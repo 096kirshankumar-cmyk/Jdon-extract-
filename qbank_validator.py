@@ -1100,11 +1100,14 @@ def main():
     from PIL import Image as PILImage
     import qbank_pipeline as qp
 
-    if not os.environ.get("GEMINI_API_KEY"):
-        print("GEMINI_API_KEY not set -- cannot run model stages")
+    import gemini_keys
+    if not gemini_keys.discover_keys():
+        print("No Gemini API key set (GEMINI_API_KEYS / GEMINI_API_KEY_1..N / "
+              "GEMINI_API_KEY) -- cannot run model stages")
         sys.exit(1)
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    model = genai.GenerativeModel(qp.GEMINI_MODEL)
+    _audit_state = qp.load_state()
+    gemini_keys.init(_audit_state, qp.MAX_CALLS_PER_DAY)
+    model = gemini_keys.track(genai.GenerativeModel(qp.GEMINI_MODEL))
     budget = int(args[args.index("--audit-budget") + 1]) if "--audit-budget" in args else 150
     dry = "--dry-run" in args
 

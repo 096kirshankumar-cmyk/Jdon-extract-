@@ -22,6 +22,7 @@ from flask import Flask, render_template_string, request, redirect, url_for, sen
 from werkzeug.utils import secure_filename
 
 import qbank_pipeline as pipeline
+import gemini_keys
 import master_review_export  # MASTER_REVIEW/ package builder (read-only)
 
 app = Flask(__name__)
@@ -79,8 +80,10 @@ def run_pipeline_thread(subject_code, pdf_path, page_offset):
         state["status"] = "processing"
         state["error"] = None
     try:
-        if not os.environ.get("GEMINI_API_KEY"):
-            raise RuntimeError("GEMINI_API_KEY is not configured in Railway variables")
+        if not gemini_keys.discover_keys():
+            raise RuntimeError(
+                "No Gemini API key configured in Railway variables "
+                "(set GEMINI_API_KEYS, GEMINI_API_KEY_1..N, or GEMINI_API_KEY)")
         pipeline.PDFS[:] = [{"subject": subject_code, "path": str(pdf_path), "page_offset": page_offset}]
         pipeline.main()
         # zero-token deterministic validation right after every run -- the
@@ -385,7 +388,8 @@ def health():
         "ok": True,
         "output_root": str(OUTPUT_ROOT_ENV),
         "volume_ready": not bool(VOLUME_WARN),
-        "gemini_key_configured": bool(os.environ.get("GEMINI_API_KEY")),
+        "gemini_key_configured": bool(gemini_keys.discover_keys()),
+        "gemini_key_count": len(gemini_keys.discover_keys()),
         "status": state["status"],
     })
 
@@ -548,11 +552,10 @@ def v2_test():
                 chapters_out = []
                 log(f"🧪 [V2-TEST] {subject_code} chapter {chapter_no} (3-pass chal raha hai)...")
                 import google.generativeai as genai
-                api_key = os.environ.get("GEMINI_API_KEY")
-                if not api_key:
-                    raise RuntimeError("GEMINI_API_KEY is not configured in Railway variables")
-                genai.configure(api_key=api_key)
-                model = genai.GenerativeModel(pipeline.GEMINI_MODEL)
+                # Multi-key pool: configures the first usable key and lets the
+                # pipeline rotate to the next project as each one is spent.
+                gemini_keys.init(st, pipeline.MAX_CALLS_PER_DAY)
+                model = gemini_keys.track(genai.GenerativeModel(pipeline.GEMINI_MODEL))
                 q_path = pipeline.DATA_DIR / "questions.jsonl"
                 # run-16: per-chapter atomic rewrite inside process_pdf --
                 # pass the PATH, not an append handle (crash-safe resume).

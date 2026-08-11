@@ -54,6 +54,7 @@ import pytesseract
 # and validator consume. See split_outputs.py for the full design and
 # docs/SPLIT_OUTPUTS_DESIGN.md for the contract.
 import split_outputs
+import gemini_keys
 
 # ============================================================
 # CONFIG — edit this section for each new subject PDF
@@ -243,6 +244,57 @@ def reset_daily_counter_if_needed(state):
     if state.get("day_stamp") != today_stamp():
         state["day_stamp"] = today_stamp()
         state["calls_today"] = 0
+        # Per-key counters roll over with the same stamp (multi-key pool).
+        try:
+            gemini_keys.pool().reset_day(state)
+        except gemini_keys.NoKeysConfigured:
+            pass
+
+
+# ============================================================
+# QUOTA BRAKE -- multi-key aware (2026-08-11)
+# ============================================================
+# Historically the brake was `quota_exhausted(state)` and
+# the counter bump was `note_call(state)`, repeated at ~30 call
+# sites. Both now delegate to the key pool so that exhausting one key ROTATES
+# to the next independent project instead of ending the run. With a single
+# key configured the behaviour is byte-for-byte what it always was.
+#
+# `state["calls_today"]` is still maintained as the POOL-WIDE total so every
+# existing log line, dashboard field and report keeps working unchanged.
+
+def quota_exhausted(state):
+    """True only when EVERY key in the pool has spent its daily budget."""
+    try:
+        return gemini_keys.pool().quota_exhausted(state)
+    except gemini_keys.NoKeysConfigured:
+        return state.get("calls_today", 0) >= MAX_CALLS_PER_DAY
+
+
+def note_call(state):
+    """Record one Gemini request against the active key + the pool total."""
+    state["calls_today"] = state.get("calls_today", 0) + 1
+    try:
+        gemini_keys.pool().note_call(state)
+    except gemini_keys.NoKeysConfigured:
+        pass
+
+
+def handle_429(state, err_text=""):
+    """A 429 came back. Park/rotate the key. Returns True if another key is
+    now active (caller should retry immediately), False if the pool is spent
+    (caller should fall back to its historical backoff/exit path)."""
+    try:
+        return gemini_keys.pool().note_429(state, err_text) is not None
+    except gemini_keys.NoKeysConfigured:
+        return False
+
+
+def keypool_summary(state):
+    try:
+        return gemini_keys.pool().summary(state)
+    except gemini_keys.NoKeysConfigured:
+        return f"single-key {state.get('calls_today', 0)}/{MAX_CALLS_PER_DAY}"
 
 # ============================================================
 # STEP 1: parse the TOC to auto-discover chapters + page ranges
@@ -1065,20 +1117,32 @@ def retry_batch_page_by_page(model, batch, state, ctx=None, prompt=None):
     recovered = 0
     for pf in batch:
         reset_daily_counter_if_needed(state)
-        if state["calls_today"] >= MAX_CALLS_PER_DAY:
+        if quota_exhausted(state):
             print("Daily Gemini call limit reached during single-page retry. Saving progress, exiting.")
             save_state(state)
             sys.exit(0)
         try:
             items.extend(call_gemini_on_pages(model, [pf], prompt=prompt))
-            state["calls_today"] += 1
+            note_call(state)
             recovered += 1
         except Exception as e2:
             t2 = str(e2)
             if "429" in t2 or "quota" in t2.lower():
-                print(f"  [QUOTA] Gemini quota exhausted during retry -- stopping run for now: {e2}")
-                save_state(state)
-                sys.exit(0)
+                if handle_429(state, t2):
+                    print(f"  [429] quota hit during retry -- rotated to "
+                          f"{keypool_summary(state)}, retrying this page")
+                    try:
+                        items.extend(call_gemini_on_pages(model, [pf], prompt=prompt))
+                        note_call(state)
+                        recovered += 1
+                        continue
+                    except Exception as e3:
+                        print(f"  [WARN] page {pf.name} failed after rotation too: {e3}")
+                        t2 = str(e3)
+                else:
+                    print(f"  [QUOTA] every key exhausted during retry -- stopping run: {e2}")
+                    save_state(state)
+                    sys.exit(0)
             print(f"  [WARN] page {pf.name} failed even alone ({e2}) -- queued for second-chance drain")
             entry = {"page_file": pf.name, "true_page": int(pf.stem.split("-")[-1]),
                      "reason": t2[:200], "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
@@ -1541,7 +1605,7 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
         first_check = False
 
         reset_daily_counter_if_needed(state)
-        if state["calls_today"] >= MAX_CALLS_PER_DAY:
+        if quota_exhausted(state):
             print("  [RETRY] daily call limit reached -- stopping retries for now")
             break
 
@@ -1831,7 +1895,7 @@ def rescue_incomplete_records(model, page_files, pdf_path, chapter_records, stat
         if pf is None:
             continue
         reset_daily_counter_if_needed(state)
-        if state["calls_today"] >= MAX_CALLS_PER_DAY:
+        if quota_exhausted(state):
             print("  [RESCUE] daily Gemini call limit reached -- saving, exiting")
             save_state(state)
             sys.exit(0)
@@ -1891,7 +1955,7 @@ def rescue_incomplete_records(model, page_files, pdf_path, chapter_records, stat
         before_n = sum(_count_fields(chapter_records[qn], qn_missing[qn]) for qn in qns_here)
         try:
             raw = call_gemini_on_pages(model, [pf], context=RECOVERY_CONTEXT, prompt=prompt)
-            state["calls_today"] += 1
+            note_call(state)
             save_state(state)
             calls += 1
         except Exception as e:
@@ -2479,12 +2543,12 @@ def gemini_json_call_splitting(model, prompt, page_files, state, label="", direc
     recitation-on-one-page simply cost that page, not the ask)."""
     def one_call(files):
         reset_daily_counter_if_needed(state)
-        if state["calls_today"] >= MAX_CALLS_PER_DAY:
+        if quota_exhausted(state):
             print("Daily Gemini call limit reached. Saving progress, exiting.")
             save_state(state)
             sys.exit(0)
         result = call_gemini_on_pages(model, files, prompt=prompt)
-        state["calls_today"] += 1
+        note_call(state)
         save_state(state)
         return result
 
@@ -2496,14 +2560,39 @@ def gemini_json_call_splitting(model, prompt, page_files, state, label="", direc
         except Exception as e:
             t = str(e)
             if "429" in t or "quota" in t.lower():
-                print(f"  [429] rate limited{label} -- backing off 65s once")
+                # Multi-key: rotate to the next project FIRST. A different
+                # project has its own RPM window and its own daily budget, so
+                # sleeping 65s is pointless when a fresh key is available.
+                if handle_429(state, t):
+                    print(f"  [429] rate limited{label} -- rotated to "
+                          f"{keypool_summary(state)}, retrying now")
+                    try:
+                        return one_call(files)
+                    except Exception as e2:
+                        t2 = str(e2)
+                        if not ("429" in t2 or "quota" in t2.lower()):
+                            print(f"  [WARN] post-rotation call failed differently{label}: {e2}")
+                            return None
+                        # Rotated key was limited too -- fall through to the
+                        # historical backoff below.
+                        t = t2
+                print(f"  [429] rate limited{label} -- backing off 65s once "
+                      f"({keypool_summary(state)})")
                 time.sleep(65)
                 try:
                     return one_call(files)
                 except Exception as e2:
                     t2 = str(e2)
                     if "429" in t2 or "quota" in t2.lower():
-                        print(f"  [QUOTA] still limited after backoff -- saving, exiting: {e2}")
+                        if handle_429(state, t2):
+                            print(f"  [429] post-backoff limit -- rotated to "
+                                  f"{keypool_summary(state)}, retrying once")
+                            try:
+                                return one_call(files)
+                            except Exception as e3:
+                                print(f"  [WARN] retry after rotation failed{label}: {e3}")
+                                return None
+                        print(f"  [QUOTA] every key exhausted -- saving, exiting: {e2}")
                         save_state(state)
                         sys.exit(0)
                     print(f"  [WARN] post-backoff call failed differently{label}: {e2}")
@@ -2603,7 +2692,7 @@ def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, 
     healed = []
     for entry in entries:
         reset_daily_counter_if_needed(state)
-        if state["calls_today"] >= MAX_CALLS_PER_DAY:
+        if quota_exhausted(state):
             print("Daily Gemini call limit reached during failed-page drain. Saving, exiting.")
             save_state(state)
             sys.exit(0)
@@ -2629,7 +2718,7 @@ def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, 
             raw = call_gemini_on_pages(
                 model, [pf], context=RECOVERY_CONTEXT,
                 prompt=(SCHEMA_PROMPT + RECITATION_RECOVERY_CONTEXT) if recitation_safe else None)
-            state["calls_today"] += 1
+            note_call(state)
             save_state(state)
         except Exception as e:
             # CROP LADDER (run-4 PROOF: PSY ch16 page 217 failed with
@@ -2649,7 +2738,7 @@ def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, 
                         crop_ctx = (f"RECOVERY NOTE: you are seeing one crop ({crop_label}) of a "
                                     f"page that must be extracted in pieces. {RECOVERY_CONTEXT}")
                         raw = call_gemini_on_pages(model, [crop_pf], context=crop_ctx)
-                        state["calls_today"] += 1
+                        note_call(state)
                         save_state(state)
                     except Exception as e2:
                         print(f"  [DRAIN] {entry['page_file']} {crop_label} failed too ({e2})")
@@ -2690,7 +2779,7 @@ def drain_failed_pages(model, entries, page_dir, chapter_records, state, stats, 
                         raw = call_gemini_text_only(model, RECITATION_RECOVERY_CONTEXT +
                             "\nRaw OCR text follows. Structure it into the normal JSON array; "
                             "correct obvious OCR errors but do not invent content.\n\nOCR TEXT:\n" + raw_text)
-                        state["calls_today"] += 1; save_state(state)
+                        note_call(state); save_state(state)
                         items2, _ = extract_batch_meta(raw)
                         items2 = [normalize_ocr_fallback_item(item) for item in items2
                                   if isinstance(item, dict)]
@@ -3536,7 +3625,7 @@ def attribute_orphan_image(model, rel_path, chapter_records, state):
     {"decorative": "brake"} when the daily limit is hit so the caller can
     stop and persist instead of guessing."""
     reset_daily_counter_if_needed(state)
-    if state["calls_today"] >= MAX_CALLS_PER_DAY:
+    if quota_exhausted(state):
         print("  [IMG] daily call limit reached during image attribution -- leftovers stay queued")
         return {"decorative": "brake"}
     q_list = "\n".join(
@@ -3566,7 +3655,7 @@ def attribute_orphan_image(model, rel_path, chapter_records, state):
             safety_settings=SAFETY_SETTINGS,
             request_options={"retry": None},
         )
-        state["calls_today"] += 1
+        note_call(state)
         save_state(state)
         if not resp.candidates:
             return None
@@ -4827,7 +4916,7 @@ def full_page_vision_ownership(model, pdf_path, file_page, rels, positions,
     try:
         resp = model.generate_content(parts, safety_settings=SAFETY_SETTINGS,
                                       request_options={"retry": None})
-        state["calls_today"] += 1
+        note_call(state)
         save_state(state)
         if not getattr(resp, "candidates", None):
             return claimed, [r for r, _o, _i in labels.values()] + still, verdicts
@@ -5697,7 +5786,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                 if not active:
                     continue
                 reset_daily_counter_if_needed(state)
-                if state["calls_today"] >= MAX_CALLS_PER_DAY:
+                if quota_exhausted(state):
                     print("Daily Gemini call limit reached. Saving progress, exiting.")
                     save_state(state)
                     sys.exit(0)
@@ -5718,7 +5807,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                 try:
                     raw_items = call_gemini_on_pages(genai_model, pass_batch,
                                                      context=context_str, prompt=prompt)
-                    state["calls_today"] += 1
+                    note_call(state)
                     save_state(state)
                 except Exception as e:
                     err_text = str(e)
@@ -5742,15 +5831,32 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                         try:
                             raw_items = call_gemini_on_pages(genai_model, batch,
                                                              context=context_str, prompt=prompt)
-                            state["calls_today"] += 1
+                            note_call(state)
                             save_state(state)
                         except Exception as e2:
                             t2 = str(e2)
                             if "429" in t2 or "quota" in t2.lower():
-                                print(f"  [QUOTA] still limited after 65s backoff -- daily cap "
-                                      f"it is. Saving progress, exiting: {e2}")
-                                save_state(state)
-                                sys.exit(0)
+                                if handle_429(state, t2):
+                                    print(f"  [429] still limited after backoff -- rotated to "
+                                          f"{keypool_summary(state)}, retrying batch")
+                                    try:
+                                        raw_items = call_gemini_on_pages(
+                                            genai_model, batch,
+                                            context=context_str, prompt=prompt)
+                                        note_call(state)
+                                        save_state(state)
+                                    except Exception as e3:
+                                        print(f"  [WARN] batch failed after rotation: {e3}")
+                                        raw_items = retry_batch_page_by_page(
+                                            genai_model, pass_batch, state,
+                                            ctx={"subject": subject, "chapter_no": ch["chapter_no"],
+                                                 "chapter_id": chapter_id, "pass": pass_name},
+                                            prompt=prompt)
+                                else:
+                                    print(f"  [QUOTA] every key exhausted -- daily cap "
+                                          f"it is. Saving progress, exiting: {e2}")
+                                    save_state(state)
+                                    sys.exit(0)
                             print(f"  [WARN] post-backoff call failed differently "
                                   f"({pass_name}-pass): {e2}")
                             raw_items = retry_batch_page_by_page(
@@ -5784,7 +5890,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                             # unresolved_page_A [175-179] even though the
                             # re-ask returned 14 items).
                             pass_recovered = True
-                            state["calls_today"] += 1
+                            note_call(state)
                             save_state(state)
                         except Exception as e2:
                             print(f"  [WARN] same-batch re-ask failed ({e2}) "
@@ -6699,11 +6805,13 @@ RECOVERY_CONTEXT = (
 
 def recover_pages(plan_path):
     plan = json.loads(Path(plan_path).read_text())
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    model = genai.GenerativeModel(GEMINI_MODEL)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     ASSETS_DIR.mkdir(parents=True, exist_ok=True)
     state = load_state()   # real state: quota tracking + failed_pages queue
+    # Key pool must be initialised from the loaded state (it stores per-key
+    # counters there) BEFORE the first model is built.
+    gemini_keys.init(state, MAX_CALLS_PER_DAY)
+    model = gemini_keys.track(genai.GenerativeModel(GEMINI_MODEL))
 
     questions_path = DATA_DIR / "questions.jsonl"
     all_lines = [json.loads(l) for l in
@@ -6751,7 +6859,7 @@ def recover_pages(plan_path):
             batch = page_files[win_start:win_start + PAGES_PER_GEMINI_CALL]
             window_pages = [int(p.stem.split("-")[-1]) for p in batch]
             reset_daily_counter_if_needed(state)
-            if state["calls_today"] >= MAX_CALLS_PER_DAY:
+            if quota_exhausted(state):
                 print("Daily Gemini call limit reached during recovery. Saving, exiting.")
                 save_state(state)
                 sys.exit(0)
@@ -6760,7 +6868,7 @@ def recover_pages(plan_path):
                 # quota accounting: recovery's direct calls used to bypass
                 # calls_today (only the fallback retries counted) -- a long
                 # recovery could overshoot the per-day cap blind.
-                state["calls_today"] += 1
+                note_call(state)
                 save_state(state)
             except Exception as e:
                 print(f"  [WARN] recovery call failed for {chapter_id} pages "
@@ -7022,13 +7130,13 @@ def build_auto_recovery_plan():
 
 
 def main():
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    model = genai.GenerativeModel(GEMINI_MODEL)
-
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
     state = load_state()
+    gemini_keys.init(state, MAX_CALLS_PER_DAY)
+    model = gemini_keys.track(genai.GenerativeModel(GEMINI_MODEL))
+
     reset_daily_counter_if_needed(state)
 
     chapters_path = DATA_DIR / "chapters.json"

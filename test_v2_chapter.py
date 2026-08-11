@@ -32,9 +32,10 @@ def main():
     page_offset = int(sys.argv[4]) if len(sys.argv) > 4 else -1
     out_dir = Path(sys.argv[5]) if len(sys.argv) > 5 else Path("./v2_test_output")
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("Set GEMINI_API_KEY first.")
+    import gemini_keys
+    if not gemini_keys.discover_keys():
+        print("Set GEMINI_API_KEYS (comma-separated), GEMINI_API_KEY_1..N, "
+              "or GEMINI_API_KEY first.")
         sys.exit(1)
 
     # Point the whole pipeline at the isolated test root BEFORE any paths resolve.
@@ -45,10 +46,9 @@ def main():
     qp.STATE_FILE = out_dir / "state.json"
     qp.DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(qp.GEMINI_MODEL)
-
     state = qp.load_state()
+    gemini_keys.init(state, qp.MAX_CALLS_PER_DAY)
+    model = gemini_keys.track(genai.GenerativeModel(qp.GEMINI_MODEL))
     cfg = {"subject": subject, "path": pdf_path, "page_offset": page_offset}
     chapters_out = []
     q_path = qp.DATA_DIR / "questions.jsonl"

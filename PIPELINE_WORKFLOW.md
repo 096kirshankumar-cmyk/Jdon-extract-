@@ -43,7 +43,7 @@ End goal: feed ~20 books through this, consume the JSONL in a separate exam/quiz
 | Hosting | Railway + **Volume mounted at `/data`** + public domain | State/output survive redeploys/restarts/crashes |
 | LLM | google-generativeai SDK | `google-genai` style `model.generate_content(parts)`; **stateless** (continuity injected manually) |
 
-Env vars: `GEMINI_API_KEY`, `OUTPUT_DIR` (default `./qbank_output`; `/data/qbank_output` in Docker), `PORT` (8080), optional `DRIVE_FOLDER_ID`, `DRIVE_API_KEY` (for restore-from-Drive), and `GEMINI_MODEL` (optional — overrides the model ID; defaults to `gemini-3.5-flash-lite`, defined in `qbank_pipeline.py`).
+Env vars: `GEMINI_API_KEYS` (**preferred** — comma-separated pool, see §7a) or `GEMINI_API_KEY_1`…`GEMINI_API_KEY_6` or single `GEMINI_API_KEY`, `OUTPUT_DIR` (default `./qbank_output`; `/data/qbank_output` in Docker), `PORT` (8080), optional `DRIVE_FOLDER_ID`, `DRIVE_API_KEY` (for restore-from-Drive), and `GEMINI_MODEL` (optional — overrides the model ID; defaults to `gemini-3.5-flash-lite`, defined in `qbank_pipeline.py`).
 
 **Hard volume guard**: if `OUTPUT_DIR` lives under `/data` but `/data` is not a real mount, the dashboard shows a red banner and **blocks** run/recover/fix/validate/restore (400) — never burn Gemini quota writing to ephemeral container fs.
 
@@ -231,7 +231,8 @@ Runs before targeted retry so anything it strips is re-asked **in the same run**
 | `SECTION_OVERLAP_PAGES` | 1 | intra-section overlap only; overlap waste 33% -> 10% |
 | `TARGETED_RETRY_MAX_ROUNDS` | 2 | diminishing returns after |
 | `SOLUTION_GATE_MIN_SHARE` | 0.6 | distinguishes "prints solutions" vs answer-only chapters |
-| `MAX_CALLS_PER_DAY` | 1400 | 7 % buffer under 1500/day free tier |
+| `MAX_CALLS_PER_DAY` | 480 | per-KEY budget. With a 6-key pool the effective ceiling is 6 x 480 = 2880/day |
+| `_RPM_COOLDOWN_SECONDS` | 60 | `gemini_keys.py`: how long a key is parked after a per-minute 429 |
 | `MAX_QUESTION_IMAGES` | 3 | >3 question-side figures ≈ mis-attribution |
 | `MAX_SOLUTION_IMAGES` | 2 | >2 solution-side figures ≈ under-detected headers stacking neighbours' figures |
 | `MIN_IMAGE_BYTES` | 1500 | <1.5 KB webp ≈ broken crop |
@@ -241,6 +242,64 @@ Runs before targeted retry so anything it strips is re-asked **in the same run**
 | Fragment containment | 0.85 | append dedupe |
 | Foreign-segment detector | shingle-8, ≥400 chars | copy-paste tails between sibling solutions |
 | Safety | BLOCK_ONLY_HIGH ×4 | clinical content must pass |
+
+---
+
+## 7a. Multi-key rotation (added 2026-08-11)
+
+Gemini quota is enforced **per Google Cloud project, not per API key** — six keys
+from one project share one bucket and buy nothing. The pool only multiplies
+throughput because these six keys come from **six separate Google accounts**.
+
+> **Warning.** Using multiple accounts to get past free-tier limits is very
+> likely against Google's API terms; accounts can be suspended. The supported
+> alternative is to enable billing on one project (Tier 1 = ~1,500 RPD instantly).
+> This was implemented at the owner's explicit direction.
+
+### Railway variables
+
+Set **one** of these forms (they merge and de-duplicate if you set several):
+
+| Variable | Format | Notes |
+|---|---|---|
+| `GEMINI_API_KEYS` | `key1,key2,key3,key4,key5,key6` | **Recommended** — one variable, comma/newline separated |
+| `GEMINI_API_KEY_1` … `GEMINI_API_KEY_20` | one key each | Easier to rotate a single account; gaps in numbering are fine |
+| `GEMINI_API_KEY` | one key | Legacy single-key fallback; still fully supported |
+
+### Behaviour
+
+- Keys are used **in order**, one at a time — never in parallel. Key *n+1* is
+  touched only once key *n* is spent, so a single working key behaves exactly
+  as before.
+- **Daily 429** (`per day` / `generate_requests_per_model_per_day`) → that key is
+  retired until the next reset, and the run continues on the next key.
+- **Per-minute 429** (RPM burst) → the key is parked for 60s only; the run rotates
+  to another project immediately instead of sleeping.
+- The run stops for the day **only when every key's daily budget is gone**. If all
+  keys are merely in RPM cooldown, the pipeline waits out the shortest cooldown
+  rather than exiting.
+- `MAX_CALLS_PER_DAY` is the **per-key** cap. Pool ceiling = keys x cap.
+- Quota resets at **midnight Pacific (12:30 PM IST)**, not at local midnight.
+
+### State & safety
+
+Per-key counters live in `state.json` under `key_pool`:
+
+```json
+"key_pool": {
+  "key1": {"fp": "...a1ZZ", "calls": 480, "status": "exhausted"},
+  "key2": {"fp": "...b2ZZ", "calls": 137, "status": "active"}
+}
+```
+
+Only a 4-character fingerprint is stored — **secrets are never written to
+state.json, logs, or the dashboard**. Progress survives restarts, so a
+redeploy mid-day does not hand a spent key a fresh budget.
+
+Implementation: `gemini_keys.py` (`init` / `pool()` / `note_call` / `note_429`).
+`GenerativeModel` caches its client on first use, so rotation also clears the
+cached client on every tracked model — otherwise a key swap would silently
+keep using the old key.
 
 ---
 
