@@ -1,4 +1,7 @@
+import copy
+import inspect
 import json
+import pathlib
 import shutil
 import tempfile
 import unittest
@@ -9,6 +12,7 @@ from pathlib import Path
 from PIL import Image
 
 import qbank_pipeline as qp
+import qbank_validator as qv
 from qbank_pipeline import _dedupe_tables, _normalize_solution_payload, looks_truncated_solution, parse_gemini_json_array
 
 
@@ -3078,6 +3082,152 @@ class Run22GarbledHeaderAndOrphanInferenceTests(unittest.TestCase):
         remaining = qp.recover_orphans(orphans, recs, "ANA", 38, self._stats())
         self.assertEqual(len(remaining), 1)
         self.assertIsNone(recs[11]["solution_text"])
+
+
+class Run22OptionsManualReviewFlagTests(unittest.TestCase):
+    """run-22: options harvested off ANOTHER question's solution page are
+    FLAGGED for manual review -- never auto-corrected, never rejected.
+
+    Ground truth (ch. 38 q13): the printed options on p670 are anatomical
+    structures; what shipped were the "Option A/B/D:" commentary lines from
+    p689, which explain q12. The genuine fix is unknowable from the record
+    alone, so the contract is: keep the text byte-identical, set a review
+    flag, surface it in the gate and the validator."""
+
+    def _q13(self):
+        """The real ch. 38 q13 option set, verbatim from out_ch38_final."""
+        return {
+            "options": {
+                "A": "It is the radial groove where radial nerve runs along "
+                     "with profunda brachii artery.",
+                "B": "It is the lateral epicondyle. Fracture of this part may "
+                     "lead to injury of the radial nerve in some cases.",
+                "C": "Palmar cutaneous branch of ulnar nerve",
+                "D": "It is the neck of humerus where axillary nerve runs "
+                     "around.",
+            },
+            "solution_text": "The deep branch of the ulnar nerve is purely "
+                             "motor and supplies the interossei.",
+        }
+
+    def test_ch38_q13_is_flagged(self):
+        recs = {13: self._q13()}
+        why = qp.detect_options_harvested_from_solution(13, recs[13], recs)
+        self.assertIsNotNone(why, "known-bad ch38 q13 must be flagged")
+        self.assertIn("commentary", why)
+        for letter in ("A", "B", "D"):
+            self.assertIn(letter, why)
+
+    def test_flagging_never_mutates_the_record(self):
+        """The whole point: the reviewer sees exactly what was extracted."""
+        recs = {13: self._q13()}
+        before = copy.deepcopy(recs[13])
+        qp.detect_options_harvested_from_solution(13, recs[13], recs)
+        self.assertEqual(before, recs[13],
+                         "detector must be read-only -- no auto-correction")
+
+    def test_healthy_options_are_not_flagged(self):
+        recs = {1: {"options": {"A": "Deep branch of ulnar nerve",
+                                "B": "Ulnar nerve before its division into "
+                                     "superficial and deep branch",
+                                "C": "Palmar cutaneous branch of ulnar nerve",
+                                "D": "Superficial terminal branch of ulnar "
+                                     "nerve"},
+                    "solution_text": "Answer is A."}}
+        self.assertIsNone(
+            qp.detect_options_harvested_from_solution(1, recs[1], recs))
+
+    def test_single_letter_diagram_labels_are_not_flagged(self):
+        """ch. 38 q12's own options legitimately ARE 'A'/'B'/'C'/'D'."""
+        recs = {12: {"options": {k: k for k in "ABCD"},
+                     "solution_text": "Medial epicondyle, marked as C."}}
+        self.assertIsNone(
+            qp.detect_options_harvested_from_solution(12, recs[12], recs))
+
+    def test_one_uncorroborated_commentary_option_is_not_enough(self):
+        """A genuine option may read 'It is the ...'; one alone stays quiet."""
+        recs = {5: {"options": {"A": "It is the only muscle supplied by the "
+                                     "anterior interosseous nerve",
+                                "B": "Flexor carpi ulnaris",
+                                "C": "Pronator teres",
+                                "D": "Supinator"},
+                    "solution_text": "A is correct."}}
+        self.assertIsNone(
+            qp.detect_options_harvested_from_solution(5, recs[5], recs))
+
+    def test_one_commentary_option_IS_flagged_when_another_q_claims_it(self):
+        recs = {
+            6: {"options": {"A": "It is the radial groove where the radial "
+                                 "nerve runs with profunda brachii",
+                            "B": "Ulnar nerve", "C": "Median nerve",
+                            "D": "Axillary nerve"},
+                "solution_text": "B is correct."},
+            7: {"options": {}, "solution_text":
+                "It is the radial groove where the radial nerve runs with "
+                "profunda brachii artery, hence option A."},
+        }
+        why = qp.detect_options_harvested_from_solution(6, recs[6], recs)
+        self.assertIsNotNone(why)
+        self.assertIn("q7", why)
+
+    def test_option_quoting_its_own_solution_is_not_proof(self):
+        """Self-match must never count -- solutions restate their options."""
+        recs = {8: {"options": {"A": "It is the radial groove carrying the "
+                                     "radial nerve",
+                                "B": "Ulnar", "C": "Median", "D": "Axillary"},
+                    "solution_text": "It is the radial groove carrying the "
+                                     "radial nerve, so A."}}
+        self.assertIsNone(
+            qp.detect_options_harvested_from_solution(8, recs[8], recs))
+
+    def test_option_line_prefix_shape_is_detected(self):
+        recs = {9: {"options": {"A": "Option A: the radial groove where the "
+                                     "radial nerve travels",
+                                "B": "Option B: the lateral epicondyle of the "
+                                     "humerus bone",
+                                "C": "Median nerve", "D": "Axillary nerve"},
+                    "solution_text": "C is correct."}}
+        self.assertIsNotNone(
+            qp.detect_options_harvested_from_solution(9, recs[9], recs))
+
+    def test_export_row_carries_options_suspect_and_manual_review(self):
+        src = inspect.getsource(qp)
+        self.assertIn('"options_suspect": rec.get("_options_suspect_reason")',
+                      src)
+        i = src.index('"manual_review": bool(')
+        tail = src[i:i + 260]
+        self.assertIn("_stem_suspect_reason", tail)
+        self.assertIn("_options_suspect_reason", tail)
+
+    def test_gate_reports_options_suspect_without_deleting(self):
+        src = inspect.getsource(qp)
+        self.assertIn('violations.append(("options_suspect"', src)
+        i = src.index('rec.get("_options_suspect_reason")')
+        window = src[i:i + 700]
+        for banned in ("del rec[", "rec[\"options\"] =", "chapter_records.pop"):
+            self.assertNotIn(banned, window,
+                             "options_suspect path must not modify the record")
+
+    def test_sweep_sets_the_flag_and_leaves_options_intact(self):
+        stats = {}
+        recs = {13: self._q13(), 12: {"options": {k: k for k in "ABCD"},
+                                      "solution_text": "Medial epicondyle."}}
+        original = copy.deepcopy(recs[13]["options"])
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(qp, "DATA_DIR", pathlib.Path(td)):
+                qp.chapter_integrity_sweep(recs, {}, "ANA", 38, stats)
+        self.assertTrue(recs[13].get("_options_suspect_reason"))
+        self.assertEqual(original, recs[13]["options"],
+                         "sweep must ship the options exactly as extracted")
+        self.assertIsNone(recs[12].get("_options_suspect_reason"))
+
+    def test_validator_emits_a_high_severity_review_flag(self):
+        src = inspect.getsource(qv)
+        self.assertIn('row.get("options_suspect")', src)
+        i = src.index('row.get("options_suspect")')
+        window = src[i:i + 500]
+        self.assertIn("MANUAL REVIEW", window)
+        self.assertIn("HIGH", window)
 
 
 if __name__ == "__main__":

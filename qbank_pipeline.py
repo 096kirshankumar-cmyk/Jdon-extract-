@@ -1407,6 +1407,29 @@ def chapter_integrity_sweep(chapter_records, image_files_by_q, subject, chapter_
         print(f"  [SWEEP] q{qn}: quarantined suspect stem ({reason}) -- kept "
               f"for review, retry may replace it")
 
+    # 6. run-22: options that look harvested off ANOTHER question's solution
+    # page. FLAG ONLY -- unlike the stem sweep above, nothing is quarantined,
+    # replaced or re-asked, because we cannot prove which text is right: ch.
+    # 38 q13 ships options taken from q12's solution commentary, and the
+    # genuine options are on a page the model already read. Auto-"correcting"
+    # would risk replacing wrong-but-real text with a hallucination, and
+    # rejecting would delete a record that is otherwise complete. So the
+    # record ships EXACTLY as extracted, carrying options_suspect for a human.
+    for qn in qns:
+        rec = chapter_records.get(qn)
+        if not rec or rec.get("_options_suspect_reason"):
+            continue
+        why = detect_options_harvested_from_solution(qn, rec, chapter_records)
+        if not why:
+            continue
+        rec["_options_suspect_reason"] = why
+        stats["options_suspect"] = stats.get("options_suspect", 0) + 1
+        iflag("options_suspect", qn,
+              f"{why} -- FLAGGED FOR MANUAL REVIEW (record shipped unchanged, "
+              f"nothing rejected or rewritten)")
+        print(f"  [SWEEP] q{qn}: options flagged for MANUAL REVIEW ({why}) "
+              f"-- record kept exactly as extracted")
+
     if flags:
         stats["integrity_flags"] = stats.get("integrity_flags", 0) + len(flags)
     return forced_solution
@@ -3301,6 +3324,71 @@ def _foreign_option_line(frag, rec):
     return sum(1 for t in otoks[:6] if t in head) == 0
 
 
+def detect_options_harvested_from_solution(qn, rec, chapter_records):
+    """Do this record's OPTIONS look like they were harvested off a SOLUTION
+    page belonging to a DIFFERENT question? Returns a reason string, or None.
+
+    FLAG ONLY -- never rejects, never rewrites. The record ships exactly as
+    extracted, with `options_suspect` set for a human reviewer.
+
+    Motivating case (ch. 38 q13, wrong in EVERY run including pre-fix). The
+    printed options on p670 are:
+        a) Deep branch of ulnar nerve
+        b) Ulnar nerve before it's division into superficial and deep branch
+        ...
+    but what got bound to q13 was:
+        A: It is the radial groove where radial nerve runs alongwith...
+        B: It is the lateral epicondyle. Fracture of this part may lead...
+        D: It is the neck of humerus where axillary nerve runs around.
+    Those three are the "Option A/B/D:" commentary lines printed on p689 --
+    ABOVE the "Solution to Question 13" header, i.e. they explain q12, whose
+    own options are the diagram labels "a) A b) B c) C d) D".
+
+    Signal 1 -- the option reads like solution COMMENTARY rather than an
+    answer choice: it is long (>= 25 chars) AND opens "Option X:" or
+    "It is the ...", the two shapes MARROW uses for per-option explanations.
+    Signal 2 -- that text also appears verbatim in some OTHER question's
+    solution, which proves the wrong owner outright.
+
+    Either TWO signal-1 options, or ONE corroborated by signal 2, is enough.
+    A lone uncorroborated signal-1 option is NOT flagged: a genuine option
+    can legitimately read "It is the only muscle supplied by ...". Requiring
+    two is what keeps this quiet -- measured over the ch. 9 and ch. 38
+    exports (68 questions, 272 options) the only record it fires on is the
+    known-bad ch. 38 q13. Note signal 2 could not save q13 on its own: the
+    p689 commentary was never merged into q12's solution_text, so there is
+    nothing to corroborate against -- hence the two-option rule.
+    """
+    opts = rec.get("options") or {}
+    if not opts:
+        return None
+    commentary_letters, proofs = [], []
+    for letter, text in sorted(opts.items()):
+        s = str(text or "").strip()
+        if len(s) < 25:            # "A", "Deep branch of ulnar nerve" -- short
+            continue               # answer choices are normal, never suspect
+        if not (OPTION_LINE_START_RE.match(s)
+                or re.match(r"^\s*It\s+is\s+the\b", s, re.IGNORECASE)):
+            continue
+        commentary_letters.append(letter)
+        probe = " ".join(re.findall(r"\w+", s.lower())[:12])
+        if not probe:
+            continue
+        for other_qn, other in (chapter_records or {}).items():
+            if other_qn == qn:
+                continue           # a question may legitimately quote itself
+            other_sol = " ".join(re.findall(
+                r"\w+", str(other.get("solution_text") or "").lower()))
+            if probe in other_sol:
+                proofs.append(f"option {letter} matches q{other_qn}'s solution")
+                break
+    if not commentary_letters or (len(commentary_letters) < 2 and not proofs):
+        return None
+    detail = "; ".join(proofs) if proofs else "no other question claims it"
+    return (f"options {', '.join(commentary_letters)} read as per-option "
+            f"solution commentary, not answer choices ({detail})")
+
+
 def _solution_fragment_foreign(frag, qn, rec, chapter_records):
     """Deterministic 'this retry fragment does NOT belong to q{qn}' proofs
     for solution text returned by targeted_retry. External-audit class
@@ -4364,6 +4452,12 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
         # run-13: quarantined suspect stem marker -- ships in questions.jsonl
         # so the post-run validator flags it too (not only the export gate).
         "stem_suspect": rec.get("_stem_suspect_reason"),
+        # run-22: options MAY have been harvested off another question's
+        # solution page (ch. 38 q13). Ships as-extracted; this is the review
+        # marker, not a correction. None on healthy records.
+        "options_suspect": rec.get("_options_suspect_reason"),
+        "manual_review": bool(rec.get("_stem_suspect_reason")
+                              or rec.get("_options_suspect_reason")),
     }
 
 
@@ -5729,6 +5823,13 @@ def _export_gate_violations(chapter_records, image_files_by_q, unresolved_ledger
             violations.append(("suspect_stem", qn,
                                f"stem quarantined (kept for review): "
                                f"{rec['_stem_suspect_reason']}"))
+        if rec.get("_options_suspect_reason"):
+            # run-22: options MAY belong to another question. Deliberately
+            # NOT auto-corrected and NOT rejected -- but the chapter must not
+            # report clean while an option set is unverified.
+            violations.append(("options_suspect", qn,
+                               f"options flagged for manual review (record "
+                               f"unchanged): {rec['_options_suspect_reason']}"))
     # every referenced asset file must exist on disk
     for qn, entry in (image_files_by_q or {}).items():
         for kind, paths in ({"question": entry.get("question", []),

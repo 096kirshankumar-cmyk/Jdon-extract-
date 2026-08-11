@@ -240,6 +240,14 @@ def check_row(row, assets_questions):
         flags.append(flag(cid, "suspect_stem",
                           f"{row.get('id')}: stem quarantined by pipeline "
                           f"({row['stem_suspect']}) -- review before use", qn, HIGH))
+    # run-22: options MAY belong to another question (harvested off a solution
+    # page). The record is intentionally shipped unchanged -- neither rejected
+    # nor auto-corrected -- so surface it loudly for a human instead.
+    if row.get("options_suspect"):
+        flags.append(flag(cid, "options_suspect",
+                          f"{row.get('id')}: options flagged for MANUAL REVIEW "
+                          f"({row['options_suspect']}) -- record shipped as "
+                          f"extracted, verify against the source page", qn, HIGH))
     opt_ids = {str(o.get("id", "")).strip().upper() for o in opts}
     nonempty = sum(1 for o in opts if (o.get("text") or "").strip())
     if len(opts) != 4 or opt_ids != {"A", "B", "C", "D"} or nonempty != 4:
