@@ -2171,7 +2171,7 @@ def question_headers_on_page(pdf_path, file_page, chapter_records):
         # run-18: accept "Question N:" and "N -" too, not just "N." / "N)"
         # -- some books print colon or dash after the number, and the old
         # class silently matched ZERO headers on every page of those books.
-        m = re.match(r"^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.:\-–)]", line)
+        m = QSTEM_HEADING_RE.match(line)
         if not m:
             continue
         qn = int(m.group(1))
@@ -2365,7 +2365,7 @@ def qns_printed_on_page(pdf_path, true_page, chapter_records):
     found = set()
     # run-18: colon/dash-terminated headings ("Question 1:") were silently
     # invisible to this scanner -- see question_headers_on_page.
-    for m in re.finditer(r"(?m)^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.:\-–)]", text):
+    for m in QSTEM_HEADING_MULTILINE_RE.finditer(text):
         qn = int(m.group(1))
         if qn in chapter_records:
             found.add(qn)
@@ -2417,9 +2417,7 @@ def chapter_printed_question_qns(pdf_path, page_files):
     it again here for clarity (this runs ONCE per chapter, not per window)."""
     found = set()
     # run-18: accept "Question N:" / "N." / "N)" / "N -" / "Q N." headings
-    stem_re = re.compile(
-        r"(?m)^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.:\-\u2013)]"
-    )
+    stem_re = QSTEM_HEADING_MULTILINE_RE
     for pf in page_files:
         try:
             page_no = int(pf.stem.split("-")[-1])
@@ -2487,8 +2485,7 @@ def locate_missing_record_pages(pdf_path, page_files, qn_missing, chapter_record
         # OPTIONS recovery.
         for qn in qns:
             if qn not in stem_re_cache:
-                stem_re_cache[qn] = re.compile(
-                    r"(?m)^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?%d\s*[.:\-–)]" % qn)
+                stem_re_cache[qn] = qstem_heading_re_for(qn)
             if stem_re_cache[qn].search(text):
                 pages[qn]["question"].add(page_no)
         # SOLUTION-SIDE: a "Solution to Question N:" header on this page
@@ -3006,6 +3003,36 @@ def build_carry_context(carry, overlap_pages, new_pages=None):
 
 ANSWER_KEY_ROW_RE = re.compile(r"\|\s*(\d{1,3})\s*\|\s*([A-Da-d])\s*\|")
 SOLUTION_TO_Q_RE = re.compile(r"Solution to Question\s+(\d{1,3})", re.IGNORECASE)
+
+# --- run-22 (D1): ONE definition of the printed question-stem heading -------
+# The terminator after the number used to be [.:\-–)] and was copy-pasted into
+# SIX places. Ch. 38 p670 prints "Question 13:" but tesseract read it as
+#     Question 13, ~\
+# -- the colon came back as a COMMA. No branch matched, so q13's four options
+# and its answer were never bound to the record, while its stem and solution
+# arrived from other passes. The result LOOKS like a complete question but is
+# silently missing options+answer, which is worse than a clean miss: the
+# export gate only caught it as "bad_options", and the [CRITIQUE] pass even
+# concluded "question 13 is not present anywhere in the text" (it is).
+#
+# Widened terminator class, one shared source of truth:
+#   , ;  -> OCR mangles ':' into these constantly
+#   ·    -> middot, another frequent ':' misread
+#   ]    -> "13]" seen in some scans
+# Kept anchored at line start and still requiring SOME terminator, so prose
+# like "in 13 patients" cannot match. A stray extra match here is cheap (one
+# redundant Q-pass on an already-covered page); a MISSED one loses real data.
+QSTEM_TERMINATORS = r".:;,·\-\u2013)\]"
+QSTEM_HEADING_RE = re.compile(
+    r"^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[" + QSTEM_TERMINATORS + r"]")
+QSTEM_HEADING_MULTILINE_RE = re.compile(
+    r"(?m)^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[" + QSTEM_TERMINATORS + r"]")
+
+
+def qstem_heading_re_for(qn):
+    """Multiline regex matching the printed stem heading of ONE q_no."""
+    return re.compile(
+        r"(?m)^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?%d\s*[%s]" % (qn, QSTEM_TERMINATORS))
 # Dump-tail detector (stricter): title-case header WITH colon, i.e. the real
 # printed "Solution to Question 2:" section header, not prose mentions.
 SOLUTION_DUMP_HDR_RE = re.compile(r"Solution to Question\s+(\d{1,3})\s*:")
@@ -3207,6 +3234,36 @@ def looks_truncated_solution(text, has_tables=False, has_images=False):
     return bool(DANGLING_END_RE.search(s))
 
 
+def _solution_block_is_open(text, rec=None):
+    """Is this solution still mid-flow, i.e. may a positionally-inferred
+    continuation be appended to it?
+
+    Deliberately NOT looks_truncated_solution(). That predicate answers a
+    different and more expensive question -- "should we spend a Gemini call
+    re-asking for this?" -- so it is intentionally conservative: it fires only
+    on an explicit dangling lead-in (":", "--"), because absent terminal
+    punctuation produced ~53 false retries against this book.
+
+    Here nothing is re-asked. The text already exists; we only decide whether
+    to append a fragment that page geometry ALREADY places inside this block.
+    Ch. 38 q11 is the motivating case: its solution stops at "...called
+    Guyon's ulnar tunnel" -- no dangling colon, so looks_truncated_solution
+    says False, yet the very next printed line ("Distal to pisiform it gives
+    2 terminal branches") is plainly its continuation. Requiring a dangling
+    marker here would leave that content in orphans forever.
+
+    So: open == no sentence-terminal punctuation at the end, OR an explicit
+    dangling lead-in. Empty is open. A solution that ends in a full stop is
+    CLOSED and is never appended to.
+    """
+    s = (text or "").rstrip()
+    if not s:
+        return True
+    if DANGLING_END_RE.search(s):
+        return True
+    return s[-1] not in TERMINAL_PUNCT
+
+
 def _stem_payload_coherence(stem, rec):
     """Share of stem word-tokens present in the record's OWN options+solution.
     A stem is explained by its own solution, so the right stem for a record
@@ -3371,7 +3428,8 @@ def _frag_mostly_present(frag, existing, threshold=0.85):
     return sum(1 for t in f if t in e) / len(f) >= threshold
 
 
-def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
+def recover_orphans(orphans, chapter_records, subject, chapter_no, stats,
+                    pdf_path=None):
     """FEATURE 3 -- second-pass owner matching for q_no=null fragments.
     Confidence rules, in order:
       0. ANSWER-KEY TABLE orphan (run-2 finding: pages 182/194/235/241 all
@@ -3578,9 +3636,74 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats):
                 # is the authoritative one for this class).
                 remaining.append(orph)
                 continue
-            print(f"  [ORPHAN] Could not determine owner: page={page} kept in orphans.jsonl")
-            remaining.append(orph)
-            continue
+            # ---- run-22 (D2): LAST RESORT -- infer the owner from where the
+            # fragment physically sits on the page, using the SAME OCR anchor
+            # geometry the image attributor uses.
+            #
+            # Ch. 38 lost four q_no-less fragments this way (4 of that
+            # chapter's 5 export-gate violations). The tempting fix -- "just
+            # use last_qn_in_batch" -- is WRONG and this chapter proves it:
+            # orphan[2] on pp.686-690 carried last_qn_in_batch=13, but its
+            # text ("Distal to pisiform it gives 2 terminal branches") is the
+            # continuation of q11's solution, which ends "...lateral to
+            # pisiform called Guyon's ulnar tunnel". Blindly trusting last_qn
+            # would have glued q11's anatomy onto q13.
+            #
+            # So: read the printed solution/question headings on the
+            # fragment's own pages and take the LAST block opened at or
+            # before it -- the nearest PRECEDING heading, which is the
+            # deterministic definition of "which block is this text inside".
+            # Only accept when that owner's field is genuinely open (empty or
+            # provably truncated), reusing the same guards as rule 3 so a
+            # complete solution never gets a neighbour's text appended.
+            # PROSE ONLY. A table is NOT safe to place by page position: the
+            # first re-run of ch. 38 proved it by gluing the chapter-wide
+            # answer key ("| 5 | c | 6 | a | 7 | b | ...", i.e. the answers to
+            # q5-q16) plus a sympathetic/parasympathetic comparison table onto
+            # q7's solution, purely because q7's heading was the last one
+            # printed before them. A table that spans many q_nos belongs to
+            # the CHAPTER, not to whichever block happens to precede it, and
+            # rule 0a already routes real answer-key tables properly. Prose
+            # continuations are different: they are physically inside exactly
+            # one block, which is what makes position decisive.
+            inferred, inf_reason = None, None
+            _frag_pages = [p for p in (orph.get("pdf_pages") or []) if p]
+            if _frag_pages and (item.get("solution_text") or "").strip():
+                for _p in reversed(_frag_pages):
+                    try:
+                        _blk = last_block_on_page(pdf_path, _p) if pdf_path else None
+                    except Exception:
+                        _blk = None
+                    if _blk is not None:
+                        _kind, _qn = _blk
+                        if _qn in chapter_records:
+                            inferred = _qn
+                            inf_reason = (f"page-position inference: last printed "
+                                          f"{_kind} heading at/before page {_p}")
+                        break
+            if inferred is not None:
+                _rec = chapter_records[inferred]
+                _existing = (_rec.get("solution_text") or "").strip()
+                _frag = (item.get("solution_text") or "").strip()
+                _open = _solution_block_is_open(_existing, _rec)
+                if _open and _frag and not _frag_mostly_present(_frag, _existing):
+                    owner, reason = inferred, inf_reason
+                else:
+                    # Owner found but its solution is already complete: this
+                    # fragment is extra material (a shared table, an aside).
+                    # Attach nothing -- but say WHY, so the reviewer is not
+                    # told "could not determine owner" when we actually could.
+                    print(f"  [ORPHAN] page={page}: inferred owner q{inferred} "
+                          f"({inf_reason}) but its solution is already complete "
+                          f"-- fragment kept in orphans.jsonl, nothing overwritten")
+                    remaining.append({**orph, "inferred_owner": inferred,
+                                      "inferred_reason": inf_reason,
+                                      "blocked_reason": "owner solution already complete"})
+                    continue
+            if owner is None:
+                print(f"  [ORPHAN] Could not determine owner: page={page} kept in orphans.jsonl")
+                remaining.append(orph)
+                continue
         rec = chapter_records[owner]
         # Wrong-owner guard (run-4: PSY-009-007): an orphan solution fragment
         # that BEGINS with an 'Option X:' explanation of an option the owner
@@ -4825,7 +4948,7 @@ def _ocr_anchors_from_data(data, scale, img_h):
                 anchors.append(("solution", int(sm.group(1)),
                                 (img_h - _yc) / scale))
             continue
-        m = re.match(r"^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.:\-–)]", line)
+        m = QSTEM_HEADING_RE.match(line)
         if m:
             anchors.append(("question", int(m.group(1)),
                             (img_h - _yc) / scale))
@@ -6467,11 +6590,23 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
             # "high" confidence; the printed page says q15). Walk back a few
             # pages for the nearest printed heading -- deterministic, cached
             # render, zero Gemini calls.
+            # run-22 (D3): CLAMP the lookback to this chapter's first page.
+            # The walk-back was unconditional, so the first window of a
+            # chapter happily seeded from the PREVIOUS chapter: ch. 38 starts
+            # at p666 and its first window seeded off p665 (solution q7) --
+            # p665 belongs to ch. 37, and that q7 is a different question
+            # entirely. It did no damage there (p666's figure was
+            # claimed by block position first), but any chapter that opens
+            # with a figure above its first heading would have attached that
+            # figure to the previous chapter's block. A chapter's first page
+            # has no in-chapter predecessor by definition, so there is
+            # nothing legitimate to seed from.
             if active_block is None and window_rows:
                 _first_p = window_rows[0][0]
+                _floor = max(1, int(ch.get("file_start") or 1))
                 for _back in range(1, CARRY_SEED_LOOKBACK_PAGES + 1):
                     _prev = _first_p - _back
-                    if _prev < 1:
+                    if _prev < _floor:
                         break
                     try:
                         _seed = last_block_on_page(pdf_path, _prev)
@@ -6550,7 +6685,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
         # only genuinely ownerless orphans are persisted (after the drain's
         # second recovery -- persisting early wrote "unresolved" entries for
         # fragments the drain later healed).
-        orphans = recover_orphans(orphans, chapter_records, subject, ch["chapter_no"], stats)
+        orphans = recover_orphans(orphans, chapter_records, subject, ch["chapter_no"], stats,
+                                  pdf_path=pdf_path)
         stats["orphans_remaining"] = len(orphans)
 
         # SECOND PASS image claiming: a figure can be extracted BEFORE the
@@ -6769,7 +6905,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                 genai_model, pending_failed, page_dir, chapter_records, state, stats,
                 pdf_path=pdf_path)
             orphans.extend(drain_orphans)
-            orphans = recover_orphans(orphans, chapter_records, subject, ch["chapter_no"], stats)
+            orphans = recover_orphans(orphans, chapter_records, subject, ch["chapter_no"],
+                                      stats, pdf_path=pdf_path)
             stats["orphans_remaining"] = len(orphans)
             if healed:
                 healed_ids = {(e["subject"], e["chapter_no"], e["true_page"]) for e in healed}
@@ -7224,7 +7361,8 @@ def recover_pages(plan_path):
                                          not in healed_ids]
                 save_state(state)
 
-        orphans = recover_orphans(orphans, records, subject, chapter_no, stats)
+        orphans = recover_orphans(orphans, records, subject, chapter_no, stats,
+                                  pdf_path=pdf_path)
         for orph in orphans:
             _append_jsonl(DATA_DIR / "orphans.jsonl", orph)
 
@@ -7367,7 +7505,7 @@ def build_auto_recovery_plan():
             text = pdftotext_page(cfg["path"], page_no)
             if not text.strip():
                 continue
-            if any(re.search(r"(?m)^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?%d\s*[.:\-–)]" % qn, text)
+            if any(qstem_heading_re_for(qn).search(text)
                    for qn in qns):
                 found.append(page_no)
                 continue

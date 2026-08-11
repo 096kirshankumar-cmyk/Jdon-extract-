@@ -3,6 +3,7 @@ import shutil
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 from pathlib import Path
 
 from PIL import Image
@@ -2821,8 +2822,12 @@ class Run21bCarrySeedAndCarryCapTests(unittest.TestCase):
 
     def test_carry_seed_only_runs_when_no_pass_carry_exists(self):
         src = Path(qp.__file__).read_text()
-        i = src.index("carry seeded from page")
-        window = src[max(0, i - 1400):i]
+        # run-22: anchor on the actual print STATEMENT, not on any occurrence
+        # of the phrase. This asserts on raw source text, so a COMMENT that
+        # quotes the log line (the D3 chapter-clamp rationale did) silently
+        # moves the anchor and the test fails on unchanged code.
+        i = src.index('f"  [IMG] carry seeded from page')
+        window = src[max(0, i - 1800):i]
         self.assertIn("if active_block is None and window_rows:", window,
                       "seeding must never override a real pass-level carry")
 
@@ -2862,6 +2867,217 @@ class Run21bCarrySeedAndCarryCapTests(unittest.TestCase):
         self.assertEqual(
             body.count("claim_source == CARRY_CLAIM_SOURCE"), 2,
             "both the question-side and solution-side guards must honour it")
+
+
+class Run22GarbledHeaderAndOrphanInferenceTests(unittest.TestCase):
+    """run-22 (D1/D2/D3): defects found by the ch. 38 held-out validation run.
+
+    Ch. 38 ("Brachial Plexus and Nerves", pp. 666-702) was NOT one of the
+    chapters the round-2 image fixes were tuned on. Its image attribution came
+    out 38/38 correct with zero vision calls, but it exposed three unrelated
+    defects, all reproduced verbatim below from the real page text.
+    """
+
+    # --- D1: OCR mangles the colon after "Question N" -------------------
+    # PDF p670 prints "Question 13:"; tesseract read "Question 13, ~\".
+    # The old terminator class [.:\-\u2013)] had no comma, so NO branch matched
+    # and q13's four options + answer were never bound to the record, while
+    # its stem and solution arrived from other passes -- a record that looks
+    # complete but silently is not.
+    GARBLED = "Question 13, ~\\"
+
+    def test_garbled_comma_terminator_still_reads_as_a_stem_heading(self):
+        m = qp.QSTEM_HEADING_RE.match(self.GARBLED)
+        self.assertIsNotNone(m, "OCR ',' for ':' must not hide a question heading")
+        self.assertEqual(int(m.group(1)), 13)
+
+    def test_other_common_ocr_terminator_misreads(self):
+        for line, qn in (("Question 13,", 13), ("Question 13;", 13),
+                         ("Question 7\u00b7", 7), ("13]", 13),
+                         ("Question 12:", 12), ("13.", 13), ("13)", 13),
+                         ("13 -", 13)):
+            with self.subTest(line=line):
+                m = qp.QSTEM_HEADING_RE.match(line)
+                self.assertIsNotNone(m, f"{line!r} must match")
+                self.assertEqual(int(m.group(1)), qn)
+
+    def test_widened_class_does_not_swallow_prose(self):
+        # The class got LOOSER, so guard the false-positive side explicitly:
+        # a stray match costs one redundant Q-pass, but matching prose would
+        # invent headings on every page.
+        for line in ("in 13 patients with ulnar palsy", "the 13 nerves listed",
+                     "A 48-year-old construction worker presented", "",
+                     "Froment test negative"):
+            with self.subTest(line=line):
+                self.assertIsNone(qp.QSTEM_HEADING_RE.match(line))
+
+    def test_per_qno_helper_agrees_with_the_generic_one(self):
+        self.assertTrue(qp.qstem_heading_re_for(13).search(self.GARBLED))
+        self.assertFalse(qp.qstem_heading_re_for(14).search(self.GARBLED))
+
+    def test_single_source_of_truth_for_the_heading_pattern(self):
+        # The pattern used to be copy-pasted into six places and they drifted.
+        src = Path(qp.__file__).read_text()
+        self.assertNotIn(r'(\d{1,3})\s*[.:\-\u2013)]', src,
+                         "no call site may re-inline the old terminator class; "
+                         "use QSTEM_HEADING_RE / qstem_heading_re_for()")
+
+    # --- D3: carry seed must not cross a chapter boundary ----------------
+    def test_carry_seed_lookback_is_clamped_to_chapter_start(self):
+        src = Path(qp.__file__).read_text()
+        i = src.index('f"  [IMG] carry seeded from page')
+        window = src[max(0, i - 1800):i]
+        self.assertIn('_floor = max(1, int(ch.get("file_start") or 1))', window,
+                      "the walk-back must start from the chapter's own first "
+                      "page; ch. 38 (starts p666) seeded off ch. 37's p665")
+        self.assertIn("if _prev < _floor:", window,
+                      "the loop must break at the chapter floor, not at page 1")
+
+    # --- D2: infer a q_no-less fragment's owner from page position -------
+    def _orphan(self, frag, pages, last_qn, tables=None):
+        return {"chapter_id": "ANA-038", "batch_start": pages[0],
+                "pdf_pages": list(pages), "new_pages": list(pages),
+                "carry_q_no": None, "cut_part": None,
+                "last_qn_in_batch": last_qn, "pass": "S",
+                "item": {"q_no": None, "question_text": None,
+                         "solution_text": frag, "options": None,
+                         "correct_option": None, "tables": tables or [],
+                         "has_figure_in_question": False,
+                         "has_figure_in_solution": False}}
+
+    def _rec(self, qn, **kw):
+        r = {"q_no": qn, "question_text": None, "options": None,
+             "correct_option": None, "solution_text": None, "tables": [],
+             "has_figure_in_question": False, "has_figure_in_solution": False,
+             "_prov": {}}
+        r.update(kw)
+        return r
+
+    def _stats(self):
+        return {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
+                "carry_merges": 0, "contaminated_stems_blocked": 0,
+                "chapter_id": "ANA-038"}
+
+    def test_position_inference_beats_naive_last_qn(self):
+        """THE ch. 38 trap: last_qn_in_batch was 13, the true owner was 11.
+
+        Orphan text "Distal to pisiform it gives 2 terminal branches" is the
+        continuation of q11's solution, which ends "...lateral to pisiform
+        called Guyon's ulnar tunnel". A last_qn-based guess would have glued
+        q11's anatomy onto q13. Page position says the last heading printed
+        at/before p687 opened q11, so q11 wins.
+        """
+        frag = ("\u2022 Distal to pisiform it gives 2 terminal branches. One "
+                "superficial terminal and another deep terminal")
+        # VERBATIM from the ch. 38 run: q11's solution stops at "...ulnar
+        # tunnel" with NO dangling colon and no full stop. That is why this
+        # needed _solution_block_is_open() rather than
+        # looks_truncated_solution(), which only fires on an explicit
+        # dangling lead-in and would have left this fragment orphaned.
+        recs = {11: self._rec(11, solution_text=(
+                    "The course of the ulnar nerve: it passes superficial to "
+                    "flexor retinaculum but under a fascial band lateral to "
+                    "pisiform called Guyon's ulnar tunnel")),
+                13: self._rec(13, solution_text=(
+                    "The given clinical scenario is suggestive of an injury to "
+                    "the ulnar nerve before its division. Given below is the "
+                    "Froment test used to test adductor pollicis."))}
+        orphans = [self._orphan(frag, [686, 687], last_qn=13)]
+        stats = self._stats()
+        with mock.patch.object(qp, "last_block_on_page",
+                               side_effect=lambda _p, page, **kw:
+                                   ("solution", 11) if page == 687 else None):
+            remaining = qp.recover_orphans(orphans, recs, "ANA", 38, stats,
+                                           pdf_path="/tmp/book.pdf")
+        self.assertIn("pisiform it gives 2 terminal branches",
+                      recs[11]["solution_text"] or "")
+        self.assertNotIn("2 terminal branches", recs[13]["solution_text"] or "",
+                         "must NOT be glued onto last_qn_in_batch's record")
+        self.assertEqual(remaining, [])
+
+    def test_open_block_predicate_is_not_the_retry_predicate(self):
+        """_solution_block_is_open must be LOOSER than
+        looks_truncated_solution: the ch. 38 q11 tail has no dangling marker,
+        so reusing the retry predicate here would drop the continuation. But
+        it must still refuse a solution that ends in a full stop."""
+        q11_tail = ("The course of the ulnar nerve: it passes superficial to "
+                    "flexor retinaculum but under a fascial band lateral to "
+                    "pisiform called Guyon's ulnar tunnel")
+        self.assertFalse(qp.looks_truncated_solution(q11_tail),
+                         "guard the assumption this test rests on")
+        self.assertTrue(qp._solution_block_is_open(q11_tail))
+        self.assertTrue(qp._solution_block_is_open(""))
+        self.assertTrue(qp._solution_block_is_open("The steps are:"))
+        for closed in ("Ends with a full stop.", "Ends with a question mark?",
+                       "Froment test used to test adductor pollicis."):
+            with self.subTest(closed=closed):
+                self.assertFalse(qp._solution_block_is_open(closed))
+
+    def test_inference_never_overwrites_a_complete_solution(self):
+        """Owner found, but its solution already ends cleanly -> attach
+        nothing, and say so instead of the misleading 'could not determine
+        owner'. Reuses the same completeness guard as rule 3."""
+        recs = {11: self._rec(11, solution_text=(
+            "The ulnar nerve supplies the palmar interossei and the course "
+            "is fully described here, ending in a complete sentence."))}
+        orphans = [self._orphan("Some extra aside material.", [686, 687],
+                                last_qn=11)]
+        stats = self._stats()
+        with mock.patch.object(qp, "last_block_on_page",
+                               return_value=("solution", 11)):
+            remaining = qp.recover_orphans(orphans, recs, "ANA", 38, stats,
+                                           pdf_path="/tmp/book.pdf")
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0].get("inferred_owner"), 11)
+        self.assertEqual(remaining[0].get("blocked_reason"),
+                         "owner solution already complete")
+        self.assertNotIn("aside material", recs[11]["solution_text"])
+
+    def test_position_inference_never_places_a_bare_table(self):
+        """REGRESSION (found by re-running ch. 38 with the D2 fix in place):
+
+        the first cut of this fix also accepted table-only fragments, and
+        promptly glued the chapter-wide ANSWER KEY ("| 5 | c | 6 | a |
+        7 | b | ...", the answers to q5-q16) plus a sympathetic vs
+        parasympathetic comparison table onto q7's solution -- q7 was merely
+        the last heading printed before them. A table spanning many q_nos
+        belongs to the chapter, not to the preceding block. Position
+        inference is for PROSE continuations only.
+        """
+        key_table = {"type": "table",
+                     "markdown": "| 5 | c |\n|---|---|\n| 6 | a |\n| 7 | b |"}
+        recs = {7: self._rec(7, solution_text="Q7 solution ends cleanly.")}
+        orphans = [self._orphan(None, [677, 681], last_qn=None,
+                                tables=[key_table])]
+        stats = self._stats()
+        with mock.patch.object(qp, "last_block_on_page",
+                               return_value=("solution", 7)):
+            remaining = qp.recover_orphans(orphans, recs, "ANA", 38, stats,
+                                           pdf_path="/tmp/book.pdf")
+        self.assertEqual(len(remaining), 1,
+                         "a bare table must stay an orphan, not join q7")
+        self.assertEqual(recs[7].get("tables"), [],
+                         "the chapter answer key must never land on one question")
+
+    def test_inference_ignores_owners_outside_this_chapter(self):
+        recs = {11: self._rec(11, solution_text=None)}
+        orphans = [self._orphan("Fragment text here.", [686], last_qn=None)]
+        stats = self._stats()
+        with mock.patch.object(qp, "last_block_on_page",
+                               return_value=("solution", 99)):
+            remaining = qp.recover_orphans(orphans, recs, "ANA", 38, stats,
+                                           pdf_path="/tmp/book.pdf")
+        self.assertEqual(len(remaining), 1, "q99 is not in this chapter")
+        self.assertIsNone(recs[11]["solution_text"])
+
+    def test_inference_is_skipped_without_a_pdf_path(self):
+        """Callers that cannot supply the PDF (unit tests, older paths) must
+        keep the pre-fix behaviour rather than crash."""
+        recs = {11: self._rec(11, solution_text=None)}
+        orphans = [self._orphan("Fragment text here.", [686], last_qn=None)]
+        remaining = qp.recover_orphans(orphans, recs, "ANA", 38, self._stats())
+        self.assertEqual(len(remaining), 1)
+        self.assertIsNone(recs[11]["solution_text"])
 
 
 if __name__ == "__main__":
