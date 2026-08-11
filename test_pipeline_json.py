@@ -3238,9 +3238,10 @@ class Run22TocTruncationTests(unittest.TestCase):
 
     def test_default_scan_reaches_past_page_three(self):
         self.assertGreaterEqual(qp.TOC_SCAN_LAST_PAGE, 5)
+        # run-23 replaced the pinned default window with a growing scan, so
+        # the default is now None ("grow it") rather than a fixed tuple.
         sig = inspect.signature(qp.extract_toc_chapters)
-        self.assertEqual(sig.parameters["toc_page_range"].default,
-                         (1, qp.TOC_SCAN_LAST_PAGE))
+        self.assertIsNone(sig.parameters["toc_page_range"].default)
 
     def test_contiguous_table_is_kept_whole(self):
         toc = [{"chapter_no": i, "chapter_title": f"Ch {i}",
@@ -3281,6 +3282,145 @@ class Run22TocTruncationTests(unittest.TestCase):
 
     def test_empty_input_is_safe(self):
         self.assertEqual(qp._longest_toc_run([]), [])
+
+
+class Run23GrowingTocScanTests(unittest.TestCase):
+    """run-23: a FIXED TOC scan window is a book-specific constant in
+    disguise. 8 pages fits a 63-chapter book with short front matter, but a
+    110-chapter book needs ~11 contents pages and would be truncated exactly
+    as silently as run-22's 42-of-63. The scan now grows until it stops
+    finding chapters."""
+
+    def test_ceiling_is_above_the_first_window(self):
+        self.assertGreater(qp.TOC_SCAN_MAX_PAGE, qp.TOC_SCAN_LAST_PAGE)
+        self.assertGreater(qp.TOC_SCAN_GROW_STEP, 0)
+
+    def test_explicit_range_is_honoured_exactly(self):
+        """Callers and tests that pin a window must not get a grown scan."""
+        seen = []
+
+        def fake_scan(pdf, first, last):
+            seen.append((first, last))
+            return [{"chapter_no": 1, "chapter_title": "A", "start_printed_page": 1}]
+
+        with mock.patch.object(qp, "_scan_toc_candidates", fake_scan):
+            qp.extract_toc_chapters("x.pdf", toc_page_range=(1, 3))
+        self.assertEqual(seen, [(1, 3)])
+
+    def test_scan_grows_while_it_keeps_finding_chapters(self):
+        def fake_scan(pdf, first, last):
+            # a contents table that needs ~16 pages: 10 chapters per page
+            n = min(last * 10, 110)
+            return [{"chapter_no": i, "chapter_title": f"C{i}",
+                     "start_printed_page": i * 9} for i in range(1, n + 1)]
+
+        with mock.patch.object(qp, "_scan_toc_candidates", fake_scan):
+            got = qp.extract_toc_chapters("x.pdf")
+        self.assertEqual(len(got), 110)
+
+    def test_scan_stops_as_soon_as_widening_adds_nothing(self):
+        calls = []
+
+        def fake_scan(pdf, first, last):
+            calls.append(last)
+            return [{"chapter_no": i, "chapter_title": f"C{i}",
+                     "start_printed_page": i} for i in range(1, 21)]
+
+        with mock.patch.object(qp, "_scan_toc_candidates", fake_scan):
+            got = qp.extract_toc_chapters("x.pdf")
+        self.assertEqual(len(got), 20)
+        # first window, then ONE probe that found nothing new, then stop
+        self.assertEqual(len(calls), 2)
+
+    def test_scan_never_exceeds_the_ceiling(self):
+        seen = []
+
+        def fake_scan(pdf, first, last):
+            seen.append(last)
+            return [{"chapter_no": i, "chapter_title": f"C{i}",
+                     "start_printed_page": i} for i in range(1, last * 10)]
+
+        with mock.patch.object(qp, "_scan_toc_candidates", fake_scan):
+            qp.extract_toc_chapters("x.pdf")
+        self.assertLessEqual(max(seen), qp.TOC_SCAN_MAX_PAGE)
+
+    def test_body_noise_past_the_table_cannot_extend_the_run(self):
+        """Widening reaches body pages whose lines match the TOC regex."""
+        def fake_scan(pdf, first, last):
+            toc = [{"chapter_no": i, "chapter_title": f"C{i}",
+                    "start_printed_page": i * 9} for i in range(1, 13)]
+            if last > 8:      # body pages now in range
+                toc += [{"chapter_no": 3, "chapter_title": "patients were given",
+                         "start_printed_page": 40},
+                        {"chapter_no": 1, "chapter_title": "result was", "start_printed_page": 5}]
+            return toc
+
+        with mock.patch.object(qp, "_scan_toc_candidates", fake_scan):
+            got = qp.extract_toc_chapters("x.pdf")
+        self.assertEqual([c["chapter_no"] for c in got], list(range(1, 13)))
+
+
+class Run23BlankOptionHealTests(unittest.TestCase):
+    """run-23: ch. 30 q16's option D was printed at the top of the NEXT page,
+    so the Q-pass emitted {"D": None}. targeted_retry used setdefault(), which
+    only fills ABSENT keys -- a present-but-empty option could never be
+    healed. The model returned the right text in both rounds and both were
+    silently discarded; the round then scored 0 fixes, tripping the "no
+    progress -- stopping" rule, which ALSO cancelled the retry for an
+    unrelated solution gap in the same chapter."""
+
+    @staticmethod
+    def _apply(rec_options, fix_options):
+        """The patch-apply block from targeted_retry, in isolation."""
+        rec = {"options": dict(rec_options)}
+        filled_here = 0
+        for k, v in fix_options.items():
+            if not (v and str(v).strip()):
+                continue
+            key = str(k).strip().upper()
+            if not (rec["options"].get(key) or "").strip():
+                rec["options"][key] = v
+                filled_here += 1
+        return rec["options"], filled_here
+
+    def test_blank_option_is_healed(self):
+        opts, n = self._apply(
+            {"A": "Superior thyroid artery", "B": "Facial artery",
+             "C": "Ascending pharyngeal artery", "D": None},
+            {"D": "Lingual artery"})
+        self.assertEqual(opts["D"], "Lingual artery")
+        self.assertEqual(n, 1)
+
+    def test_whitespace_only_option_is_healed(self):
+        opts, n = self._apply({"A": "x", "B": "y", "C": "z", "D": "   "},
+                              {"D": "Lingual artery"})
+        self.assertEqual(opts["D"], "Lingual artery")
+        self.assertEqual(n, 1)
+
+    def test_absent_option_still_added(self):
+        opts, n = self._apply({"A": "x", "B": "y", "C": "z"}, {"D": "w"})
+        self.assertEqual(opts["D"], "w")
+        self.assertEqual(n, 1)
+
+    def test_real_option_text_is_never_overwritten(self):
+        """A retry is a patch, not permission to rewrite good data."""
+        opts, n = self._apply({"A": "correct text", "B": "y", "C": "z", "D": "w"},
+                              {"A": "MODEL HALLUCINATION"})
+        self.assertEqual(opts["A"], "correct text")
+        self.assertEqual(n, 0)
+
+    def test_empty_patch_value_is_not_counted_as_progress(self):
+        opts, n = self._apply({"A": "x", "B": "y", "C": "z", "D": None}, {"D": None})
+        self.assertIsNone(opts["D"])
+        self.assertEqual(n, 0)
+
+    def test_blank_option_is_reported_as_incomplete(self):
+        """The detector was already right -- keep it that way."""
+        recs = {16: {"question_text": "Q?", "correct_option": "C",
+                     "solution_text": "S", "tables": [],
+                     "options": {"A": "a", "B": "b", "C": "c", "D": None}}}
+        missing = dict(qp.find_incomplete_records(recs))
+        self.assertIn("options", missing.get(16, []))
 
 
 if __name__ == "__main__":

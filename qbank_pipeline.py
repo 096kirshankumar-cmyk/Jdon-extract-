@@ -95,6 +95,21 @@ TOC_SCAN_LAST_PAGE = 8          # run-22: how many leading pages to scan for
                                  # never processed. Over-scanning is safe:
                                  # _longest_toc_run() discards anything that
                                  # is not a contiguous chapter sequence.
+                                 # NOTE: this is only the FIRST window. The
+                                 # scan now GROWS automatically -- see
+                                 # TOC_SCAN_MAX_PAGE and extract_toc_chapters.
+TOC_SCAN_MAX_PAGE = 40          # run-23: hard ceiling for the growing TOC
+                                 # scan. A fixed 8-page window is a book-
+                                 # specific constant in disguise: a 110-chapter
+                                 # book needs ~9-11 contents pages, and a book
+                                 # with a long front matter (title, copyright,
+                                 # foreword, contributors) can push the table
+                                 # well past page 8. Both cases truncate the
+                                 # chapter list SILENTLY, which is the exact
+                                 # class of bug run-22 fixed for 63 chapters.
+                                 # 40 pages of pdftotext is ~0.2s and costs no
+                                 # API calls, so the ceiling is generous.
+TOC_SCAN_GROW_STEP = 8          # widen by this many pages per attempt.
 PAGES_PER_GEMINI_CALL = 6       # tune this: more pages/call = fewer calls,
                                  # but keep it small enough that Gemini can
                                  # read every question accurately
@@ -309,27 +324,10 @@ def keypool_summary(state):
 # pdftotext even on PDFs where body-page text is broken/garbled)
 # ============================================================
 
-def extract_toc_chapters(pdf_path, toc_page_range=(1, TOC_SCAN_LAST_PAGE)):
-    """
-    Returns [{"chapter_no": int, "chapter_title": str, "start_printed_page": int}, ...]
-
-    RUN-22 SILENT CHAPTER TRUNCATION: the default range was (1, 3), which on
-    the MARROW ED8 Anatomy book found only chapters 1-42 -- its contents table
-    spans FIVE pages, so chapters 43-63 (printed pages 800-1217, a third of
-    the book) were never detected. Nothing failed: process_pdf simply never
-    saw those chapters, so a full-book run silently produced no questions for
-    them and no gate flag could fire, because the gate only reports on
-    chapters it knows about.
-
-    Scanning wider is not free -- past the real contents table, ordinary body
-    pages contain lines that match the same "<n> <title> <page>" shape and
-    would inject phantom chapters. So the scan is widened AND the result is
-    validated: keep only the longest run that starts at chapter 1 and has
-    strictly increasing chapter numbers with non-decreasing start pages. A
-    real contents table satisfies this; scattered body-text matches do not.
-    """
+def _scan_toc_candidates(pdf_path, first_page, last_page):
+    """pdftotext one window and return every "<n> <title> <page>" line in it."""
     text = subprocess.run(
-        ["pdftotext", "-f", str(toc_page_range[0]), "-l", str(toc_page_range[1]),
+        ["pdftotext", "-f", str(first_page), "-l", str(last_page),
          "-layout", pdf_path, "-"],
         capture_output=True, text=True
     ).stdout
@@ -348,7 +346,69 @@ def extract_toc_chapters(pdf_path, toc_page_range=(1, TOC_SCAN_LAST_PAGE)):
                 "chapter_title": title,
                 "start_printed_page": int(page),
             })
-    return _longest_toc_run(candidates)
+    return candidates
+
+
+def extract_toc_chapters(pdf_path, toc_page_range=None):
+    """
+    Returns [{"chapter_no": int, "chapter_title": str, "start_printed_page": int}, ...]
+
+    RUN-23 GROWING SCAN: pass toc_page_range to pin the window (tests do this).
+    Left as None, the scan starts at TOC_SCAN_LAST_PAGE and widens by
+    TOC_SCAN_GROW_STEP until the detected chapter count STOPS growing, or
+    TOC_SCAN_MAX_PAGE is reached. A fixed window is a book-specific constant
+    in disguise -- 8 pages happens to fit a 63-chapter book with short front
+    matter, but a 110-chapter book needs ~9-11 contents pages and would be
+    truncated just as silently as run-22's 42-of-63. Widening is free
+    (pdftotext, no API calls) and safe (_longest_toc_run rejects non-contiguous
+    body-text noise), so the scan keeps growing while it is still finding
+    chapters and stops as soon as it is not.
+
+    RUN-22 SILENT CHAPTER TRUNCATION: the default range was (1, 3), which on
+    the MARROW ED8 Anatomy book found only chapters 1-42 -- its contents table
+    spans FIVE pages, so chapters 43-63 (printed pages 800-1217, a third of
+    the book) were never detected. Nothing failed: process_pdf simply never
+    saw those chapters, so a full-book run silently produced no questions for
+    them and no gate flag could fire, because the gate only reports on
+    chapters it knows about.
+
+    Scanning wider is not free -- past the real contents table, ordinary body
+    pages contain lines that match the same "<n> <title> <page>" shape and
+    would inject phantom chapters. So the scan is widened AND the result is
+    validated: keep only the longest run that starts at chapter 1 and has
+    strictly increasing chapter numbers with non-decreasing start pages. A
+    real contents table satisfies this; scattered body-text matches do not.
+    """
+    if toc_page_range is not None:
+        # Explicit window -- honour it exactly (used by tests and callers that
+        # already know where the contents table is).
+        return _longest_toc_run(
+            _scan_toc_candidates(pdf_path, toc_page_range[0], toc_page_range[1]))
+
+    last = TOC_SCAN_LAST_PAGE
+    best = _longest_toc_run(_scan_toc_candidates(pdf_path, 1, last))
+
+    while last < TOC_SCAN_MAX_PAGE:
+        wider = min(last + TOC_SCAN_GROW_STEP, TOC_SCAN_MAX_PAGE)
+        found = _longest_toc_run(_scan_toc_candidates(pdf_path, 1, wider))
+        if len(found) <= len(best):
+            # Widening stopped paying. The contents table has ended; anything
+            # further is body text, which _longest_toc_run already rejects.
+            break
+        print(f"  [TOC] scan widened to page {wider}: "
+              f"{len(best)} -> {len(found)} chapters")
+        best, last = found, wider
+
+    if best and len(best) != best[-1]["chapter_no"]:
+        # Defensive: _longest_toc_run guarantees a 1..N run, so this should be
+        # unreachable. Loud rather than silent if that ever changes.
+        print(f"  [TOC] WARNING: kept {len(best)} chapters but the last is "
+              f"numbered {best[-1]['chapter_no']} -- non-contiguous run")
+    if best and last >= TOC_SCAN_MAX_PAGE:
+        print(f"  [TOC] WARNING: scan hit the {TOC_SCAN_MAX_PAGE}-page ceiling "
+              f"with {len(best)} chapters; raise TOC_SCAN_MAX_PAGE if this "
+              f"book's contents table is longer")
+    return best
 
 
 def _longest_toc_run(candidates):
@@ -1814,11 +1874,23 @@ def targeted_retry(model, page_files, chapter_records, state, max_rounds=2,
                         fixed_this_round += 1
             if "options" in requested and fix.get("options"):
                 rec["options"] = rec.get("options") or {}
-                before = len(rec["options"])
+                # run-23: setdefault() could not heal a PRESENT-BUT-EMPTY
+                # option. ch. 30 q16's option D was printed at the top of the
+                # next page, so the Q-pass emitted {"D": None}; the key
+                # existed, so setdefault discarded the correct "Lingual
+                # artery" the model returned in BOTH retry rounds, and the
+                # round scored 0 fixes ("no progress -- stopping"), which
+                # also cancelled the retry for the unrelated q7 gap. Fill a
+                # slot when it is missing OR blank; never overwrite real text.
+                filled_here = 0
                 for k, v in fix["options"].items():
-                    if v:  # don't let a null/empty value overwrite nothing-useful
-                        rec["options"].setdefault(str(k).strip().upper(), v)
-                if len(rec["options"]) > before:
+                    if not (v and str(v).strip()):
+                        continue        # a null/empty patch value is not a fix
+                    key = str(k).strip().upper()
+                    if not (rec["options"].get(key) or "").strip():
+                        rec["options"][key] = v
+                        filled_here += 1
+                if filled_here:
                     fixed_this_round += 1
 
         print(f"  [RETRY] round {round_no}: filled {fixed_this_round} field(s)")
