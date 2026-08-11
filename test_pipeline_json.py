@@ -2667,5 +2667,202 @@ class ZipResetIsolationTests(unittest.TestCase):
         self.assertTrue(any(n.endswith("data/questions.jsonl") for n in names))
 
 
+class Run21ImageAttributionTests(unittest.TestCase):
+    """run-21 (2026-08-11): the three real-run defects found on a live ANA
+    chapter-9 pass over the MARROW ED8 book (46 MB, garbled text layer).
+
+    1. OCR anchor line-grouping: the y-average grouper split
+       "Solution to Question 10:" and the tail fragment "10:" matched the
+       QUESTION regex -- every solution-page figure was attributed to the
+       question slot of the wrong q_no.
+    2. Flat over-attribution cap refused a 4th figure the model had DECLARED
+       for q12 (ANA-009-012), dumping a real figure into unmatched_images.
+    3. A continuation page with zero printed headings (p158) bailed out of
+       the deterministic OCR pass entirely instead of using the open block.
+    """
+
+    def setUp(self):
+        qp._declared_image_allowance.clear()
+
+    tearDown = setUp
+
+    # --- 1. anchor classification ------------------------------------
+    def _data(self, lines):
+        """Fake pytesseract image_to_data dict; each line is its own line_num."""
+        d = {k: [] for k in ("text", "left", "top", "height", "conf",
+                             "block_num", "par_num", "line_num")}
+        for li, (y, text) in enumerate(lines):
+            for wi, w in enumerate(text.split()):
+                d["text"].append(w)
+                d["left"].append(50 + wi * 40)
+                d["top"].append(y)
+                d["height"].append(12)
+                d["conf"].append(90)
+                d["block_num"].append(1)
+                d["par_num"].append(1)
+                d["line_num"].append(li)
+        return d
+
+    def test_solution_header_is_not_read_as_question_anchor(self):
+        data = self._data([(100, "Solution to Question 10:"),
+                           (400, "Solution to Question 11:")])
+        anchors = qp._ocr_anchors_from_data(data, scale=2.0, img_h=1000)
+        kinds = {(k, qn) for k, qn, _y in anchors}
+        self.assertIn(("solution", 10), kinds)
+        self.assertIn(("solution", 11), kinds)
+        # the regression: NEITHER may appear as a question anchor
+        self.assertNotIn(("question", 10), kinds)
+        self.assertNotIn(("question", 11), kinds)
+
+    def test_real_question_stem_still_anchors_as_question(self):
+        data = self._data([(100, "Question 14:"), (400, "Question 15:")])
+        anchors = qp._ocr_anchors_from_data(data, scale=2.0, img_h=1000)
+        kinds = {(k, qn) for k, qn, _y in anchors}
+        self.assertEqual(kinds, {("question", 14), ("question", 15)})
+
+    def test_grouper_falls_back_when_line_ids_absent(self):
+        data = self._data([(100, "Question 7:")])
+        for k in ("block_num", "par_num", "line_num"):
+            data.pop(k)
+        anchors = qp._ocr_anchors_from_data(data, scale=2.0, img_h=1000)
+        self.assertEqual([(k, qn) for k, qn, _y in anchors], [("question", 7)])
+
+    # --- 2. dynamic image cap ----------------------------------------
+    def test_positional_claim_keeps_the_strict_cap(self):
+        self.assertEqual(qp.image_cap_for("ANA", 9, 12, "question"),
+                         qp.MAX_QUESTION_IMAGES)
+        self.assertEqual(qp.image_cap_for("ANA", 9, 12, "solution"),
+                         qp.MAX_SOLUTION_IMAGES)
+
+    def test_model_declared_owner_raises_cap_and_is_remembered(self):
+        key = qp._allowance_key("ANA", 9, 12, "question")
+        qp._declared_image_allowance[key] = 4
+        # the sweep and any later claim must both see the RAISED cap, else
+        # the trim silently undoes the fix a few hundred lines later
+        self.assertEqual(qp.image_cap_for("ANA", 9, 12, "question"), 4)
+        self.assertEqual(qp.image_cap_for("ANA", 9, 13, "question"),
+                         qp.MAX_QUESTION_IMAGES)   # scoped per question
+
+    def test_ceilings_are_finite_and_above_the_soft_caps(self):
+        self.assertGreater(qp.IMAGE_CAP_CEILING_QUESTION, qp.MAX_QUESTION_IMAGES)
+        self.assertGreater(qp.IMAGE_CAP_CEILING_SOLUTION, qp.MAX_SOLUTION_IMAGES)
+        self.assertLessEqual(qp.IMAGE_CAP_CEILING_QUESTION, 8)
+
+    def test_model_claim_sources_cover_all_three_model_passes(self):
+        self.assertEqual(qp.MODEL_CLAIM_SOURCES,
+                         frozenset({"figure_map", "full_page_vision",
+                                    "isolated_crop_vision"}))
+
+    # --- 3. isolated-crop page context -------------------------------
+    def test_isolated_crop_prompt_has_page_context_placeholders(self):
+        for token in ("{PAGE_NO}", "{ANCHORS}", "{PAGE_QNOS}"):
+            self.assertIn(token, qp.IMAGE_ATTRIBUTION_PAGE_CONTEXT)
+        # the crop pass must now ask for a confidence it can log
+        self.assertIn("confidence", qp.IMAGE_ATTRIBUTION_PROMPT)
+
+    def test_attribute_orphan_image_accepts_page_context_args(self):
+        import inspect
+        sig = inspect.signature(qp.attribute_orphan_image)
+        self.assertIn("pdf_path", sig.parameters)
+        self.assertIn("file_page", sig.parameters)
+        # optional -- existing callers must keep working unchanged
+        self.assertIsNone(sig.parameters["pdf_path"].default)
+        self.assertIsNone(sig.parameters["file_page"].default)
+
+    def test_verdict_confidence_reads_the_l4_verdict(self):
+        v = {"q_no": 12, "slot": "question", "confidence": "high"}
+        self.assertEqual(qp._verdict_confidence({"x.webp": v}, "x.webp"), "high")
+        self.assertIsNone(qp._verdict_confidence({"x.webp": {}}, "x.webp"))
+
+
+class Run21bCarrySeedAndCarryCapTests(unittest.TestCase):
+    """run-21 §2.1(b)/(c) -- the two image defects that survived the first
+    round of run-21 fixes and were caught by diffing the post-fix ANA ch.9
+    run against its baseline.
+
+    (b) CARRY SEEDING. Batch windows overlap, and a window skips pages the
+        PREVIOUS window already imaged (`pages_imaged`). So the ch.9 window
+        "160-163" actually iterates images from p161 onward, while the block
+        owning p161's top figure was opened by the heading printed on p160 --
+        a page this window never visits. The per-page carry advance therefore
+        could never see it, the pass-level carry was empty ("carry-in: -"),
+        and a deterministically-ownable figure fell through to full-page
+        vision, which answered "q16, high confidence" when the printed page
+        says the figure belongs to q15.
+
+    (c) CARRY CLAIMS vs THE FLAT CAP. q11's solution genuinely spans three
+        figures (p158 x2 + p159). The flat solution cap of 2 refused the
+        third *even though* it came from the deterministic cross-page carry,
+        and the refused file went to vision, which misfiled it under q12.
+        A carry claim is page evidence, not the "stacking a neighbour's
+        figures" pattern the flat cap exists to stop, so it may reach the
+        model ceiling.
+    """
+
+    def setUp(self):
+        qp._declared_image_allowance.clear()
+
+    def tearDown(self):
+        qp._declared_image_allowance.clear()
+
+    # --- (b) carry seeding -------------------------------------------
+    def test_carry_seed_lookback_is_a_small_positive_window(self):
+        self.assertIsInstance(qp.CARRY_SEED_LOOKBACK_PAGES, int)
+        self.assertGreaterEqual(qp.CARRY_SEED_LOOKBACK_PAGES, 1)
+        self.assertLessEqual(qp.CARRY_SEED_LOOKBACK_PAGES, 5,
+                             "a long lookback would resurrect stale blocks")
+
+    def test_carry_seeding_block_present_in_window_loop(self):
+        src = Path(qp.__file__).read_text()
+        self.assertIn("carry seeded from page", src,
+                      "the window loop must seed active_block from the page "
+                      "before its first imaged page")
+        self.assertIn("CARRY_SEED_LOOKBACK_PAGES", src)
+
+    def test_carry_seed_only_runs_when_no_pass_carry_exists(self):
+        src = Path(qp.__file__).read_text()
+        i = src.index("carry seeded from page")
+        window = src[max(0, i - 1400):i]
+        self.assertIn("if active_block is None and window_rows:", window,
+                      "seeding must never override a real pass-level carry")
+
+    # --- (c) carry claims and the cap --------------------------------
+    def test_carry_claim_source_is_distinct_from_plain_positional(self):
+        self.assertNotEqual(qp.CARRY_CLAIM_SOURCE, "positional")
+        self.assertNotIn(qp.CARRY_CLAIM_SOURCE, qp.MODEL_CLAIM_SOURCES,
+                         "a carry is deterministic, not a model claim")
+
+    def test_carry_claim_may_exceed_the_flat_solution_cap(self):
+        """q11 (p158 x2 + p159) -- the exact ch.9 refusal."""
+        entry = {"question": [], "solution": ["a.webp", "b.webp"]}
+        self.assertEqual(len(entry["solution"]), qp.MAX_SOLUTION_IMAGES)
+        cap = qp.image_cap_for("ANA", 9, 11, "solution")
+        raised = max(cap, min(len(entry["solution"]) + 1,
+                              qp.IMAGE_CAP_CEILING_SOLUTION))
+        self.assertGreater(raised, qp.MAX_SOLUTION_IMAGES)
+        self.assertLessEqual(raised, qp.IMAGE_CAP_CEILING_SOLUTION)
+
+    def test_plain_positional_claim_still_stops_at_the_flat_cap(self):
+        cap = qp.image_cap_for("ANA", 9, 11, "solution")
+        self.assertEqual(cap, qp.MAX_SOLUTION_IMAGES,
+                         "same-page positional stacking must stay capped")
+
+    def test_both_positional_claim_sites_tag_the_carry_source(self):
+        src = Path(qp.__file__).read_text()
+        self.assertEqual(
+            src.count("if owner is active_block"), 2,
+            "claim_page_images and claim_block_images_ocr must BOTH tag a "
+            "carry-derived owner so the cap can tell it from same-page "
+            "positional stacking")
+
+    def test_carry_source_reaches_rename_guard(self):
+        src = Path(qp.__file__).read_text()
+        i = src.index("def _rename_for_slot")
+        body = src[i:i + 6000]
+        self.assertEqual(
+            body.count("claim_source == CARRY_CLAIM_SOURCE"), 2,
+            "both the question-side and solution-side guards must honour it")
+
+
 if __name__ == "__main__":
     unittest.main()

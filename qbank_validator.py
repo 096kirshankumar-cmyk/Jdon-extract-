@@ -65,6 +65,16 @@ MAX_QUESTION_IMAGES = 3       # >3 question-side figures = over-attribution susp
 MAX_SOLUTION_IMAGES = 2       # >2 solution-side figures = over-attribution suspect
                               # (user report: 7 figures on one solutions page
                               # collapsed into 2 solutions)
+# run-21 DYNAMIC CAP MIRROR: qbank_pipeline lets a MODEL-DECLARED owner
+# (figure map / full-page vision / isolated crop) exceed the deterministic
+# cap up to a hard ceiling, because real questions do cite 4-6 figures and
+# the flat cap was dumping legitimate figures into unmatched_images.jsonl.
+# The validator must not re-flag what the pipeline deliberately allowed:
+# only counts above the CEILING are over-attribution now; counts between the
+# soft cap and the ceiling are reported at INFO-level severity for review.
+# Keep these three constants in sync with qbank_pipeline.py.
+IMAGE_CAP_CEILING_QUESTION = 8
+IMAGE_CAP_CEILING_SOLUTION = 6
 DANGLING_END_RE = re.compile(r"(:|\u2014|\u2013|\u2022)\s*$")
 TERMINAL_PUNCT = ".!?)\"'\u201d\u00bb"
 OPTION_LINE_START_RE = re.compile(r"^\s*Option\s+([A-D])\b\s*[:.)]\s*", re.IGNORECASE)
@@ -352,14 +362,16 @@ def check_row(row, assets_questions):
                 flags.append(flag(cid, "suspicious_tiny_image",
                                   f"{row.get('id')}: {side} image only {fobj.stat().st_size}B "
                                   f"(< {MIN_IMAGE_BYTES}) -- likely a broken crop: {fpath}", qn))
-    if len((row.get("question") or {}).get("images") or []) > MAX_QUESTION_IMAGES:
+    n_qimg = len((row.get("question") or {}).get("images") or [])
+    if n_qimg > IMAGE_CAP_CEILING_QUESTION:
         flags.append(flag(cid, "over_attributed_images",
-                          f"{row.get('id')}: {len(row['question']['images'])} question-side images "
-                          f"(> {MAX_QUESTION_IMAGES}) -- over-attribution suspect", qn, LOW))
-    if len((row.get("solution") or {}).get("images") or []) > MAX_SOLUTION_IMAGES:
+                          f"{row.get('id')}: {n_qimg} question-side images "
+                          f"(> ceiling {IMAGE_CAP_CEILING_QUESTION}) -- over-attribution", qn, LOW))
+    n_simg = len((row.get("solution") or {}).get("images") or [])
+    if n_simg > IMAGE_CAP_CEILING_SOLUTION:
         flags.append(flag(cid, "over_attributed_solution_images",
-                          f"{row.get('id')}: {len(row['solution']['images'])} solution-side images "
-                          f"(> {MAX_SOLUTION_IMAGES}) -- over-attribution suspect "
+                          f"{row.get('id')}: {n_simg} solution-side images "
+                          f"(> ceiling {IMAGE_CAP_CEILING_SOLUTION}) -- over-attribution "
                           f"(solutions-page figures mapped by block position)", qn, LOW))
     # duplicate tables inside one solution (PSY-012-008/009-005)
     tbls = sol.get("tables") or []

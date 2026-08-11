@@ -1329,40 +1329,46 @@ def chapter_integrity_sweep(chapter_records, image_files_by_q, subject, chapter_
 
     # 4. over-attributed question images (022-003 class, rows healed by the
     #    recovery path where the rename-time cap never ran).
+    # run-21: trim to the cap ACTUALLY IN FORCE for this question. When a
+    # model-declared claim earned a higher allowance, the sweep must honour
+    # the same number -- trimming back to the flat MAX_QUESTION_IMAGES here
+    # would silently undo the dynamic cap a few hundred lines later.
     for qn in qns:
         entry = image_files_by_q.get(qn)
-        if not entry or len(entry.get("question") or []) <= MAX_QUESTION_IMAGES:
+        cap = image_cap_for(subject, chapter_no, qn, "question")
+        if not entry or len(entry.get("question") or []) <= cap:
             continue
-        extras = entry["question"][MAX_QUESTION_IMAGES:]
-        del entry["question"][MAX_QUESTION_IMAGES:]
+        extras = entry["question"][cap:]
+        del entry["question"][cap:]
         _append_jsonl(DATA_DIR / "unmatched_images.jsonl",
                       {"subject": subject, "chapter_id": f"{subject}-{chapter_no:03d}",
                        "page": None, "files": extras,
-                       "reason": f"over-attribution sweep (> {MAX_QUESTION_IMAGES} question "
+                       "reason": f"over-attribution sweep (> {cap} question "
                                  f"images on one question) -- de-referenced for review"})
         iflag("question_images_trimmed", qn,
-              f"had {len(extras) + MAX_QUESTION_IMAGES} question images; kept first "
-              f"{MAX_QUESTION_IMAGES}, de-referenced {len(extras)}")
+              f"had {len(extras) + cap} question images; kept first "
+              f"{cap}, de-referenced {len(extras)}")
         print(f"  [SWEEP] q{qn}: de-referenced {len(extras)} over-attributed question "
-              f"image(s) -- logged to unmatched_images.jsonl")
+              f"image(s) beyond cap {cap} -- logged to unmatched_images.jsonl")
 
     # 4b. over-attributed SOLUTION images (same class on the solution side:
     #     user report -- 7 figures on one solutions page collapsed into 2
     #     solutions; the sweep also heals rows from runs before the cap).
     for qn in qns:
         entry = image_files_by_q.get(qn)
-        if not entry or len(entry.get("solution") or []) <= MAX_SOLUTION_IMAGES:
+        cap = image_cap_for(subject, chapter_no, qn, "solution")
+        if not entry or len(entry.get("solution") or []) <= cap:
             continue
-        extras = entry["solution"][MAX_SOLUTION_IMAGES:]
-        del entry["solution"][MAX_SOLUTION_IMAGES:]
+        extras = entry["solution"][cap:]
+        del entry["solution"][cap:]
         _append_jsonl(DATA_DIR / "unmatched_images.jsonl",
                       {"subject": subject, "chapter_id": f"{subject}-{chapter_no:03d}",
                        "page": None, "files": extras,
-                       "reason": f"over-attribution sweep (> {MAX_SOLUTION_IMAGES} solution "
+                       "reason": f"over-attribution sweep (> {cap} solution "
                                  f"images on one question) -- de-referenced for review"})
         iflag("solution_images_trimmed", qn,
-              f"had {len(extras) + MAX_SOLUTION_IMAGES} solution images; kept first "
-              f"{MAX_SOLUTION_IMAGES}, de-referenced {len(extras)}")
+              f"had {len(extras) + cap} solution images; kept first "
+              f"{cap}, de-referenced {len(extras)}")
         print(f"  [SWEEP] q{qn}: de-referenced {len(extras)} over-attributed solution "
               f"image(s) -- logged to unmatched_images.jsonl")
 
@@ -3019,6 +3025,54 @@ SECTION_HEADING_RE = re.compile(
 
 # --- run-4 audit RCA guards (2026-07-26 full-output audit; see
 # ROOT_CAUSE_ANALYSIS.md "Run-4 audit" section). Deterministic, zero-token:
+# --- run-21 DYNAMIC IMAGE CAP (2026-08-11) -------------------------------
+# The flat cap below is the right default for DETERMINISTIC claims (block
+# position / OCR geometry): those stack a neighbour's figures onto whichever
+# question happens to sit above them, so 3 is a real over-attribution signal.
+# It is the WRONG rule for a claim the MODEL declared while looking at the
+# printed page: ANA-009-012 legitimately cites 4 figures, and the flat cap
+# refused the 4th ("over-attribution guard: ... already has 3 question images")
+# even though the full-page vision pass had named q12 with a printed anchor.
+# The refused file then landed in unmatched_images.jsonl and tripped the
+# export gate -- content loss dressed up as a safety guard.
+#
+# Rule: a model-declared owner may exceed the deterministic cap up to a hard
+# ceiling; positional claims stay at the strict cap. The per-question
+# allowance actually granted is remembered so the late over-attribution sweep
+# trims to the SAME number instead of undoing the fix.
+IMAGE_CAP_CEILING_QUESTION = 8   # hard ceiling even for model-declared owners
+IMAGE_CAP_CEILING_SOLUTION = 6
+# How many pages back to look for the block that is still open when a window's
+# leading pages were already imaged by the previous window (run-21 §2.1(b)).
+CARRY_SEED_LOOKBACK_PAGES = 3
+# A cross-page CARRY claim is deterministic page evidence (the block provably
+# opened on an earlier page and no new heading has been printed since), so it
+# is not the "stacking neighbours' figures" failure the flat cap defends
+# against. ch9 q11's solution genuinely spans p158 x2 + p159; the flat cap of 2
+# refused the third and handed it to vision, which then misfiled it under q12.
+# Carry claims may reach the model ceiling; plain same-page positional claims
+# still stop at the strict cap.
+CARRY_CLAIM_SOURCE = "positional_carry"
+MODEL_CLAIM_SOURCES = frozenset((
+    "figure_map",            # model's window-level figure map (exact-count guarded)
+    "full_page_vision",      # L3: red-boxed page render, printed-anchor evidence
+    "isolated_crop_vision",  # L4: last-resort single-image verdict
+))
+_declared_image_allowance = {}   # (subject, chapter_no, qn, kind) -> granted cap
+
+
+def _allowance_key(subject, chapter_no, qn, kind):
+    return (subject, int(chapter_no), int(qn), kind)
+
+
+def image_cap_for(subject, chapter_no, qn, kind):
+    """The cap in force for one (question, side) -- the deterministic default
+    unless a model-declared claim already earned a higher allowance."""
+    base = MAX_QUESTION_IMAGES if kind == "question" else MAX_SOLUTION_IMAGES
+    return max(base, _declared_image_allowance.get(
+        _allowance_key(subject, chapter_no, qn, kind), 0))
+
+
 MAX_QUESTION_IMAGES = 3       # >3 question-side figures on ONE question is almost
                               # certainly wrong-owner attribution (PSY-022-003
                               # collected SEVEN via repeated model-confirmed passes).
@@ -3628,23 +3682,54 @@ Look at the image and decide: does it BELONG to one of these questions
 its solution refers to)?
 
 Return ONE JSON object only:
-{"q_no": <int>|null, "slot": "question"|"solution"|null, "decorative": true|false}
+{"q_no": <int>|null, "slot": "question"|"solution"|null, "decorative": true|false,
+ "confidence": "high"|"medium"|"low", "evidence": "<short reason>"}
 - q_no: the question this image belongs to. null if it belongs to none.
 - slot: "question" if the figure appears with/above the stem, "solution" if
   it appears in the explanation region. null if q_no is null.
 - decorative: true ONLY if you are confident this is decoration/unrelated to
   any question (portrait, logo, ornament, watermark, cover art, chapter icon).
+- confidence: how sure you are of q_no. Use "low" when you are guessing.
 Never guess a number. When unsure between decorative and a weak match,
 prefer {"q_no": null, "decorative": true}.
 """
 
 
-def attribute_orphan_image(model, rel_path, chapter_records, state):
+# run-21 §2.1: the isolated-crop pass used to receive ONLY the cropped figure.
+# On a multi-question page with a shared figure that is unanswerable -- the
+# crop carries no printed question number, so the model either guessed or
+# said "decorative", and 14 of 31 export-gate violations came from exactly
+# this call. It now ALSO receives the rendered page the crop came from plus
+# the OCR'd printed anchors for that page, so it can read the same layout
+# evidence the full-page pass uses.
+IMAGE_ATTRIBUTION_PAGE_CONTEXT = """
+Two images are attached:
+  1. the extracted figure itself (the one you must attribute),
+  2. the FULL rendered page {PAGE_NO} that the figure was taken from.
+Printed block anchors OCR'd from that page, top to bottom:
+{ANCHORS}
+Question numbers printed on this page: {PAGE_QNOS}
+Use the page render and these anchors as the PRIMARY evidence: find where the
+figure sits on the page and read the question number printed above it, or the
+"Solution to Question N:" header of the block it falls inside. Prefer that
+printed evidence over the medical content of the figure. If the figure sits
+between two questions, it belongs to the one whose text is printed ABOVE it.
+"""
+
+
+def attribute_orphan_image(model, rel_path, chapter_records, state,
+                           pdf_path=None, file_page=None):
     """FINAL safety net (Gap-2): one image, one call, one verdict. Never
     grouped -- a single image per call removes cross-image confusion.
     Returns (verdict_dict | None). Quota-brake-safe: returns
     {"decorative": "brake"} when the daily limit is hit so the caller can
-    stop and persist instead of guessing."""
+    stop and persist instead of guessing.
+
+    run-21 §2.1: when pdf_path/file_page are supplied the call also carries
+    the RENDERED PAGE and its OCR'd printed anchors, so the model can place
+    the crop by layout instead of guessing from medical content alone. This
+    is the single biggest source of export-gate violations (14/31) -- an
+    isolated crop on a multi-question page is genuinely unattributable."""
     reset_daily_counter_if_needed(state)
     if quota_exhausted(state):
         print("  [IMG] daily call limit reached during image attribution -- leftovers stay queued")
@@ -3654,6 +3739,28 @@ def attribute_orphan_image(model, rel_path, chapter_records, state):
         for qn in sorted(chapter_records)
     ) or "(no question text available)"
     prompt = IMAGE_ATTRIBUTION_PROMPT.replace("{Q_LIST}", q_list)
+    # --- page context (run-21) ---------------------------------------
+    page_img = None
+    if pdf_path is not None and file_page:
+        try:
+            r_img, r_scale, r_h = render_page_png(pdf_path, file_page)
+        except Exception:
+            r_img = None
+        if r_img is not None:
+            page_img = r_img
+            anchors = []
+            try:
+                anchors = ocr_page_anchors(r_img, r_scale, r_h)
+            except Exception:
+                anchors = []
+            anchor_txt = "\n".join(
+                f"  - {kind} q{a_qn} (y={y:.0f}pt)" for kind, a_qn, y in anchors
+            ) or "  (no anchors could be OCR'd from this page)"
+            page_qnos = sorted({a_qn for _k, a_qn, _y in anchors})
+            prompt += IMAGE_ATTRIBUTION_PAGE_CONTEXT \
+                .replace("{PAGE_NO}", str(file_page)) \
+                .replace("{ANCHORS}", anchor_txt) \
+                .replace("{PAGE_QNOS}", str(page_qnos) if page_qnos else "(none read)")
     img_file = ASSETS_DIR / "questions" / rel_path
     if not img_file.exists():
         # STALE-PATH GUARD (run-11 RC-1): the image was already renamed to a
@@ -3671,8 +3778,11 @@ def attribute_orphan_image(model, rel_path, chapter_records, state):
     # 15 RPM window and triggers the 429s. Every Gemini call must be paced.
     _pace_gemini_call()
     try:
+        parts = [prompt, Image.open(img_file)]
+        if page_img is not None:
+            parts.append(page_img)
         resp = model.generate_content(
-            [prompt, Image.open(img_file)],
+            parts,
             safety_settings=SAFETY_SETTINGS,
             request_options={"retry": None},
         )
@@ -4264,10 +4374,16 @@ def pending_image_slots(chapter_records, image_files_by_q):
 
 
 def _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q,
-                     option_letter=None):
+                     option_letter=None, claim_source="positional"):
     """Rename one extracted temp image into the locked convention for the
     given (q_no, "question"|"solution"|"option") slot. kind letters: Q, SOL,
-    or OPT_{L} (option_letter A-D). Returns the new rel path or None."""
+    or OPT_{L} (option_letter A-D). Returns the new rel path or None.
+
+    claim_source (run-21): "positional" (default -- deterministic block/OCR
+    geometry) keeps the strict over-attribution cap. A source in
+    MODEL_CLAIM_SOURCES means the model NAMED this owner while looking at the
+    printed page, so the cap lifts to the hard ceiling and the granted
+    allowance is remembered for the late sweep."""
     old_path = ASSETS_DIR / "questions" / rel
     if not old_path.exists():
         print(f"  [WARN] {rel} missing at rename time -- skipping (alias/dup ref)")
@@ -4288,19 +4404,46 @@ def _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q,
     # images through repeated model-confirmed passes -- every pass was
     # individually reasonable, the SUM was nonsense). One question in this
     # book never legitimately cites >3 figures.
-    if kind == "question" and len(entry["question"]) >= MAX_QUESTION_IMAGES:
-        print(f"  [WARN] over-attribution guard: {qid} already has {MAX_QUESTION_IMAGES} "
-              f"question images -- refusing {rel}; left for model/manual review")
-        return None
+    #
+    # run-21: the cap is DYNAMIC. A deterministic (positional/OCR) claim still
+    # stops at MAX_QUESTION_IMAGES; a claim the model declared from the
+    # printed page may go up to IMAGE_CAP_CEILING_QUESTION, because a real
+    # question CAN cite 4-6 figures and refusing those was losing content.
+    if kind == "question":
+        cap = image_cap_for(subject, chapter_no, qn, "question")
+        if claim_source in MODEL_CLAIM_SOURCES or claim_source == CARRY_CLAIM_SOURCE:
+            cap = max(cap, min(len(entry["question"]) + 1,
+                               IMAGE_CAP_CEILING_QUESTION))
+        if len(entry["question"]) >= cap:
+            print(f"  [WARN] over-attribution guard: {qid} already has "
+                  f"{len(entry['question'])} question images (cap {cap}, "
+                  f"source {claim_source}) -- refusing {rel}; left for review")
+            return None
+        if cap > MAX_QUESTION_IMAGES:
+            _declared_image_allowance[
+                _allowance_key(subject, chapter_no, qn, "question")] = cap
+            print(f"  [IMG] dynamic cap: {qid} question images raised to {cap} "
+                  f"({claim_source} declared this owner)")
     # Same guard on the solution side (user report: a 7-figure solutions page
     # collapsed into 2 solutions because a single decoded header swallowed
     # every image under it). A solution block legitimately cites a figure or
     # two; beyond that the deterministic matcher is stacking neighbours'
     # figures -- refuse and let the model/manual pass decide on content.
-    if kind == "solution" and len(entry["solution"]) >= MAX_SOLUTION_IMAGES:
-        print(f"  [WARN] over-attribution guard: {qid} already has {MAX_SOLUTION_IMAGES} "
-              f"solution images -- refusing {rel}; left for model/manual review")
-        return None
+    if kind == "solution":
+        cap = image_cap_for(subject, chapter_no, qn, "solution")
+        if claim_source in MODEL_CLAIM_SOURCES or claim_source == CARRY_CLAIM_SOURCE:
+            cap = max(cap, min(len(entry["solution"]) + 1,
+                               IMAGE_CAP_CEILING_SOLUTION))
+        if len(entry["solution"]) >= cap:
+            print(f"  [WARN] over-attribution guard: {qid} already has "
+                  f"{len(entry['solution'])} solution images (cap {cap}, "
+                  f"source {claim_source}) -- refusing {rel}; left for review")
+            return None
+        if cap > MAX_SOLUTION_IMAGES:
+            _declared_image_allowance[
+                _allowance_key(subject, chapter_no, qn, "solution")] = cap
+            print(f"  [IMG] dynamic cap: {qid} solution images raised to {cap} "
+                  f"({claim_source} declared this owner)")
     if kind == "option":
         opt = str(option_letter or "A").strip().upper()
         bucket = entry["option"].setdefault(opt, [])
@@ -4459,7 +4602,10 @@ def claim_block_images(imgs, pdf_path, file_page, subject, chapter_no,
             if opt_letter is not None:
                 slot = "option"
         new_rel = _rename_for_slot(rel, qn, slot, subject, chapter_no,
-                                   image_files_by_q, option_letter=opt_letter)
+                                   image_files_by_q, option_letter=opt_letter,
+                                   claim_source=(CARRY_CLAIM_SOURCE
+                                                 if owner is active_block
+                                                 else "positional"))
         if new_rel:
             entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
             entry.setdefault("option", {})
@@ -4618,23 +4764,45 @@ def _ocr_anchors_from_data(data, scale, img_h):
         floor = 30 if re.fullmatch(r"\d{1,3}", t) else 40
         if conf < floor:
             continue
-        words.append((left, top + hgt / 2.0, t))   # x_px, y_center_px
+        try:
+            lid = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        except (KeyError, IndexError):
+            lid = None
+        words.append((left, top + hgt / 2.0, t, lid))   # x_px, y_center_px
     if not words:
         return []
-    # group words into visual lines by vertical center
-    tol = max(6.0, scale * 6.0)   # ~half a line height in px at this dpi
-    words.sort(key=lambda w: (w[1], w[0]))
+    # --- run-21 CRITICAL FIX: group by tesseract's OWN line ids ------------
+    # The old grouper rebuilt lines from y centers with a running average
+    # (cur_y = cur_y*0.5 + yc*0.5). That average DRIFTS across a wide line, so
+    # a heading like "Solution to Question 10:" was split into fragments and
+    # the tail fragment "10:" then matched the QUESTION regex below. Result:
+    # a solution header was recorded as a question anchor at the same y --
+    # every image under it was attributed to the "question" slot of q10, and
+    # on this book's solution pages that is simply the wrong side. tesseract
+    # already returns block/par/line numbers that group the line correctly;
+    # use them, and keep the y-proximity grouper only as a fallback for
+    # output dicts that lack those keys.
     lines = []
-    cur = []
-    cur_y = None
-    for x, yc, t in words:
-        if cur and abs(yc - cur_y) > tol:
+    if all(w[3] is not None for w in words):
+        by_line = {}
+        for x, yc, t, lid in words:
+            by_line.setdefault(lid, []).append((x, yc, t))
+        for lid in sorted(by_line, key=lambda k: min(w[1] for w in by_line[k])):
+            grp = by_line[lid]
+            y_mid = sum(w[1] for w in grp) / len(grp)
+            lines.append((y_mid, sorted((x, t) for x, _y, t in grp)))
+    else:
+        tol = max(6.0, scale * 6.0)   # ~half a line height in px at this dpi
+        words.sort(key=lambda w: (w[1], w[0]))
+        cur, cur_y = [], None
+        for x, yc, t, _lid in words:
+            if cur and abs(yc - cur_y) > tol:
+                lines.append((cur_y, sorted(cur)))
+                cur = []
+            cur.append((x, t))
+            cur_y = yc if cur_y is None else (cur_y * 0.5 + yc * 0.5)
+        if cur:
             lines.append((cur_y, sorted(cur)))
-            cur = []
-        cur.append((x, t))
-        cur_y = yc if cur_y is None else (cur_y * 0.5 + yc * 0.5)
-    if cur:
-        lines.append((cur_y, sorted(cur)))
     anchors = []
     for _yc, wl in lines:
         line = " ".join(t for _x, t in wl)
@@ -4647,13 +4815,19 @@ def _ocr_anchors_from_data(data, scale, img_h):
         # Q-pass call on an already-covered page -- same safe-default
         # philosophy as probe_batch_pages ("never let a window-sizer
         # disable a pass"); a missed one silently drops real questions.
+        # run-21: SOLUTION headers are tested FIRST. "Solution to Question 10:"
+        # also satisfies the question regex once any prefix is lost to OCR, and
+        # whichever branch runs first wins -- so the more specific pattern must
+        # go first, and a line carrying it never falls through to "question".
+        sol_hits = list(re.finditer(r"Solution\s+to\s+Question\s+(\d{1,3})", line, re.I))
+        if sol_hits:
+            for sm in sol_hits:
+                anchors.append(("solution", int(sm.group(1)),
+                                (img_h - _yc) / scale))
+            continue
         m = re.match(r"^\s*(?:Q(?:uestion)?\s*[.:]?\s*)?(\d{1,3})\s*[.:\-–)]", line)
         if m:
             anchors.append(("question", int(m.group(1)),
-                            (img_h - _yc) / scale))
-            continue
-        for sm in re.finditer(r"Solution\s+to\s+Question\s+(\d{1,3})", line, re.I):
-            anchors.append(("solution", int(sm.group(1)),
                             (img_h - _yc) / scale))
     return sorted(set(anchors), key=lambda a: -a[2])
 
@@ -4770,7 +4944,13 @@ def claim_block_images_ocr(imgs, pdf_path, file_page, subject, chapter_no,
         return imgs
     img, scale, page_h_pt = rendered
     anchors = ocr_page_anchors(img, scale, page_h_pt)
-    if not anchors:
+    # run-21 §2.1: a CONTINUATION page (this book's p158: a solution that runs
+    # over from p157, with no printed header of its own) OCRs to ZERO anchors.
+    # The old code returned every image untouched, so a perfectly determinable
+    # figure fell all the way to the vision passes and then to
+    # "all_levels_failed". When a block is still open from the previous page
+    # that block IS the deterministic owner -- keep going instead of bailing.
+    if not anchors and active_block is None:
         return imgs
     # identical filtering to block_headers_on_page: question headings below
     # the first solution header are solution-prose list items, not stems
@@ -4808,7 +4988,10 @@ def claim_block_images_ocr(imgs, pdf_path, file_page, subject, chapter_no,
             leftover.append(rel)
             continue
         new_rel = _rename_for_slot(rel, qn, kind, subject, chapter_no,
-                                   image_files_by_q)
+                                   image_files_by_q,
+                                   claim_source=(CARRY_CLAIM_SOURCE
+                                                 if owner is active_block
+                                                 else "positional"))
         if new_rel:
             entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
             entry[kind].append(new_rel)
@@ -4973,7 +5156,8 @@ def full_page_vision_ownership(model, pdf_path, file_page, rels, positions,
                 still.append(rel)
                 continue
         new_rel = _rename_for_slot(rel, qn, slot, subject, chapter_no,
-                                   image_files_by_q, option_letter=opt)
+                                   image_files_by_q, option_letter=opt,
+                                   claim_source="full_page_vision")
         if not new_rel:
             still.append(rel)
             continue
@@ -5039,7 +5223,8 @@ def claim_figure_map_images(fig_map, window_rows, subject, chapter_no,
                 still.append(rel)
                 continue
             new_rel = _rename_for_slot(rel, qn, slot, subject, chapter_no,
-                                       image_files_by_q)
+                                       image_files_by_q,
+                                       claim_source="figure_map")
             if new_rel:
                 image_files_by_q.setdefault(qn, {"question": [], "solution": []})[slot].append(new_rel)
                 qid = f"{subject}-{chapter_no:03d}-{qn:03d}"
@@ -5078,6 +5263,36 @@ def claim_page_images(imgs, pdf_path, file_page, subject, chapter_no,
                                                 subject, chapter_no, chapter_records,
                                                 image_files_by_q)
     return leftover
+
+
+def last_block_on_page(pdf_path, file_page, dpi=150):
+    """(kind, q_no) of the LAST (lowest) printed block heading on a page, or
+    None when the page prints no heading.
+
+    run-21 §2.1: the window loop used to compute active_block ONCE per window
+    and reuse that stale value for every page in it, so a figure at the top of
+    page N (owned by the block that started at the bottom of page N-1) was
+    attributed to whatever block was open at the START of the window -- pages
+    away. Advancing the carry page by page makes the cross-page rule actually
+    cross ONE page, which is what "continuation" means.
+    """
+    rendered = render_page_png(pdf_path, file_page, dpi=dpi)
+    if not rendered[0]:
+        return None
+    img, scale, page_h_pt = rendered
+    anchors = ocr_page_anchors(img, scale, page_h_pt)
+    if not anchors:
+        return None
+    qs = [("question", qn, y) for k, qn, y in anchors if k == "question"]
+    ss = [("solution", qn, y) for k, qn, y in anchors if k == "solution"]
+    if ss:
+        first_sol_y = min(y for _k, _q, y in ss)
+        qs = [t for t in qs if t[2] > first_sol_y]
+    allh = qs + ss
+    if not allh:
+        return None
+    kind, qn, _y = min(allh, key=lambda t: t[2])   # smallest y == lowest
+    return (kind, qn)
 
 
 def _active_block_from_carries(carry_by_pass):
@@ -6240,6 +6455,34 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
             # PSY-002-014) now extended to question-side figures -- the
             # page-4 class fix. Gemini never overrides this.
             active_block = _active_block_from_carries(carries_at_window_start)
+            # run-21 §2.1(b): SEED the carry from the page physically BEFORE
+            # this window's first imaged page. A window whose leading pages
+            # were already imaged by the previous window (`pages_imaged`)
+            # starts at, say, p161 while the block that owns p161's top figure
+            # was opened on p160 -- a page this window never iterates, so the
+            # per-page advance below can never see it. With no pass-level carry
+            # either (carry-in "-"), active_block stayed None and a perfectly
+            # determinable figure fell through to the vision passes, which then
+            # guessed from medical content (ch9 p161: vision said q16 with
+            # "high" confidence; the printed page says q15). Walk back a few
+            # pages for the nearest printed heading -- deterministic, cached
+            # render, zero Gemini calls.
+            if active_block is None and window_rows:
+                _first_p = window_rows[0][0]
+                for _back in range(1, CARRY_SEED_LOOKBACK_PAGES + 1):
+                    _prev = _first_p - _back
+                    if _prev < 1:
+                        break
+                    try:
+                        _seed = last_block_on_page(pdf_path, _prev)
+                    except Exception:
+                        _seed = None
+                    if _seed is not None:
+                        active_block = _seed
+                        print(f"  [IMG] carry seeded from page {_prev}: "
+                              f"active block {_seed[0]} q{_seed[1]} "
+                              f"(window starts at page {_first_p})")
+                        break
             leftover_by_page = {}
             for file_page_num, rels in window_rows:
                 leftover = claim_page_images(rels, pdf_path, file_page_num, subject,
@@ -6256,6 +6499,18 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                     chapter_records, image_files_by_q, chapter_id=chapter_id,
                     active_block=active_block)
                 leftover_by_page[file_page_num] = leftover
+                # run-21 §2.1: advance the cross-page carry to the LAST block
+                # printed on this page, so the next page's header-less top
+                # figures resolve against their real predecessor instead of a
+                # window-start value that may be several pages stale. A page
+                # that prints no heading leaves the carry untouched (the block
+                # is still open across it).
+                try:
+                    _last = last_block_on_page(pdf_path, file_page_num)
+                except Exception:
+                    _last = None
+                if _last is not None:
+                    active_block = _last
 
             # FIGURE-MAP pass (run-6 user ask, run-9 priority D): Gemini's
             # own _figure_map declares q_no+slot per figure in reading order.
@@ -6394,7 +6649,9 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                 if brake_hit:
                     still.append(rel)
                     continue
-                verdict = attribute_orphan_image(genai_model, rel, chapter_records, state)
+                verdict = attribute_orphan_image(genai_model, rel, chapter_records,
+                                                 state, pdf_path=pdf_path,
+                                                 file_page=um.get("page"))
                 if verdict and verdict.get("decorative") == "brake":
                     brake_hit = True
                     still.append(rel)
@@ -6425,8 +6682,9 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                         subject, chapter_id, um["page"], rel,
                         "model-declared decorative (single "
                         "verdict -- conservative, kept for review)",
-                        model_verdict={"decorative": True}, method="isolated_crop_vision",
-                        confidence=_verdict_confidence(um.get("model_verdicts"), rel))
+                        model_verdict=verdict, method="isolated_crop_vision",
+                        confidence=(_verdict_confidence({rel: verdict}, rel)
+                                    or _verdict_confidence(um.get("model_verdicts"), rel)))
                     if rec:
                         chapter_unresolved_images.append(rec)
                     continue
@@ -6440,7 +6698,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                 if slot not in ("question", "solution"):
                     slot = "question"
                 new_rel = _rename_for_slot(rel, qn_attr, slot, subject, ch["chapter_no"],
-                                           image_files_by_q)
+                                           image_files_by_q,
+                                           claim_source="isolated_crop_vision")
                 if new_rel:
                     image_files_by_q.setdefault(qn_attr, {"question": [], "solution": []})[slot].append(new_rel)
                     qid = f"{subject}-{ch['chapter_no']:03d}-{qn_attr:03d}"
