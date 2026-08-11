@@ -109,7 +109,22 @@ SOLUTION_GATE_MIN_SHARE = 0.6   # if >=60% of a chapter's questions already have
                                  # the same pages, and ch11's count changed 5->8
                                  # between runs -- proof of nondeterministic model
                                  # drops, not absent print.
-GEMINI_MODEL = "gemini-3.1-flash-lite-preview"   # confirmed working model from your bot's config
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+                                 # 2026-08-11: migrated 3.1-flash-lite-preview ->
+                                 # 3.5-flash-lite (GA, stable ID -- no "-preview"
+                                 # suffix). 3.5 Flash-Lite is the newer generation,
+                                 # NOT a rename of 3.1: same 1M-token input window
+                                 # and 64k output cap, ~350 tok/s, and Google
+                                 # positions it explicitly for "document parsing"
+                                 # and "simple data extraction" -- exactly this
+                                 # pipeline's workload.
+                                 # Env-overridable so the model can be A/B tested
+                                 # or rolled back from Railway (Variables ->
+                                 # GEMINI_MODEL) without a code change + redeploy.
+                                 # NOTE: 3.5-era models REJECT the deprecated
+                                 # sampling params (temperature/top_p/top_k). This
+                                 # repo never sets a generation_config, so no call
+                                 # site needed changing -- keep it that way.
 
 MIN_SECONDS_BETWEEN_CALLS = 5   # free tier = ~15 requests/minute (1 per 4s).
                                  # Without pacing, back-to-back calls (v2's Q/A/S

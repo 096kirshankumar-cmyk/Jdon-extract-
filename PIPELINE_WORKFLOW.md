@@ -5,7 +5,7 @@
 
 ## 1. What the system does
 
-Converts scanned/printed **medical MCQ textbook PDFs** (question booklets with questions, options, answer-key tables, and printed explanations) into a **single `questions.jsonl`** dataset using **Gemini Vision** (`gemini-3.1-flash-lite-preview`, free tier). One JSON object per question:
+Converts scanned/printed **medical MCQ textbook PDFs** (question booklets with questions, options, answer-key tables, and printed explanations) into a **single `questions.jsonl`** dataset using **Gemini Vision** (`gemini-3.5-flash-lite`, free tier). One JSON object per question:
 
 ```json
 {
@@ -43,7 +43,7 @@ End goal: feed ~20 books through this, consume the JSONL in a separate exam/quiz
 | Hosting | Railway + **Volume mounted at `/data`** + public domain | State/output survive redeploys/restarts/crashes |
 | LLM | google-generativeai SDK | `google-genai` style `model.generate_content(parts)`; **stateless** (continuity injected manually) |
 
-Env vars: `GEMINI_API_KEY`, `OUTPUT_DIR` (default `./qbank_output`; `/data/qbank_output` in Docker), `PORT` (8080), optional `DRIVE_FOLDER_ID`, `DRIVE_API_KEY` (for restore-from-Drive), `GEMINI_MODEL` not env — model is a constant in `qbank_pipeline.py`.
+Env vars: `GEMINI_API_KEY`, `OUTPUT_DIR` (default `./qbank_output`; `/data/qbank_output` in Docker), `PORT` (8080), optional `DRIVE_FOLDER_ID`, `DRIVE_API_KEY` (for restore-from-Drive), and `GEMINI_MODEL` (optional — overrides the model ID; defaults to `gemini-3.5-flash-lite`, defined in `qbank_pipeline.py`).
 
 **Hard volume guard**: if `OUTPUT_DIR` lives under `/data` but `/data` is not a real mount, the dashboard shows a red banner and **blocks** run/recover/fix/validate/restore (400) — never burn Gemini quota writing to ephemeral container fs.
 
@@ -223,7 +223,7 @@ Runs before targeted retry so anything it strips is re-asked **in the same run**
 
 | Const | Value | Why |
 |---|---|---|
-| `GEMINI_MODEL` | `gemini-3.1-flash-lite-preview` | free-tier, confirmed working |
+| `GEMINI_MODEL` | `gemini-3.5-flash-lite` | free-tier; GA stable ID (no `-preview`). Env-overridable for A/B + rollback. Migrated from `gemini-3.1-flash-lite-preview` on 2026-08-11 |
 | `PAGES_PER_GEMINI_CALL` | 6 | accuracy/cost balance |
 | `BATCH_OVERLAP_PAGES` | 2 | fallback fixed-window overlap (used only when the text layer can't be read) |
 | `QUESTIONS_CHUNK_PAGES` | 10 | whole questions section in 1-2 calls (all questions share one context) |
@@ -838,6 +838,16 @@ answer-missing records' rescue asked the question page (ch15 q15 -> page 194
 **RC-12C — Quota brake.** The real free-tier limit for this model is 500 RPD
 (log: "limit: 500, model: gemini-3.1-flash-lite"); `MAX_CALLS_PER_DAY`
 1400->480 so the daily stop is graceful instead of a hard 429 mid-run.
+
+> **2026-08-11 model migration note.** The 500 RPD figure above was measured on
+> `gemini-3.1-flash-lite-preview`. The pipeline now runs `gemini-3.5-flash-lite`,
+> whose free-tier RPD/RPM Google has **not** confirmed as identical. The brake was
+> deliberately left at `MAX_CALLS_PER_DAY = 480` and `MIN_SECONDS_BETWEEN_CALLS = 5`
+> because those are conservative in either direction: if 3.5's quota is the same or
+> larger, nothing is lost but a little headroom; if it is *smaller*, the brake still
+> stops the run gracefully. **Action:** on the first real 3.5 run, grep the log for
+> the `limit: NNN, model: ...` line a 429 prints and retune `MAX_CALLS_PER_DAY` to
+> `limit - 20`.
 
 **RC-12D — Ledger false UNRESOLVED.** A successful same-batch re-ask after
 malformed JSON left `pass_recovered=False` -> the pass was marked UNRESOLVED
