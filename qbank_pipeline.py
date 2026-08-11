@@ -88,6 +88,13 @@ MAX_CALLS_PER_DAY = 480         # RUN-12: the free tier's actual limit for
                                  # the day GRACEFULLY with ~20 calls of
                                  # headroom for transient retries; state.json
                                  # resumes the next day.
+TOC_SCAN_LAST_PAGE = 8          # run-22: how many leading pages to scan for
+                                 # the contents table. Was effectively 3, which
+                                 # truncated the MARROW Anatomy book at chapter
+                                 # 42 of 63 -- a third of the book silently
+                                 # never processed. Over-scanning is safe:
+                                 # _longest_toc_run() discards anything that
+                                 # is not a contiguous chapter sequence.
 PAGES_PER_GEMINI_CALL = 6       # tune this: more pages/call = fewer calls,
                                  # but keep it small enough that Gemini can
                                  # read every question accurately
@@ -302,10 +309,24 @@ def keypool_summary(state):
 # pdftotext even on PDFs where body-page text is broken/garbled)
 # ============================================================
 
-def extract_toc_chapters(pdf_path, toc_page_range=(1, 3)):
+def extract_toc_chapters(pdf_path, toc_page_range=(1, TOC_SCAN_LAST_PAGE)):
     """
     Returns [{"chapter_no": int, "chapter_title": str, "start_printed_page": int}, ...]
-    Adjust toc_page_range per PDF if the contents table spans more/fewer pages.
+
+    RUN-22 SILENT CHAPTER TRUNCATION: the default range was (1, 3), which on
+    the MARROW ED8 Anatomy book found only chapters 1-42 -- its contents table
+    spans FIVE pages, so chapters 43-63 (printed pages 800-1217, a third of
+    the book) were never detected. Nothing failed: process_pdf simply never
+    saw those chapters, so a full-book run silently produced no questions for
+    them and no gate flag could fire, because the gate only reports on
+    chapters it knows about.
+
+    Scanning wider is not free -- past the real contents table, ordinary body
+    pages contain lines that match the same "<n> <title> <page>" shape and
+    would inject phantom chapters. So the scan is widened AND the result is
+    validated: keep only the longest run that starts at chapter 1 and has
+    strictly increasing chapter numbers with non-decreasing start pages. A
+    real contents table satisfies this; scattered body-text matches do not.
     """
     text = subprocess.run(
         ["pdftotext", "-f", str(toc_page_range[0]), "-l", str(toc_page_range[1]),
@@ -313,7 +334,7 @@ def extract_toc_chapters(pdf_path, toc_page_range=(1, 3)):
         capture_output=True, text=True
     ).stdout
 
-    chapters = []
+    candidates = []
     # Matches lines like: "12   Bipolar and Related Disorders   160"
     for line in text.splitlines():
         m = re.match(r"^\s*(\d{1,3})\s+(.*?)\s+(\d{1,4})\s*$", line)
@@ -322,12 +343,37 @@ def extract_toc_chapters(pdf_path, toc_page_range=(1, 3)):
             title = title.strip()
             if len(title) < 3:
                 continue
-            chapters.append({
+            candidates.append({
                 "chapter_no": int(no),
                 "chapter_title": title,
                 "start_printed_page": int(page),
             })
-    return chapters
+    return _longest_toc_run(candidates)
+
+
+def _longest_toc_run(candidates):
+    """Keep the longest chapter run starting at 1 with strictly increasing
+    chapter numbers and non-decreasing start pages (see extract_toc_chapters).
+
+    Duplicates are tolerated: a contents table repeated in a per-section
+    listing yields the same chapter twice, and the FIRST occurrence wins.
+    Anything that breaks the sequence -- an out-of-order number, a page that
+    jumps backwards -- ends the run, which is what keeps body-text noise from
+    being accepted as chapters.
+    """
+    run = []
+    for c in candidates:
+        if not run:
+            if c["chapter_no"] == 1:
+                run.append(c)
+            continue
+        prev = run[-1]
+        if c["chapter_no"] == prev["chapter_no"]:
+            continue                      # duplicate listing -- first wins
+        if (c["chapter_no"] == prev["chapter_no"] + 1
+                and c["start_printed_page"] >= prev["start_printed_page"]):
+            run.append(c)
+    return run
 
 def compute_page_ranges(chapters, page_offset, last_page_file):
     """Turns a flat chapter list into (file_start, file_end) ranges."""

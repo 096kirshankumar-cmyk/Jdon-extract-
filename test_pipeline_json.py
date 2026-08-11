@@ -3230,5 +3230,58 @@ class Run22OptionsManualReviewFlagTests(unittest.TestCase):
         self.assertIn("HIGH", window)
 
 
+class Run22TocTruncationTests(unittest.TestCase):
+    """run-22: the contents-table scan defaulted to pages 1-3, which found
+    only chapters 1-42 of the MARROW Anatomy book's 63. Chapters 43-63 were
+    never handed to process_pdf, so a full-book run silently skipped a third
+    of the book with no error and no gate flag."""
+
+    def test_default_scan_reaches_past_page_three(self):
+        self.assertGreaterEqual(qp.TOC_SCAN_LAST_PAGE, 5)
+        sig = inspect.signature(qp.extract_toc_chapters)
+        self.assertEqual(sig.parameters["toc_page_range"].default,
+                         (1, qp.TOC_SCAN_LAST_PAGE))
+
+    def test_contiguous_table_is_kept_whole(self):
+        toc = [{"chapter_no": i, "chapter_title": f"Ch {i}",
+                "start_printed_page": i * 10} for i in range(1, 64)]
+        self.assertEqual(len(qp._longest_toc_run(toc)), 63)
+
+    def test_body_text_noise_is_skipped_without_ending_the_table(self):
+        """Past the real table, body pages have '<n> <words> <n>' lines. An
+        out-of-sequence line is SKIPPED, not treated as the end of the table:
+        a stray match in the middle of a real contents table must not cost us
+        the chapters listed after it."""
+        toc = [{"chapter_no": 1, "chapter_title": "Intro", "start_printed_page": 5},
+               {"chapter_no": 2, "chapter_title": "Bones", "start_printed_page": 20},
+               {"chapter_no": 3, "chapter_title": "Joints", "start_printed_page": 40},
+               # noise: out-of-sequence number, page jumps backwards
+               {"chapter_no": 9, "chapter_title": "see table 9 on", "start_printed_page": 3},
+               {"chapter_no": 4, "chapter_title": "Muscles", "start_printed_page": 60}]
+        kept = qp._longest_toc_run(toc)
+        self.assertEqual([c["chapter_no"] for c in kept], [1, 2, 3, 4])
+        self.assertNotIn("see table 9 on", [c["chapter_title"] for c in kept])
+
+    def test_run_must_start_at_chapter_one(self):
+        self.assertEqual(qp._longest_toc_run(
+            [{"chapter_no": 7, "chapter_title": "Orphan", "start_printed_page": 9}]), [])
+
+    def test_duplicate_listing_keeps_first(self):
+        toc = [{"chapter_no": 1, "chapter_title": "A", "start_printed_page": 5},
+               {"chapter_no": 1, "chapter_title": "A again", "start_printed_page": 5},
+               {"chapter_no": 2, "chapter_title": "B", "start_printed_page": 9}]
+        kept = qp._longest_toc_run(toc)
+        self.assertEqual([c["chapter_no"] for c in kept], [1, 2])
+        self.assertEqual(kept[0]["chapter_title"], "A")
+
+    def test_backwards_page_breaks_the_run(self):
+        toc = [{"chapter_no": 1, "chapter_title": "A", "start_printed_page": 50},
+               {"chapter_no": 2, "chapter_title": "B", "start_printed_page": 10}]
+        self.assertEqual([c["chapter_no"] for c in qp._longest_toc_run(toc)], [1])
+
+    def test_empty_input_is_safe(self):
+        self.assertEqual(qp._longest_toc_run([]), [])
+
+
 if __name__ == "__main__":
     unittest.main()
