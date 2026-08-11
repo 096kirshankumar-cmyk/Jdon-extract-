@@ -1309,12 +1309,23 @@ def chapter_integrity_sweep(chapter_records, image_files_by_q, subject, chapter_
         if not sol.strip():
             continue
         entry = image_files_by_q.get(qn, {"question": [], "solution": []})
+        sol_imgs = entry.get("solution") or []
         if looks_truncated_solution(sol, has_tables=bool(rec.get("tables")),
-                                    has_images=bool(entry.get("solution"))):
+                                    has_images=bool(sol_imgs)):
             forced_solution.add(qn)
             iflag("truncated_solution_retry", qn,
                   f"solution looks truncated (...{sol.rstrip()[-50:]!r}) -- forced re-ask")
             print(f"  [SWEEP] q{qn}: solution looks truncated -- targeted retry will re-ask it")
+        elif sol_imgs and DANGLING_END_RE.search(sol.rstrip()):
+            # AUDITABLE SUPPRESSION (2026-08-11): the dangling lead-in is
+            # explained by an attributed solution figure, so no re-ask is
+            # spent. Logged + flagged (not silent) so a genuine truncation
+            # hiding behind a figure is still reviewable in the export.
+            iflag("truncated_solution_suppressed_by_image", qn,
+                  f"solution ends {sol.rstrip()[-40:]!r} but {len(sol_imgs)} solution "
+                  f"image(s) attached -- lead-in explained by figure, retry skipped")
+            print(f"  [SWEEP] q{qn}: dangling end but {len(sol_imgs)} solution image(s) "
+                  f"attached -- not treating as truncated (retry saved)")
 
     # 4. over-attributed question images (022-003 class, rows healed by the
     #    recovery path where the rename-time cap never ran).
@@ -3124,6 +3135,16 @@ def looks_truncated_solution(text, has_tables=False, has_images=False):
     # table is the continuation for a lead-in ("stages are:"), so never send
     # that record to a truncation retry based on text ending alone.
     if has_tables:
+        return False
+    # Same logic for figures (2026-08-11): "...as shown in the image below:"
+    # is a lead-in whose continuation IS the attributed figure, not missing
+    # prose. This parameter was accepted but never read, so every such
+    # solution was re-asked at a real quota cost (38 forced retries in the
+    # 2026-08-11 ANA run) and came back identical -- the source text genuinely
+    # ends there. Only suppress when a figure is actually attached to the
+    # SOLUTION side; a question-side figure does not explain a solution's
+    # dangling lead-in.
+    if has_images:
         return False
     # Do not infer truncation from absent terminal punctuation, a trailing
     # OCR space, or a short explanation. Source pages frequently omit a final
@@ -5493,6 +5514,25 @@ def drop_phantom_solution_only_records(chapter_records, chapter_id, stats,
     return dropped
 
 
+def _verdict_confidence(verdicts, rel):
+    """The model's OWN confidence for one file, pulled off the verdict dict
+    the vision passes already return (2026-08-11).
+
+    _record_unresolved_image has always accepted confidence= but NO call site
+    passed it, so every unresolved_images.jsonl row serialized
+    "confidence": null and the export gate printed 'confidence=?'. The value
+    was being computed and discarded. Returns None when the pass produced no
+    verdict for this file (render unavailable / call failed / no position),
+    which is a genuine unknown rather than a low score."""
+    if not isinstance(verdicts, dict):
+        return None
+    v = verdicts.get(rel)
+    if not isinstance(v, dict):
+        return None
+    conf = str(v.get("confidence") or "").strip().lower()
+    return conf if conf in ("high", "medium", "low") else None
+
+
 def _record_unresolved_image(subject, chapter_id, page, rel, reason,
                              model_verdict=None, method="unresolved",
                              confidence=None):
@@ -6385,7 +6425,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                         subject, chapter_id, um["page"], rel,
                         "model-declared decorative (single "
                         "verdict -- conservative, kept for review)",
-                        model_verdict={"decorative": True}, method="isolated_crop_vision")
+                        model_verdict={"decorative": True}, method="isolated_crop_vision",
+                        confidence=_verdict_confidence(um.get("model_verdicts"), rel))
                     if rec:
                         chapter_unresolved_images.append(rec)
                     continue
@@ -6453,7 +6494,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                         method = "all_levels_failed"
                     rec = _record_unresolved_image(
                         subject, chapter_id, um["page"], rel, reason,
-                        method=method)
+                        method=method,
+                        confidence=_verdict_confidence(um.get("model_verdicts"), rel))
                     if rec:
                         chapter_unresolved_images.append(rec)
 
