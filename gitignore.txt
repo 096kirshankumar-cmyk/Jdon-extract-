@@ -1,0 +1,3 @@
+qbank_output/
+__pycache__/
+fixtures/
