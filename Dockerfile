@@ -1,7 +1,10 @@
 FROM python:3.11-slim
 
 # poppler-utils gives us pdftoppm, pdfimages, pdftotext
-RUN apt-get update && apt-get install -y poppler-utils tesseract-ocr && rm -rf /var/lib/apt/lists/*
+# tzdata: today_stamp() stamps the quota day in US/Pacific to match Google's
+# RPD reset. Without the tz database zoneinfo raises and we fall back to a
+# fixed UTC-8 offset (safe, but an hour off during US DST).
+RUN apt-get update && apt-get install -y poppler-utils tesseract-ocr tzdata && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt .
@@ -19,6 +22,10 @@ ENV OUTPUT_DIR=/data/qbank_output_v2
 # Flush every print() immediately, otherwise Docker block-buffers stdout and
 # pipeline progress never shows up in Railway's Deploy Logs in real time.
 ENV PYTHONUNBUFFERED=1
+
+# Container clock stays UTC; the quota day is computed in US/Pacific by
+# today_stamp(). Override only if Google moves the reset boundary.
+ENV QUOTA_RESET_TZ=America/Los_Angeles
 
 EXPOSE 8080
 # Gunicorn avoids Flask's development-server warning and is safe for Railway.

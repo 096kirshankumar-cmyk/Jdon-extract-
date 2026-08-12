@@ -3647,5 +3647,127 @@ class Run24KeyRotationBatchLossTests(unittest.TestCase):
                       "an unrecoverable page must still be queued for drain")
 
 
+class Run24QuotaDayBoundaryTests(unittest.TestCase):
+    """Google resets Gemini RPD at midnight US/Pacific, not UTC midnight.
+    Rolling over early makes the pool think spent keys are fresh, 429 on the
+    first call, and park all 6 keys as exhausted for nothing."""
+
+    def test_stamp_uses_pacific_not_container_clock(self):
+        import datetime as _dt
+        from zoneinfo import ZoneInfo
+        expected = _dt.datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+        self.assertEqual(qp.today_stamp(), expected)
+
+    def test_stamp_differs_from_utc_inside_the_danger_window(self):
+        """Between UTC midnight and 07/08:00 UTC the two dates MUST differ --
+        that is exactly the window the old code got wrong."""
+        import datetime as _dt
+        from zoneinfo import ZoneInfo
+        utc = _dt.datetime.now(_dt.timezone.utc)
+        pac = utc.astimezone(ZoneInfo("America/Los_Angeles"))
+        if utc.strftime("%Y-%m-%d") != pac.strftime("%Y-%m-%d"):
+            self.assertEqual(qp.today_stamp(), pac.strftime("%Y-%m-%d"))
+            self.assertNotEqual(qp.today_stamp(), utc.strftime("%Y-%m-%d"))
+
+    def test_tz_is_overridable(self):
+        self.assertTrue(qp.QUOTA_RESET_TZ)
+        self.assertIsNotNone(qp._quota_tz())
+
+    def test_fallback_offset_is_never_early(self):
+        """If tzdata is missing we fall back to fixed UTC-8. During US DST
+        that is one hour LATE, which is safe; it must never be EARLY."""
+        import datetime as _dt
+        from zoneinfo import ZoneInfo
+        real = _dt.datetime.now(ZoneInfo("America/Los_Angeles"))
+        fb = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=-8)))
+        self.assertLessEqual(fb, real.replace(tzinfo=fb.tzinfo) + _dt.timedelta(seconds=1))
+
+    def test_rollover_resets_pool_counters(self):
+        state = {"calls_today": 99, "day_stamp": "1999-01-01"}
+        qp.reset_daily_counter_if_needed(state)
+        self.assertEqual(state["calls_today"], 0)
+        self.assertEqual(state["day_stamp"], qp.today_stamp())
+
+    def test_same_day_does_not_reset(self):
+        state = {"calls_today": 42, "day_stamp": qp.today_stamp()}
+        qp.reset_daily_counter_if_needed(state)
+        self.assertEqual(state["calls_today"], 42, "must not wipe today's count")
+
+
+class Run24SelfLabeledSolutionHeadTests(unittest.TestCase):
+    """ch7 q19/q20 (pp.129-130): a "Solution to Question 19:" heading sat at
+    the BOTTOM of p129 and its body ran onto p130, so the model emitted that
+    body as q20's solution. q19 exported EMPTY while its 767-char solution
+    sat glued to the head of q20, ahead of a self-labeled
+    "Solution to Question 20:" header. Sweep 2b only looked at headers naming
+    a DIFFERENT question, so this fell through."""
+
+    @staticmethod
+    def _rec(sol):
+        return {"question_text": "stem",
+                "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                "correct_option": "A", "_prov": {}, "tables": [],
+                "solution_text": sol}
+
+    GLUED = ("Failure of fusion of the dorsal and ventral pancreatic buds leads "
+             "to pancreas divisum.\nThe developing pancreatic ducts usually fuse "
+             "so the dorsal drains into the ventral duct.\n"
+             "Solution to Question 20:\n"
+             "The spleen develops from the mesoderm in the dorsal mesogastrium.\n"
+             "The mesenchymal cells form lobular masses called spleniculi.")
+
+    def test_head_is_returned_to_the_solutionless_owner(self):
+        recs = {19: self._rec(""), 20: self._rec(self.GLUED)}
+        qp.chapter_integrity_sweep(recs, {}, "ANA", 7, {})
+        self.assertIn("divisum", recs[19]["solution_text"])
+        self.assertNotIn("spleen", recs[19]["solution_text"])
+        self.assertIn("spleen", recs[20]["solution_text"])
+        self.assertNotIn("divisum", recs[20]["solution_text"])
+
+    def test_split_is_recorded_in_stats(self):
+        recs = {19: self._rec(""), 20: self._rec(self.GLUED)}
+        stats = {}
+        qp.chapter_integrity_sweep(recs, {}, "ANA", 7, stats)
+        self.assertEqual(stats.get("solution_heads_reassigned"), 1)
+
+    def test_never_overwrites_a_question_that_has_a_solution(self):
+        """The other three real occurrences in ch1/ch7 had a previous question
+        that already owned its solution -- those must be left alone."""
+        keep = "q19 already owns a perfectly good solution and must keep it."
+        recs = {19: self._rec(keep), 20: self._rec(self.GLUED)}
+        qp.chapter_integrity_sweep(recs, {}, "ANA", 7, {})
+        self.assertEqual(recs[19]["solution_text"], keep)
+
+    def test_donates_to_the_NEAREST_preceding_empty_question(self):
+        recs = {15: self._rec(""), 19: self._rec(""), 20: self._rec(self.GLUED)}
+        qp.chapter_integrity_sweep(recs, {}, "ANA", 7, {})
+        self.assertIn("divisum", recs[19]["solution_text"], "nearest, not earliest")
+        self.assertEqual(recs[15]["solution_text"], "")
+
+    def test_retry_guard_accepts_the_rescue_fragment(self):
+        """_solution_fragment_foreign vetoed the correct retry with 'first line
+        exists verbatim in q20's solution' -- true, but q20 was the thief."""
+        ch = {19: {"solution_text": ""}, 20: {"solution_text": self.GLUED}}
+        frag = ("Failure of fusion of the dorsal and ventral pancreatic buds leads "
+                "to pancreas divisum.")
+        self.assertIsNone(
+            qp._solution_fragment_foreign(frag, 19, {"options": {}}, ch))
+
+    def test_retry_guard_still_blocks_genuine_contamination(self):
+        """Donor is NOT a glued block -> the old proof must still fire."""
+        line = "The spleen develops from the mesoderm in the dorsal mesogastrium."
+        ch = {19: {"solution_text": ""}, 20: {"solution_text": line + " More."}}
+        self.assertIsNotNone(
+            qp._solution_fragment_foreign(line, 19, {"options": {}}, ch))
+
+    def test_header_naming_another_question_still_trims_the_tail(self):
+        """Sweep 2b must be unaffected by 2c."""
+        recs = {1: self._rec("q1 solution body that is long enough to be real.\n"
+                             "Solution to Question 2:\nq2 body glued on."),
+                2: self._rec("q2 owns its own solution already, proving redundancy.")}
+        qp.chapter_integrity_sweep(recs, {}, "ANA", 11, {})
+        self.assertNotIn("q2 body glued on", recs[1]["solution_text"])
+
+
 if __name__ == "__main__":
     unittest.main()

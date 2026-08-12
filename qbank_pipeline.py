@@ -40,6 +40,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import datetime
 from pathlib import Path
 
 import google.generativeai as genai
@@ -259,8 +260,42 @@ def build_subject_bundle(subject, chapters_out):
     print(f"[{subject}] bundle ready -> subjects/{subject}/ "
           f"({len(ch_files)} chapter file(s) + chapters.json + questions.jsonl)")
 
+# ---- Daily-quota day boundary (run-24 fix) ----------------------------
+# Google resets Gemini RPD at MIDNIGHT US/PACIFIC (08:00 UTC in winter,
+# 07:00 UTC in summer -- it follows US DST), NOT at UTC midnight and
+# certainly not at the container's local midnight.
+#
+# `time.strftime("%Y-%m-%d")` used the container clock, so on a UTC host the
+# pipeline rolled its per-key counters over ~8 hours EARLY. In that window it
+# believed every key was fresh while Google still counted them against the
+# previous day: the very first call 429'd, the key was parked `exhausted`,
+# and the pool burned through all 6 keys for nothing.
+#
+# We stamp the day in US/Pacific so our rollover lines up with Google's.
+# QUOTA_RESET_TZ can override it if Google ever moves the boundary.
+QUOTA_RESET_TZ = os.environ.get("QUOTA_RESET_TZ", "America/Los_Angeles").strip()
+
+def _quota_tz():
+    """Return the tzinfo Google resets RPD on, or None if unavailable."""
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(QUOTA_RESET_TZ)
+    except Exception:
+        # No tzdata in the image (slim containers often ship without it).
+        # Fall back to a fixed UTC-8 offset: worst case during US summer we
+        # roll over one hour late, which is safe (late = we under-count, so
+        # we never think a spent key is fresh).
+        try:
+            return datetime.timezone(datetime.timedelta(hours=-8))
+        except Exception:
+            return None
+
 def today_stamp():
-    return time.strftime("%Y-%m-%d")
+    """Calendar date in Google's quota-reset timezone (US/Pacific)."""
+    tz = _quota_tz()
+    if tz is None:
+        return time.strftime("%Y-%m-%d")          # last-resort legacy path
+    return datetime.datetime.now(tz).strftime("%Y-%m-%d")
 
 def reset_daily_counter_if_needed(state):
     if state.get("day_stamp") != today_stamp():
@@ -1406,6 +1441,83 @@ def chapter_integrity_sweep(chapter_records, image_files_by_q, subject, chapter_
                   f"solution -- tail kept (may be unique content), needs review",
                   matched=False)
             break
+
+    # 2c. foreign solution HEAD -- the mirror image of 2b (run-24, found on
+    #     ch7 q19/q20, pp.129-130). When a "Solution to Question N:" heading
+    #     sits at the very BOTTOM of a page and its body continues on the
+    #     next page, the model can emit the body as the NEXT question's
+    #     solution. The tell is unmistakable and self-labeled: q20's
+    #     solution_text contains the literal header "Solution to Question 20:"
+    #     at a non-zero offset, i.e. the record names ITSELF part-way
+    #     through. Everything BEFORE that header therefore belongs to an
+    #     earlier question, not to q20.
+    #
+    #     Sweep 2b only handles headers naming a DIFFERENT question (n != qn),
+    #     so this case fell straight through and cost a real solution: ch7 q19
+    #     exported empty while its 767-char solution sat glued to the head of
+    #     q20. The targeted retry then made it worse -- it re-read the page,
+    #     got the right text, and _solution_fragment_foreign rejected it
+    #     because "first line exists verbatim in q20's solution". The guard
+    #     was right that the text was duplicated and wrong about who owned it.
+    #
+    #     Restitution is deterministic and only ever moves text to a record
+    #     that has NONE, so it cannot overwrite good data:
+    #       * split at the self-header; tail stays with qn (it is genuinely
+    #         q{qn}'s own solution, correctly labeled);
+    #       * the head is donated to the nearest preceding question that owns
+    #         an EMPTY solution -- the only record that can be missing it;
+    #       * if no such record exists the head is dropped only when it is
+    #         already present verbatim elsewhere, else kept and flagged.
+    for qn in qns:
+        sol = chapter_records[qn].get("solution_text") or ""
+        if not sol:
+            continue
+        m = next((m for m in SOLUTION_DUMP_HDR_RE.finditer(sol)
+                  if m.start() > 2 and int(m.group(1)) == qn), None)
+        if not m:
+            continue
+        head = sol[:m.start()].rstrip()
+        tail = sol[m.end():].lstrip("\n ")
+        if not head or not tail:
+            continue
+        # nearest EARLIER question in this chapter with no solution of its own
+        needy = [o for o in qns
+                 if o < qn and not (chapter_records[o].get("solution_text") or "").strip()]
+        if needy:
+            owner = max(needy)
+            chapter_records[owner]["solution_text"] = head
+            chapter_records[owner].setdefault("_prov", {})["solution_text"] = "SWEEP_HEAD_SPLIT"
+            chapter_records[qn]["solution_text"] = tail
+            stats["solution_heads_reassigned"] = stats.get("solution_heads_reassigned", 0) + 1
+            iflag("foreign_solution_head_reassigned", owner,
+                  f"q{qn}'s solution carried a self-labeled 'Solution to Question {qn}:' "
+                  f"header at char {m.start()}; the {len(head)}-char head before it was "
+                  f"q{owner}'s solution (page-bottom heading / next-page body split) "
+                  f"and has been moved back to q{owner}")
+            print(f"  [SWEEP] q{qn}: self-labeled header at char {m.start()} -- "
+                  f"donated {len(head)}-char head back to q{owner} (was solution-less), "
+                  f"kept {len(tail)} chars")
+            if looks_truncated_solution(tail, has_tables=bool(chapter_records[qn].get("tables"))):
+                forced_solution.add(qn)
+            if looks_truncated_solution(head, has_tables=bool(chapter_records[owner].get("tables"))):
+                forced_solution.add(owner)
+            continue
+        dup_elsewhere = any(other != qn and head[:80] in (chapter_records[other].get("solution_text") or "")
+                            for other in qns)
+        if dup_elsewhere:
+            chapter_records[qn]["solution_text"] = tail
+            stats["solution_heads_stripped"] = stats.get("solution_heads_stripped", 0) + 1
+            iflag("foreign_solution_head_stripped", qn,
+                  f"self-labeled header at char {m.start()}; {len(head)}-char head is a "
+                  f"verbatim duplicate of another record -- stripped")
+            print(f"  [SWEEP] q{qn}: stripped {len(head)}-char foreign head (verbatim dup elsewhere)")
+        else:
+            iflag("foreign_solution_head_review", qn,
+                  f"self-labeled 'Solution to Question {qn}:' header at char {m.start()} but "
+                  f"no solution-less earlier question and no verbatim donor -- head kept, "
+                  f"needs review: {head[:120]!r}", matched=False)
+            print(f"  [WARN] [SWEEP] q{qn}: self-labeled header at char {m.start()} "
+                  f"but no owner found for the head -- kept, logged for review")
 
     # 3. truncated-solution suspects (023-007/006-009 class): deterministic
     #    dangling-end / mid-flow-cut patterns -- re-ask the FULL solution.
@@ -3541,8 +3653,24 @@ def _solution_fragment_foreign(frag, qn, rec, chapter_records):
         for other_qn, other in chapter_records.items():
             if other_qn == qn:
                 continue
-            if first_line in (other.get("solution_text") or ""):
-                return f"first line exists verbatim in q{other_qn}'s solution"
+            other_sol = other.get("solution_text") or ""
+            if first_line not in other_sol:
+                continue
+            # Run-24 (ch7 q19/q20): proof 3 assumes the sibling that already
+            # holds this text is its rightful owner. That is false when the
+            # sibling's solution is itself a glued double-block -- a
+            # page-bottom "Solution to Question N:" heading whose body ran
+            # onto the next page gets emitted under the NEXT question, so the
+            # donor holds q{qn}'s text at its HEAD, before a self-labeled
+            # header naming the donor. Here the retry fragment is the
+            # RESCUE, not the contamination, and vetoing it left q{qn}
+            # permanently empty. Sweep 2c repairs the donor; this keeps the
+            # retry path from blocking the same recovery in the meantime.
+            hdr = next((m for m in SOLUTION_DUMP_HDR_RE.finditer(other_sol)
+                        if m.start() > 2 and int(m.group(1)) == other_qn), None)
+            if hdr and first_line in other_sol[:hdr.start()]:
+                continue   # donor is a glued block; the match is q{qn}'s own text
+            return f"first line exists verbatim in q{other_qn}'s solution"
     return None
 
 
