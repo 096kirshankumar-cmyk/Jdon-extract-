@@ -300,7 +300,16 @@ def check_row(row, assets_questions):
         # introduces lives in solution.tables -- all 6 such flags in the
         # resumed run were row-verified false positives (001-012, 006-013,
         # 006-019, 011-015, 013-003, 023-005).
-        if DANGLING_END_RE.search(s) and not (s.endswith(":") and sol.get("tables")):
+        # run-24: the same exemption must cover FIGURES, not just tables.
+        # The pipeline sweep already excuses a dangling ':' when a solution
+        # image is attached ("lead-in explained by figure, retry skipped" ->
+        # truncated_solution_suppressed_by_image), but the validator re-raised
+        # it as a HIGH truncated_solution. Ch.60 q3/q21 were both flagged that
+        # way with the figure sitting right there in solution.images, which
+        # makes a clean chapter look broken and trains reviewers to ignore the
+        # flag. One rule, both places: ':' + (table OR image) = a lead-in.
+        _leadin_explained = s.endswith(":") and (sol.get("tables") or sol.get("images"))
+        if DANGLING_END_RE.search(s) and not _leadin_explained:
             flags.append(flag(cid, "truncated_solution",
                               f"{row.get('id')}: solution ends on a dangling connector (...{s[-50:]!r})", qn))
         elif sol_text != s and re.search(r"[A-Za-z0-9]$", s) and s[-1] not in TERMINAL_PUNCT:

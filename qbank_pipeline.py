@@ -3634,6 +3634,71 @@ def _frag_mostly_present(frag, existing, threshold=0.85):
     return sum(1 for t in f if t in e) / len(f) >= threshold
 
 
+def _content_overlap(frag, text):
+    """Fraction of `frag`'s DISTINCT content tokens that appear in `text`.
+
+    Deliberately different from _frag_mostly_present: that one asks "is this
+    fragment already there" (duplicate guard, positional). This one asks "does
+    this fragment talk about the same thing" (ownership evidence), so it uses
+    a distinct-token set and drops short/stop tokens that every anatomy
+    solution shares ('the', 'is', 'nerve' is kept -- it is discriminative here).
+    """
+    stop = {"the", "is", "are", "of", "in", "to", "and", "a", "an", "it", "as",
+            "by", "for", "on", "this", "that", "with", "from", "at", "be",
+            "which", "or", "its", "was", "were", "has", "have", "not"}
+    f = {t for t in re.findall(r"\w+", (frag or "").lower())
+         if len(t) > 2 and t not in stop}
+    e = {t for t in re.findall(r"\w+", (text or "").lower())
+         if len(t) > 2 and t not in stop}
+    if not f or not e:
+        return 0.0
+    return len(f & e) / len(f)
+
+
+def _positional_owner_contested(frag, last_qn, chapter_records,
+                                margin=0.15, floor=0.30):
+    """run-24 (P3): veto/redirect a POSITIONAL ownership guess when the
+    fragment's own words point somewhere else.
+
+    Rule 3 below assigns a q_no-less fragment to `last_qn_in_batch` -- the
+    highest question number seen in the same Gemini window. That is a guess
+    about page layout, not about content, and ch.60 proved it wrong: a
+    fragment on pp.1158-1162 belonged to q7 but the window's last question was
+    q15. Nothing was corrupted that time only because q15's solution was
+    already complete, so the "PARTIAL owner append" guard refused the write.
+    That guard is luck, not a rule -- the same miss landing on an INCOMPLETE
+    solution would silently graft q7's text onto q15.
+
+    Returns (verdict, better_qn, detail):
+      "ok"        -- positional owner is also the best content match (or no
+                     candidate is discriminative enough to argue); proceed.
+      "redirect"  -- another record beats it clearly; caller should prefer it.
+      "veto"      -- contested with no safe alternative; leave for review.
+    """
+    if last_qn is None or not frag or len(frag.split()) < 6:
+        return "ok", None, ""          # too short to carry evidence either way
+    scores = {}
+    for qn, r in chapter_records.items():
+        body = " ".join(str(r.get(k) or "") for k in
+                        ("question_text", "solution_text"))
+        if body.strip():
+            scores[qn] = _content_overlap(frag, body)
+    if not scores:
+        return "ok", None, ""
+    best_qn = max(scores, key=lambda q: scores[q])
+    best, positional = scores[best_qn], scores.get(last_qn, 0.0)
+    if best_qn == last_qn or best < floor or (best - positional) < margin:
+        return "ok", None, ""
+    detail = (f"content points to q{best_qn} ({best:.0%} overlap) not the "
+              f"window's last question q{last_qn} ({positional:.0%})")
+    rec = chapter_records.get(best_qn) or {}
+    existing = (rec.get("solution_text") or "").strip()
+    if not existing or looks_truncated_solution(
+            existing, has_tables=bool(rec.get("tables"))):
+        return "redirect", best_qn, detail
+    return "veto", best_qn, detail
+
+
 def recover_orphans(orphans, chapter_records, subject, chapter_no, stats,
                     pdf_path=None):
     """FEATURE 3 -- second-pass owner matching for q_no=null fragments.
@@ -3746,6 +3811,31 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats,
         # ---- rule 3: highest q_no of the same batch window missing that field
         if owner is None:
             last_qn = orph.get("last_qn_in_batch")
+            # run-24 (P3): test the POSITIONAL guess against the fragment's own
+            # words before letting it own anything (ch.60 q7 -> q15 miss).
+            _frag_probe = " ".join(filter(None, [
+                (item.get("solution_text") or "").strip(),
+                (item.get("question_text") or "").strip()]))
+            _verdict, _better, _detail = _positional_owner_contested(
+                _frag_probe, last_qn, chapter_records)
+            if _verdict == "redirect":
+                print(f"  [ORPHAN] positional owner overridden: {_detail} "
+                      f"-- reassigning to q{_better}")
+                last_qn = _better
+            elif _verdict == "veto":
+                # Contested, but the better-matching record's solution is
+                # already complete so there is nowhere safe to send it.
+                # Deliberately DO NOT clear last_qn: the existing wrong-owner
+                # guards below (_foreign_option_line /
+                # _solution_fragment_foreign) already refuse this append AND
+                # record a blocked_reason + foreign_fragments_blocked stat.
+                # Zeroing the owner here skipped those guards entirely and the
+                # fragment fell through to "unresolved" with no reason
+                # attached -- strictly less information for the reviewer
+                # (caught by OrphanForeignGuardTests). Just add the evidence.
+                print(f"  [ORPHAN] positional owner q{last_qn} is contested: "
+                      f"{_detail}; that record is already complete -- "
+                      f"deferring to the wrong-owner guards below")
             rec = chapter_records.get(last_qn) if last_qn is not None else None
             if rec:
                 frag = (item.get("solution_text") or "").strip()
@@ -4185,7 +4275,17 @@ def merge_question_records(existing, new_items, stats=None, fill_only=False,
     for item in new_items:
         raw_qn = item.get("q_no")
         if raw_qn is None:
-            print(f"  [WARN] Gemini returned an item with no q_no, skipping: {str(item)[:200]}")
+            # NOT a drop: every caller routes `skipped` onward (orphan buffer
+            # or integrity_flags.jsonl) -- see the 6 call sites. The old wording
+            # ("skipping") read like data loss and sent two separate log audits
+            # chasing a phantom; run-24 makes the destination explicit and
+            # reports whether the item actually carries content.
+            _payload = [k for k in ("question_text", "solution_text", "options",
+                                    "answer", "tables", "images")
+                        if item.get(k)]
+            print(f"  [WARN] Gemini item has no q_no -> routed to orphan recovery "
+                  f"({'content: ' + ','.join(_payload) if _payload else 'EMPTY shell, no content'}): "
+                  f"{str(item)[:160]}")
             skipped.append(item)
             continue
         try:

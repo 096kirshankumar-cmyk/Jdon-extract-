@@ -3423,5 +3423,125 @@ class Run23BlankOptionHealTests(unittest.TestCase):
         self.assertIn("options", missing.get(16, []))
 
 
+class Run24PositionalOwnerTiebreakTests(unittest.TestCase):
+    """P3: a q_no-less fragment must not be owned by the window's last
+    question when its own words point at a different one (ch.60 q7 -> q15)."""
+
+    def test_ch60_q7_fragment_is_not_given_to_q15(self):
+        """The real miss: fragment about the trochlear nerve / superior
+        oblique belongs to q7, but the Q-pass window ended on q15."""
+        recs = {
+            7: {"question_text": "Which nerve supplies the superior oblique muscle?",
+                "solution_text": "The trochlear nerve supplies the superior oblique",
+                "tables": []},
+            15: {"question_text": "Which artery supplies the stomach fundus?",
+                 "solution_text": "The short gastric arteries arise from the splenic artery "
+                                  "and supply the fundus of the stomach completely.",
+                 "tables": []},
+        }
+        frag = ("trochlear nerve emerges dorsally and decussates before "
+                "supplying the superior oblique muscle of the orbit")
+        verdict, better, detail = qp._positional_owner_contested(frag, 15, recs)
+        self.assertNotEqual(verdict, "ok", "positional guess must be challenged")
+        self.assertEqual(better, 7)
+        self.assertIn("q7", detail)
+
+    def test_veto_when_true_owner_solution_is_already_complete(self):
+        recs = {
+            7: {"question_text": "Trochlear nerve question?",
+                "solution_text": "The trochlear nerve supplies the superior oblique muscle "
+                                 "and emerges dorsally from the brainstem.",
+                "tables": []},
+            15: {"question_text": "Gastric artery question?",
+                 "solution_text": "Splenic artery supplies the fundus.", "tables": []},
+        }
+        frag = "trochlear nerve emerges dorsally supplying the superior oblique muscle"
+        verdict, better, _ = qp._positional_owner_contested(frag, 15, recs)
+        self.assertEqual(verdict, "veto")
+        self.assertEqual(better, 7)
+
+    def test_redirect_when_true_owner_solution_is_truncated(self):
+        recs = {
+            7: {"question_text": "Trochlear nerve question?",
+                "solution_text": "The trochlear nerve supplies the superior oblique:",
+                "tables": []},
+            15: {"question_text": "Gastric artery question?",
+                 "solution_text": "Splenic artery supplies the fundus.", "tables": []},
+        }
+        frag = "trochlear nerve emerges dorsally supplying the superior oblique muscle"
+        verdict, better, _ = qp._positional_owner_contested(frag, 15, recs)
+        self.assertEqual(verdict, "redirect")
+        self.assertEqual(better, 7)
+
+    def test_agreeing_positional_owner_is_left_alone(self):
+        """No regression: when position and content agree, say nothing."""
+        recs = {15: {"question_text": "Which artery supplies the fundus?",
+                     "solution_text": "The short gastric arteries supply the fundus.",
+                     "tables": []}}
+        frag = "short gastric arteries arising from the splenic artery supply the fundus"
+        verdict, better, _ = qp._positional_owner_contested(frag, 15, recs)
+        self.assertEqual(verdict, "ok")
+        self.assertIsNone(better)
+
+    def test_short_fragment_carries_no_evidence(self):
+        recs = {7: {"question_text": "Q7", "solution_text": "trochlear nerve", "tables": []},
+                15: {"question_text": "Q15", "solution_text": "splenic artery", "tables": []}}
+        verdict, _, _ = qp._positional_owner_contested("see below:", 15, recs)
+        self.assertEqual(verdict, "ok")
+
+    def test_generic_fragment_below_floor_does_not_steal(self):
+        """A fragment sharing only boilerplate must not beat the position."""
+        recs = {7: {"question_text": "Q7 stem", "solution_text": "Therefore option A.",
+                    "tables": []},
+                15: {"question_text": "Q15 stem", "solution_text": "Hence option C.",
+                     "tables": []}}
+        verdict, _, _ = qp._positional_owner_contested(
+            "xylophone quasar tessellation buttress", 15, recs)
+        self.assertEqual(verdict, "ok")
+
+    def test_no_qno_item_is_returned_for_orphan_recovery_not_dropped(self):
+        """P2: the 'no q_no' path routes content onward -- it is not a drop."""
+        existing = {}
+        stats = {"duplicates_merged": 0, "conflicts": 0, "foreign_chapter_qno_dropped": 0}
+        item = {"q_no": None, "solution_text": "orphaned continuation text"}
+        _, skipped = qp.merge_question_records(existing, [item], stats)
+        self.assertEqual(skipped, [item])
+
+
+class Run24LeadInFlagParityTests(unittest.TestCase):
+    """P4: the validator must honour the same figure lead-in exemption the
+    pipeline sweep already applies (ch.60 q3/q21 double-flagged)."""
+
+    def _flags(self, sol):
+        row = {"id": "ANA-060-003", "chapter_id": "ANA-060", "q_no": 3,
+               "question": {"text": "Q?", "options": [
+                   {"label": "A", "text": "a"}, {"label": "B", "text": "b"},
+                   {"label": "C", "text": "c"}, {"label": "D", "text": "d"}]},
+               "correct_options": ["A"], "solution": sol}
+        return [f["kind"] for f in qv.check_row(row, "/nonexistent-assets")]
+
+    def test_dangling_colon_with_figure_is_not_truncated(self):
+        kinds = self._flags({"text": "The muscles of mastication are shown below:",
+                             "tables": [], "images": [{"file": "fig1.png"}]})
+        self.assertNotIn("truncated_solution", kinds)
+
+    def test_dangling_colon_with_table_still_exempt(self):
+        kinds = self._flags({"text": "The values are listed below:",
+                             "tables": [{"markdown": "| a |"}], "images": []})
+        self.assertNotIn("truncated_solution", kinds)
+
+    def test_dangling_colon_with_nothing_is_still_flagged(self):
+        kinds = self._flags({"text": "The muscles of mastication are shown below:",
+                             "tables": [], "images": []})
+        self.assertIn("truncated_solution", kinds)
+
+    def test_real_mid_flow_cut_with_a_figure_is_still_flagged(self):
+        """The exemption is for ':' lead-ins only -- a genuine mid-sentence
+        cut must not be excused just because a figure happens to be attached."""
+        kinds = self._flags({"text": "The nerve travels through the foramen and then \u2014",
+                             "tables": [], "images": [{"file": "fig1.png"}]})
+        self.assertIn("truncated_solution", kinds)
+
+
 if __name__ == "__main__":
     unittest.main()
