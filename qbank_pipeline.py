@@ -6524,24 +6524,46 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                         print(f"  [429] rate limited on {subject} ch{ch['chapter_no']} "
                               f"batch {batch_start} {pass_name}-pass -- backing off 65s "
                               f"(could be the per-minute cap, not the daily one)")
+                        # run-24 KEY-ROTATION BATCH LOSS (user-reported audit):
+                        # every call below MUST send `pass_batch`, not `batch`.
+                        # `batch` is the raw window; `pass_batch` is that window
+                        # after _batch_after_routing dropped the pages the
+                        # PREFLIGHT_OCR already recovered for this pass. Re-sending
+                        # `batch` on the retry path re-asks recitation-sensitive
+                        # solution pages that were deliberately routed away --
+                        # the exact pages that trigger finish_reason=4 -- so the
+                        # retry could fail on a page the pass was never meant to
+                        # send, and the whole window was then written off.
                         time.sleep(65)
                         try:
-                            raw_items = call_gemini_on_pages(genai_model, batch,
+                            raw_items = call_gemini_on_pages(genai_model, pass_batch,
                                                              context=context_str, prompt=prompt)
                             note_call(state)
                             save_state(state)
+                            pass_recovered = True
                         except Exception as e2:
                             t2 = str(e2)
+                            rotated_ok = False
                             if "429" in t2 or "quota" in t2.lower():
                                 if handle_429(state, t2):
                                     print(f"  [429] still limited after backoff -- rotated to "
                                           f"{keypool_summary(state)}, retrying batch")
                                     try:
                                         raw_items = call_gemini_on_pages(
-                                            genai_model, batch,
+                                            genai_model, pass_batch,
                                             context=context_str, prompt=prompt)
                                         note_call(state)
                                         save_state(state)
+                                        # run-24: a SUCCESSFUL post-rotation call
+                                        # ends the failure path. The old code fell
+                                        # through to the "failed differently"
+                                        # branch below and threw these good items
+                                        # away, replacing them with a page-by-page
+                                        # re-ask of the SAME pages -- burning one
+                                        # fresh-key call per page and re-extracting
+                                        # content it was already holding.
+                                        rotated_ok = True
+                                        pass_recovered = True
                                     except Exception as e3:
                                         print(f"  [WARN] batch failed after rotation: {e3}")
                                         raw_items = retry_batch_page_by_page(
@@ -6549,19 +6571,22 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                                             ctx={"subject": subject, "chapter_no": ch["chapter_no"],
                                                  "chapter_id": chapter_id, "pass": pass_name},
                                             prompt=prompt)
+                                        rotated_ok = True
+                                        pass_recovered = bool(raw_items)
                                 else:
                                     print(f"  [QUOTA] every key exhausted -- daily cap "
                                           f"it is. Saving progress, exiting: {e2}")
                                     save_state(state)
                                     sys.exit(0)
-                            print(f"  [WARN] post-backoff call failed differently "
-                                  f"({pass_name}-pass): {e2}")
-                            raw_items = retry_batch_page_by_page(
-                                genai_model, pass_batch, state,
-                                ctx={"subject": subject, "chapter_no": ch["chapter_no"],
-                                     "chapter_id": chapter_id, "pass": pass_name},
-                                prompt=prompt)
-                            pass_recovered = bool(raw_items)
+                            if not rotated_ok:
+                                print(f"  [WARN] post-backoff call failed differently "
+                                      f"({pass_name}-pass): {e2}")
+                                raw_items = retry_batch_page_by_page(
+                                    genai_model, pass_batch, state,
+                                    ctx={"subject": subject, "chapter_no": ch["chapter_no"],
+                                         "chapter_id": chapter_id, "pass": pass_name},
+                                    prompt=prompt)
+                                pass_recovered = bool(raw_items)
                             if not raw_items:
                                 ledger_rows.append(_ledger_pass(
                                     chapter_id, subject, ch["chapter_no"], pass_name,

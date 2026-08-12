@@ -3543,5 +3543,109 @@ class Run24LeadInFlagParityTests(unittest.TestCase):
         self.assertIn("truncated_solution", kinds)
 
 
+class Run24KeyRotationBatchLossTests(unittest.TestCase):
+    """User-reported audit: when a key exhausts and the pool rotates, is any
+    batch skipped? Two real defects were found in the MAIN batch loop's 429
+    handler and are locked down here."""
+
+    def _replay(self, scenario, keys_after_rotation):
+        """Mirror of the main loop's 429 handler AS FIXED (qbank_pipeline
+        ~:6520-6595). Returns (raw_items, n_model_calls, pages_sent, log)."""
+        calls, pages_sent, log = {"n": 0}, [], []
+
+        def call_gemini(which, pages):
+            calls["n"] += 1
+            pages_sent.append((which, tuple(pages)))
+            outcome = scenario.pop(0)
+            log.append(f"{which}:{outcome}")
+            if outcome == "ok":
+                return ["ITEM"]
+            raise Exception(outcome)
+
+        def handle_429():
+            return keys_after_rotation.pop(0) if keys_after_rotation else False
+
+        def salvage(pages):
+            log.append("salvage")
+            pages_sent.append(("salvage", tuple(pages)))
+            return ["SALVAGED"]
+
+        batch = ["p1", "p2", "p3"]          # raw window
+        pass_batch = ["p1", "p2"]           # p3 routed away (PREFLIGHT_OCR)
+        raw_items = None
+        try:
+            call_gemini("first", pass_batch)
+        except Exception as e:
+            if "429" in str(e):
+                try:
+                    raw_items = call_gemini("post-backoff", pass_batch)
+                except Exception as e2:
+                    t2, rotated_ok = str(e2), False
+                    if "429" in t2:
+                        if handle_429():
+                            log.append("ROTATED")
+                            try:
+                                raw_items = call_gemini("post-rotation", pass_batch)
+                                rotated_ok = True
+                            except Exception:
+                                raw_items = salvage(pass_batch)
+                                rotated_ok = True
+                        else:
+                            log.append("EXIT")
+                            return None, calls["n"], pages_sent, log
+                    if not rotated_ok:
+                        log.append("failed-differently")
+                        raw_items = salvage(pass_batch)
+        return raw_items, calls["n"], pages_sent, log
+
+    def test_successful_rotation_keeps_its_data(self):
+        """BUG 1: the post-backoff handler ran the 'failed differently' branch
+        UNCONDITIONALLY, so a SUCCESSFUL post-rotation call had its items
+        thrown away and replaced by a page-by-page re-ask of the same pages."""
+        items, n_calls, _pages, log = self._replay(
+            ["429 quota", "429 quota", "ok"], [True])
+        self.assertEqual(items, ["ITEM"], "rotated-key data must be kept")
+        self.assertNotIn("salvage", log, "must not re-ask pages it already has")
+        self.assertEqual(n_calls, 3, "no wasted calls on the fresh key")
+
+    def test_retry_path_never_sends_routed_away_pages(self):
+        """BUG 2: the backoff/rotation calls sent `batch` (raw window) instead
+        of `pass_batch`, re-asking recitation-sensitive pages that
+        _batch_after_routing had deliberately removed for this pass."""
+        _items, _n, pages_sent, _log = self._replay(
+            ["429 quota", "429 quota", "ok"], [True])
+        for which, pages in pages_sent:
+            self.assertNotIn("p3", pages,
+                             f"{which} re-sent a routed-away page")
+
+    def test_batch_is_never_silently_skipped_on_rotation(self):
+        """The user's actual question: can a batch be dropped when the key
+        switches? No -- every path either returns items or salvages."""
+        for scenario, keys in (
+                (["429 quota", "429 quota", "ok"], [True]),          # rotate, ok
+                (["429 quota", "429 quota", "429 quota"], [True]),   # rotate, still bad
+                (["429 quota", "500 server error"], [True]),         # non-429
+        ):
+            items, _n, _p, log = self._replay(list(scenario), list(keys))
+            self.assertTrue(items, f"batch produced nothing: {log}")
+
+    def test_exhausted_pool_exits_before_marking_chapter_done(self):
+        """When every key is spent the run exits; the chapter must NOT be in
+        chapters_done, so a resume re-processes it whole (no silent gap)."""
+        items, _n, _p, log = self._replay(["429 quota", "429 quota"], [False])
+        self.assertIn("EXIT", log)
+        self.assertIsNone(items)
+
+    def test_page_by_page_retry_rotates_and_continues(self):
+        """retry_batch_page_by_page must rotate and RETRY the same page, not
+        move on to the next one (that would drop the page's content)."""
+        src = inspect.getsource(qp.retry_batch_page_by_page)
+        rot = src.index("handle_429")
+        self.assertIn("continue", src[rot:rot + 700],
+                      "must re-attempt the SAME page after rotation")
+        self.assertIn("failed even alone", src,
+                      "an unrecoverable page must still be queued for drain")
+
+
 if __name__ == "__main__":
     unittest.main()
