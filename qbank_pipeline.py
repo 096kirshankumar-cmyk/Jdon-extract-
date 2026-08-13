@@ -1526,6 +1526,18 @@ def chapter_integrity_sweep(chapter_records, image_files_by_q, subject, chapter_
         entry.update(extra)
         flags.append(entry)
         _append_jsonl(DATA_DIR / "integrity_flags.jsonl", entry)
+        # run-26: matched=False means the sweep SAW a problem it could not
+        # repair deterministically -- exactly the cases a human must look at.
+        # Until now that verdict lived only in integrity_flags.jsonl, so the
+        # exported record carried manual_review=False and the reviewer had no
+        # way to see it without opening a side file (DER ch3 q11 / ch4 q14
+        # both shipped silently clean). Pin the reason onto the record so
+        # build_export_row can surface it.
+        if not matched and qn in chapter_records:
+            reasons = chapter_records[qn].setdefault("_review_reasons", [])
+            note = f"{kind}: {detail}"
+            if note not in reasons:
+                reasons.append(note)
 
     # 1. duplicate-stem pairs (012-001 class): identical/near-identical stems
     #    on two records of one chapter. The record whose stem does NOT cohere
@@ -1581,11 +1593,46 @@ def chapter_integrity_sweep(chapter_records, image_files_by_q, subject, chapter_
                   f"on another record -- stripped: {head_line[:120]!r}")
             print(f"  [SWEEP] q{qn}: stripped foreign 'Option' head (verbatim dup elsewhere)")
         else:
-            iflag("foreign_option_head_review", qn,
-                  f"solution begins with an 'Option' line its own options cannot own "
-                  f"-- kept (unique), needs review: {head_line[:120]!r}", matched=False)
-            print(f"  [WARN] [SWEEP] q{qn}: foreign 'Option' head but no verbatim donor "
-                  f"-- kept, logged for review")
+            # run-26b: no verbatim duplicate exists, but the line may still be
+            # the page-cut TAIL of the nearest earlier solution rather than a
+            # stray copy. The 2. branch above only fires when the model emits a
+            # "Solution to Question N:" header between the two; on a clean page
+            # break it emits blank lines instead and the same DER ch3 q10/q11
+            # defect reappears here. Same rules as the header branch: donate to
+            # the nearest earlier record that HAS a solution, append only, and
+            # only when the join reads as a genuine continuation.
+            donated = False
+            prevs = [o for o in qns
+                     if o < qn and (chapter_records[o].get("solution_text") or "").strip()]
+            if prevs and head_line:
+                owner = max(prevs)
+                owner_sol = chapter_records[owner].get("solution_text") or ""
+                head_opts = _option_letters_in(head_line)
+                owner_opts = _option_letters_in(owner_sol)
+                if (head_line not in owner_sol
+                        and (not head_opts or not (head_opts & owner_opts))
+                        and _reads_as_continuation(owner_sol, head_line)):
+                    chapter_records[owner]["solution_text"] = (
+                        owner_sol.rstrip() + "\n" + head_line)
+                    chapter_records[qn]["solution_text"] = \
+                        sol[len(sol.splitlines()[0]):].lstrip("\n ")
+                    chapter_records[owner].setdefault("_prov", {})["solution_text"] = \
+                        "SWEEP_OPTION_HEAD_APPENDED"
+                    stats["foreign_heads_appended"] = \
+                        stats.get("foreign_heads_appended", 0) + 1
+                    iflag("foreign_option_head_appended", owner,
+                          f"q{qn}'s solution began with an 'Option' line it cannot own; "
+                          f"it continues q{owner}'s page-cut solution and has been "
+                          f"appended to it: {head_line[:120]!r}")
+                    print(f"  [SWEEP] q{qn}: foreign 'Option' head reads as q{owner}'s "
+                          f"page-cut tail -- appended to q{owner}, stripped from q{qn}")
+                    donated = True
+            if not donated:
+                iflag("foreign_option_head_review", qn,
+                      f"solution begins with an 'Option' line its own options cannot own "
+                      f"-- kept (unique), needs review: {head_line[:120]!r}", matched=False)
+                print(f"  [WARN] [SWEEP] q{qn}: foreign 'Option' head but no verbatim donor "
+                      f"-- kept, logged for review")
 
     # 2b. foreign "Solution to Question N:" dump TAIL (external-audit class,
     #     2026-07-27: on a dense solutions page the model sometimes returns
@@ -1690,6 +1737,54 @@ def chapter_integrity_sweep(chapter_records, image_files_by_q, subject, chapter_
             if looks_truncated_solution(head, has_tables=bool(chapter_records[owner].get("tables"))):
                 forced_solution.add(owner)
             continue
+        # run-26: the head is not orphaned -- the nearest earlier question
+        # HAS a solution, but it was cut at the page break and this head is
+        # its tail (DER ch3 q10/q11 "Option D: Polycyclic lesions...", ch4
+        # q13/q14 the acid bullet list). The old code had no branch for this:
+        # `needy` requires an EMPTY solution, so both fell through to the
+        # review branch and shipped with a foreign prefix while their true
+        # owner stayed truncated. Append -- never overwrite -- and only when
+        # the join reads as a genuine continuation and the text is not
+        # already there.
+        prevs = [o for o in qns if o < qn and (chapter_records[o].get("solution_text") or "").strip()]
+        if prevs:
+            owner = max(prevs)
+            owner_sol = chapter_records[owner].get("solution_text") or ""
+            already = head[:80] in owner_sol
+            # An "Option X:" head can only belong to a record whose own
+            # options do not already cover that letter -- guards against
+            # re-donating a line the owner legitimately printed itself.
+            head_opts = _option_letters_in(head)
+            owner_opts = _option_letters_in(owner_sol)
+            opt_ok = not head_opts or not (head_opts & owner_opts)
+            if not already and opt_ok and _reads_as_continuation(owner_sol, head):
+                chapter_records[owner]["solution_text"] = owner_sol.rstrip() + "\n" + head
+                chapter_records[qn]["solution_text"] = tail
+                chapter_records[owner].setdefault("_prov", {})["solution_text"] = "SWEEP_HEAD_APPENDED"
+                # An earlier pass may have logged this very head as an unrepaired
+                # review reason on qn. The head is gone from qn now, so drop any
+                # stale reason that quotes it -- otherwise the record ships with
+                # manual_review=True for a defect that has just been fixed.
+                stale_probe = head.strip()[:60]
+                if stale_probe:
+                    kept_reasons = [
+                        r for r in (chapter_records[qn].get("_review_reasons") or [])
+                        if stale_probe not in r
+                    ]
+                    chapter_records[qn]["_review_reasons"] = kept_reasons
+                stats["solution_heads_appended"] = stats.get("solution_heads_appended", 0) + 1
+                iflag("foreign_solution_head_appended", owner,
+                      f"q{qn}'s solution carried a self-labeled 'Solution to Question {qn}:' "
+                      f"header at char {m.start()}; the {len(head)}-char head before it reads as "
+                      f"the continuation of q{owner}'s page-cut solution and has been appended "
+                      f"to it")
+                print(f"  [SWEEP] q{qn}: self-labeled header at char {m.start()} -- "
+                      f"appended {len(head)}-char head to q{owner}'s page-cut solution, "
+                      f"kept {len(tail)} chars")
+                if looks_truncated_solution(tail, has_tables=bool(chapter_records[qn].get("tables"))):
+                    forced_solution.add(qn)
+                continue
+
         dup_elsewhere = any(other != qn and head[:80] in (chapter_records[other].get("solution_text") or "")
                             for other in qns)
         if dup_elsewhere:
@@ -3559,6 +3654,64 @@ STEM_COHERENCE_MARGIN = 0.15  # stem-conflict resolver: stem<->payload coherence
 DANGLING_END_RE = re.compile(r"(:|\u2014|\u2013|\u2022)\s*$")   # ends ':' / em/en-dash / bullet
 OPTION_LINE_START_RE = re.compile(r"^\s*Option\s+([A-D])\b\s*[:.)]\s*", re.IGNORECASE)
 
+# run-26: does `head` read as the direct continuation of `prev`?
+# Used when a record carries a foreign head before its own self-labeled
+# "Solution to Question N:" header. The existing sweep could only donate the
+# head to a solution-LESS earlier question; in practice (DER ch3 q10/q11,
+# ch4 q13/q14) the earlier question already HAS a solution that was cut at a
+# page break, so the head belongs on the end of it. Both signals below are
+# deterministic and text-only -- no API call.
+_BULLET_LINE_RE = re.compile(r"^\s*[\u2022\u25cf\u00b7*\-]\s+\S")
+
+
+def _reads_as_continuation(prev, head):
+    """True when `head` is evidently the tail of `prev` split at a page break.
+
+    Two independent tells, either is sufficient:
+      1. LIST CONTINUATION -- prev's last line and head's first line are both
+         bullet items (a list that ran over the page edge), or prev ends on a
+         dangling lead-in (':', dash, bullet) and head opens with a bullet.
+      2. SENTENCE CONTINUATION -- prev ends without terminal punctuation and
+         head starts lowercase or with a clause continuation, i.e. the
+         sentence itself was cut mid-flow.
+    Deliberately conservative: a head that starts a fresh capitalised sentence
+    after a properly terminated prev is NOT a continuation.
+    """
+    prev = (prev or "").rstrip()
+    head = (head or "").strip()
+    if not prev or not head:
+        return False
+    prev_last = prev.split("\n")[-1].strip()
+    head_first = head.split("\n")[0].strip()
+    if not prev_last or not head_first:
+        return False
+    # 1. list continuation
+    if _BULLET_LINE_RE.match(head_first):
+        if _BULLET_LINE_RE.match(prev_last) or DANGLING_END_RE.search(prev_last):
+            return True
+    # 2. sentence cut mid-flow
+    if prev_last[-1] not in TERMINAL_PUNCT and not DANGLING_END_RE.search(prev_last):
+        if head_first[:1].islower():
+            return True
+    # 3. OPTION-WALK continuation -- the book explains options in order
+    #    ("Option A: ... Option B: ..."). If prev's last option line is the
+    #    letter immediately before head's first option line, the walk ran
+    #    over the page edge (DER ch3 q10 ends 'Option C:', q11's head opens
+    #    'Option D:'). Requires strict adjacency, so an unrelated record
+    #    starting at 'Option A' never matches.
+    hm = OPTION_LINE_START_RE.match(head_first)
+    if hm:
+        prev_opts = sorted(_option_letters_in(prev))
+        if prev_opts and ord(hm.group(1).upper()) == ord(prev_opts[-1]) + 1:
+            return True
+    return False
+
+
+def _option_letters_in(text):
+    """Set of 'Option X' letters that appear as line starts in text."""
+    return {m.group(1).upper()
+            for m in re.finditer(r"(?m)^\s*Option\s+([A-D])\b", text or "", re.IGNORECASE)}
+
 TERMINAL_PUNCT = ".!?)\"'\u201d\u00bb"
 
 
@@ -4990,8 +5143,14 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
         # solution page (ch. 38 q13). Ships as-extracted; this is the review
         # marker, not a correction. None on healthy records.
         "options_suspect": rec.get("_options_suspect_reason"),
+        # run-26: unrepaired integrity-sweep findings (iflag matched=False).
+        # These are the "I found something wrong and could not fix it safely"
+        # cases -- they used to live only in integrity_flags.jsonl, leaving
+        # the exported row looking clean. None on healthy records.
+        "review_reasons": list(rec.get("_review_reasons") or []) or None,
         "manual_review": bool(rec.get("_stem_suspect_reason")
-                              or rec.get("_options_suspect_reason")),
+                              or rec.get("_options_suspect_reason")
+                              or rec.get("_review_reasons")),
     }
 
 

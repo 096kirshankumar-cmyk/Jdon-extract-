@@ -3888,5 +3888,176 @@ class Run25CarryAdvancesOnImagelessPagesTests(unittest.TestCase):
         self.assertIn("window_rows.append((file_page_num, ordered))", body)
 
 
+class Run26PageCutSolutionContinuationTests(unittest.TestCase):
+    """run-26: a solution cut at a page break left its tail glued to the FRONT
+    of the next question's record (DER ch3 q10/q11, ch4 q13/q14). The existing
+    self-labeled-header sweep could only donate that head to a question with
+    an EMPTY solution, so these cases shipped with a foreign prefix while the
+    real owner stayed truncated."""
+
+    # ---- _reads_as_continuation ----------------------------------------
+    def test_option_walk_running_over_the_page_edge_is_a_continuation(self):
+        prev = "Option B: x.\nOption C: Arcuate lesions are arc-shaped or incomplete circles."
+        head = "Option D: Polycyclic lesions are several circles that have merged together."
+        self.assertTrue(qp._reads_as_continuation(prev, head))
+
+    def test_bullet_list_running_over_the_page_edge_is_a_continuation(self):
+        prev = "Other peeling agents are:\n\u2022 Pyruvic acid\n\u2022 Citric acid"
+        head = "\u2022 Tartaric acid\n\u2022 Mandelic acid"
+        self.assertTrue(qp._reads_as_continuation(prev, head))
+
+    def test_sentence_cut_mid_flow_is_a_continuation(self):
+        self.assertTrue(qp._reads_as_continuation(
+            "Pearly opalescent white epidermal inclusion cysts. Resolve",
+            "spontaneously without scarring."))
+
+    def test_new_capitalised_sentence_after_clean_stop_is_not_a_continuation(self):
+        self.assertFalse(qp._reads_as_continuation(
+            "This is fully explained.", "Rhinophyma is a separate condition."))
+
+    def test_fresh_option_a_after_a_finished_solution_is_not_a_continuation(self):
+        self.assertFalse(qp._reads_as_continuation(
+            "The answer is B. Fully explained here.", "Option A: Something unrelated."))
+
+    def test_non_adjacent_option_letters_are_not_a_continuation(self):
+        self.assertFalse(qp._reads_as_continuation("Option A: first.", "Option D: jump."))
+
+    def test_empty_inputs_are_never_a_continuation(self):
+        self.assertFalse(qp._reads_as_continuation("", "Option D: x"))
+        self.assertFalse(qp._reads_as_continuation("Option C: x", ""))
+
+    # ---- _option_letters_in --------------------------------------------
+    def test_option_letters_only_counts_line_starts(self):
+        self.assertEqual(qp._option_letters_in("Option A: x\nOption C: y"), {"A", "C"})
+        self.assertEqual(
+            qp._option_letters_in("as described in Option B this is inline"), set())
+
+    # ---- sweep wiring (source-level) -----------------------------------
+    def _sweep_src(self):
+        """The self-labeled-header sweep: from its `for qn in qns:` header up
+        to the dup_elsewhere fallback that follows the new append branch."""
+        src = Path(qp.__file__).read_text()
+        anchor = src.index("prevs = [o for o in qns if o < qn")
+        start = src.rindex("for qn in qns:", 0, anchor)
+        end = src.index("dup_elsewhere = any(other != qn", anchor)
+        return src[start:end]
+
+    def test_sweep_appends_head_to_a_truncated_earlier_solution(self):
+        body = self._sweep_src()
+        self.assertIn("_reads_as_continuation(owner_sol, head)", body)
+        self.assertIn('owner_sol.rstrip() + "\\n" + head', body)
+
+    def test_sweep_never_overwrites_an_existing_solution(self):
+        """The append branch must concatenate, never assign head alone.
+
+        (The earlier `needy` branch legitimately assigns head outright, but
+        only to a record whose solution is EMPTY -- that is not this block.)
+        """
+        src = Path(qp.__file__).read_text()
+        start = src.index("prevs = [o for o in qns if o < qn")
+        end = src.index("dup_elsewhere = any(other != qn", start)
+        append_branch = src[start:end]
+        self.assertNotIn('chapter_records[owner]["solution_text"] = head',
+                         append_branch)
+        self.assertIn('owner_sol.rstrip() + "\\n" + head', append_branch)
+
+    def test_sweep_skips_when_head_is_already_present(self):
+        self.assertIn("already = head[:80] in owner_sol", self._sweep_src())
+
+    def test_sweep_guards_against_redonating_an_owned_option_letter(self):
+        body = self._sweep_src()
+        self.assertIn("head_opts & owner_opts", body)
+
+    def test_repairing_the_head_clears_the_stale_review_reason(self):
+        """A head logged as unrepaired earlier must not keep manual_review on.
+
+        The `foreign 'Option' head ... no verbatim donor` warning fires before
+        this branch runs. Once the head has been moved to its true owner the
+        record is clean, so the reason quoting that head has to go with it.
+        """
+        body = self._sweep_src()
+        self.assertIn("stale_probe = head.strip()[:60]", body)
+        self.assertIn("stale_probe not in r", body)
+        self.assertIn('chapter_records[qn]["_review_reasons"] = kept_reasons',
+                      body)
+
+
+class Run26OptionHeadWithoutAHeaderTests(unittest.TestCase):
+    """The same page-cut defect when the model emits NO 'Solution to
+    Question N:' header -- just blank lines. Branch 2 handles it there;
+    branch 2's no-donor `else` has to handle it here or DER ch3 q10/q11
+    regresses on any run where the header is absent (observed live)."""
+
+    def _nodonor_src(self):
+        src = Path(qp.__file__).read_text()
+        anchor = src.index('iflag("foreign_option_head_review"')
+        start = src.rindex("donated = False", 0, anchor)
+        return src[start:anchor]
+
+    def test_no_donor_branch_tries_the_page_cut_owner_first(self):
+        body = self._nodonor_src()
+        self.assertIn("_reads_as_continuation(owner_sol, head_line)", body)
+        self.assertIn('owner_sol.rstrip() + "\\n" + head_line', body)
+
+    def test_no_donor_branch_appends_never_overwrites(self):
+        self.assertNotIn('chapter_records[owner]["solution_text"] = head_line',
+                         self._nodonor_src())
+
+    def test_no_donor_branch_keeps_the_option_letter_guard(self):
+        self.assertIn("head_opts & owner_opts", self._nodonor_src())
+
+    def test_review_flag_only_fires_when_nothing_was_donated(self):
+        src = Path(qp.__file__).read_text()
+        anchor = src.index('iflag("foreign_option_head_review"')
+        preceding = src.rindex("if not donated:", 0, anchor)
+        self.assertLess(anchor - preceding, 200)
+
+    def test_der_ch3_q10_q11_pair_reads_as_a_continuation(self):
+        owner = ("granuloma annulare.\n\nAnnular lesion\n\n"
+                 "Option C: Arcuate lesions are arc-shaped or incomplete circles.")
+        head = ("Option D: Polycyclic lesions are several circles that "
+                "have merged together.")
+        self.assertTrue(qp._reads_as_continuation(owner, head))
+
+    def test_a_finished_solution_does_not_adopt_a_fresh_option_a(self):
+        owner = "The answer is psoriasis. This is a well established finding."
+        self.assertFalse(
+            qp._reads_as_continuation(owner, "Option A: Something entirely new."))
+
+
+class Run26UnrepairedFlagsReachTheExportTests(unittest.TestCase):
+    """run-26: iflag(matched=False) means the sweep found something it could
+    NOT fix. That verdict only ever reached integrity_flags.jsonl, so the
+    exported row still said manual_review=False and a reviewer saw nothing."""
+
+    def test_iflag_pins_unmatched_reasons_onto_the_record(self):
+        src = Path(qp.__file__).read_text()
+        i = src.index("def iflag(kind, qn, detail, matched=True")
+        body = src[i:src.index("# 1. duplicate-stem pairs", i)]
+        self.assertIn("if not matched and qn in chapter_records:", body)
+        self.assertIn('setdefault("_review_reasons", [])', body)
+
+    def test_iflag_does_not_flag_repaired_findings(self):
+        """matched=True is a fixed problem -- it must not raise manual_review."""
+        src = Path(qp.__file__).read_text()
+        i = src.index("def iflag(kind, qn, detail, matched=True")
+        body = src[i:src.index("# 1. duplicate-stem pairs", i)]
+        self.assertIn("if not matched", body)
+
+    def test_export_row_surfaces_review_reasons(self):
+        src = Path(qp.__file__).read_text()
+        i = src.index('"manual_review": bool(')
+        row = src[i - 800:i + 300]
+        self.assertIn('"review_reasons"', row)
+        self.assertIn('rec.get("_review_reasons")', row)
+
+    def test_manual_review_is_true_when_only_a_review_reason_exists(self):
+        src = Path(qp.__file__).read_text()
+        i = src.index('"manual_review": bool(')
+        expr = src[i:src.index("}", i)]
+        self.assertIn('_review_reasons', expr,
+                      "manual_review must consider unrepaired sweep findings")
+
+
 if __name__ == "__main__":
     unittest.main()
