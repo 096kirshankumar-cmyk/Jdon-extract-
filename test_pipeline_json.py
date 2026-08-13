@@ -2832,8 +2832,13 @@ class Run21bCarrySeedAndCarryCapTests(unittest.TestCase):
         # moves the anchor and the test fails on unchanged code.
         i = src.index('f"  [IMG] carry seeded from page')
         window = src[max(0, i - 1800):i]
-        self.assertIn("if active_block is None and window_rows:", window,
-                      "seeding must never override a real pass-level carry")
+        # run-25: the page list this guard reads was renamed window_rows ->
+        # window_seq (window_seq also carries the IMAGE-LESS pages, so the
+        # carry advances across them -- Defect B). The invariant under test is
+        # unchanged: seed ONLY when there is no pass-level carry.
+        self.assertRegex(window,
+                         r"if active_block is None and window_(rows|seq):",
+                         "seeding must never override a real pass-level carry")
 
     # --- (c) carry claims and the cap --------------------------------
     def test_carry_claim_source_is_distinct_from_plain_positional(self):
@@ -3767,6 +3772,120 @@ class Run24SelfLabeledSolutionHeadTests(unittest.TestCase):
                 2: self._rec("q2 owns its own solution already, proving redundancy.")}
         qp.chapter_integrity_sweep(recs, {}, "ANA", 11, {})
         self.assertNotIn("q2 body glued on", recs[1]["solution_text"])
+
+
+class Run25SlicedFigureStitchTests(unittest.TestCase):
+    """Defect A: one printed figure stored as N abutting image XObjects was
+    saved as N files, and the attribution pass then scattered those fragments
+    over N different questions. Real case (DER p11): the infant-back photo
+    came out as 3 strips, all 3 attached to q15 while its true owner q22 got
+    none. Slices must be regrouped by drawn geometry and stitched."""
+
+    # the real DER p7 geometry: (y, x, draw_idx, w, h), bottom-left origin
+    P7 = {17: (406.9, 161.5, 1, 224.9, 108.3),
+          18: (298.8, 385.9, 2, 64.6, 216.5),
+          19: (298.8, 161.5, 3, 224.9, 108.4)}
+    WATERMARK = {2393: (-1.3, -1.5, 0, 614.9, 794.7)}
+
+    def _rects(self, pos):
+        return {k: qp._rect_from_position(v) for k, v in pos.items()}
+
+    def test_three_slices_of_one_figure_group_together(self):
+        groups = qp._group_slice_rects(self._rects(self.P7))
+        self.assertEqual(len(groups), 1, "p7's 3 strips are ONE printed figure")
+        self.assertCountEqual(groups[0], [17, 18, 19])
+
+    def test_full_page_watermark_does_not_swallow_the_figures(self):
+        """A page-sized backdrop contains every figure; without the
+        containment guard union-find merged the whole page into one blob."""
+        pos = dict(self.P7); pos.update(self.WATERMARK)
+        groups = qp._group_slice_rects(self._rects(pos))
+        self.assertEqual(len(groups), 2)
+        self.assertIn([2393], [sorted(g) for g in groups])
+
+    def test_two_separate_figures_on_one_page_stay_separate(self):
+        """DER p18 prints two distinct photos, 3 slices each -> 2 figures."""
+        pos = {53: (600.0, 161.5, 1, 224.9, 108.0),
+               54: (600.0, 386.4, 2, 64.6, 108.0),
+               55: (491.0, 161.5, 3, 289.5, 108.0),
+               # second figure, a clear gutter below the first
+               56: (300.0, 161.5, 4, 224.9, 108.0),
+               57: (300.0, 386.4, 5, 64.6, 108.0),
+               58: (191.0, 161.5, 6, 289.5, 108.0)}
+        groups = [sorted(g) for g in qp._group_slice_rects(self._rects(pos))]
+        self.assertEqual(len(groups), 2)
+        self.assertCountEqual(groups, [[53, 54, 55], [56, 57, 58]])
+
+    def test_side_by_side_figures_with_a_real_gutter_are_not_merged(self):
+        pos = {1: (500.0, 60.0, 0, 200.0, 150.0),
+               2: (500.0, 330.0, 1, 200.0, 150.0)}   # 70 pt gutter
+        self.assertEqual(len(qp._group_slice_rects(self._rects(pos))), 2)
+
+    def test_positions_report_the_union_rect_under_the_lead_slice_id(self):
+        """Every consumer looks geometry up by the object id parsed out of the
+        saved filename, so the lead id must resolve to the WHOLE figure."""
+        merged = {}
+        rects = self._rects(self.P7)
+        for g in qp._group_slice_rects(rects):
+            merged[qp._group_lead(g, rects)] = g
+        self.assertEqual(list(merged), [17], "topmost slice names the file")
+
+    def test_stitched_canvas_spans_the_union_and_places_each_slice(self):
+        rects = self._rects(self.P7)
+        members = [(k, Image.new("RGB", (int(self.P7[k][3]) * 2,
+                                         int(self.P7[k][4]) * 2), col))
+                   for k, col in ((17, "red"), (18, "green"), (19, "blue"))]
+        out = qp._stitch_slices(members, rects)
+        # union is 289.0 x 216.7 pt at 2 px/pt
+        self.assertAlmostEqual(out.width / out.height, 289.0 / 216.7, places=1)
+        self.assertEqual(out.getpixel((5, 5)), (255, 0, 0))          # top-left
+        self.assertEqual(out.getpixel((out.width - 5, out.height - 5)),
+                         (0, 128, 0))                                 # right col
+        self.assertEqual(out.getpixel((5, out.height - 5)), (0, 0, 255))
+
+    def test_single_image_page_is_returned_untouched(self):
+        one = Image.new("RGB", (720, 540), "white")
+        self.assertIs(qp._stitch_slices([(22, one)],
+                                        {22: (162.0, 56.0, 450.0, 272.0)}), one)
+
+
+class Run25CarryAdvancesOnImagelessPagesTests(unittest.TestCase):
+    """Defect B: `if not imgs: continue` dropped image-less pages from the
+    window list, and the carry advance lived in the claim loop over that same
+    list -- so a text-only page's headings never moved active_block and the
+    next page's top figure was attributed to a block that had closed pages
+    earlier (29/210 carries wrong on DER ch1-9, 2 of them crossing the
+    question->solution boundary)."""
+
+    def _window_loop_src(self):
+        src = Path(qp.__file__).read_text()
+        i = src.index("window_seq = []")
+        return src[i:src.index("FIGURE-MAP pass", i)]
+
+    def test_imageless_pages_stay_in_the_page_sequence(self):
+        body = self._window_loop_src()
+        head = body[:body.index("pos = image_positions_on_page")]
+        self.assertIn("window_seq.append((file_page_num, []))", head,
+                      "an image-less page must still enter the sequence")
+
+    def test_claim_loop_iterates_the_full_sequence_not_just_imaged_pages(self):
+        self.assertIn("for file_page_num, rels in window_seq:",
+                      self._window_loop_src())
+
+    def test_carry_advances_before_skipping_an_imageless_page(self):
+        body = self._window_loop_src()
+        i = body.index("for file_page_num, rels in window_seq:")
+        guard = body[i:body.index("leftover = claim_page_images", i)]
+        self.assertIn("last_block_on_page(pdf_path, file_page_num)", guard)
+        self.assertLess(guard.index("active_block = _last"),
+                        guard.rindex("continue"),
+                        "advance the carry BEFORE continuing past the page")
+
+    def test_figure_map_still_only_sees_pages_that_have_images(self):
+        """window_rows (imaged pages only) must keep feeding the fallbacks --
+        an empty row would break the exact-count guard."""
+        body = self._window_loop_src()
+        self.assertIn("window_rows.append((file_page_num, ordered))", body)
 
 
 if __name__ == "__main__":

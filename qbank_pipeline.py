@@ -539,11 +539,153 @@ def _decode_image_fallback(obj):
     except Exception:
         return None
 
+# A single printed figure is very often stored as several abutting JPEG
+# XObjects (the typesetter's image slicer cuts one photo into horizontal or
+# vertical strips). Two drawn rects whose edges are within this many points
+# of each other -- and which overlap on the perpendicular axis -- are treated
+# as slices of ONE figure and stitched back together before saving.
+IMAGE_SLICE_GAP_PT = 3.0
+
+
+def _rect_from_position(pos):
+    """(y, x, draw_idx, w, h) from image_positions_on_page -> normalised
+    (left, bottom, right, top) in PDF user space. The cm scale can be
+    negative (flipped placement), so fold that into the corners."""
+    y, x, _draw_idx, w, h = pos
+    left, right = (x, x + w) if w >= 0 else (x + w, x)
+    bottom, top = (y, y + h) if h >= 0 else (y + h, y)
+    return (float(left), float(bottom), float(right), float(top))
+
+
+def _rect_contains(outer, inner, pad=1.0):
+    return (outer[0] <= inner[0] + pad and outer[1] <= inner[1] + pad
+            and outer[2] >= inner[2] - pad and outer[3] >= inner[3] - pad)
+
+
+def _rect_area(r):
+    return max(r[2] - r[0], 0.0) * max(r[3] - r[1], 0.0)
+
+
+def _rects_are_slices(r1, r2, gap=IMAGE_SLICE_GAP_PT):
+    """True if r1 and r2 look like two slices of one figure: they touch (or
+    nearly touch) along one axis while substantially overlapping on the
+    other. Pure side-by-side figures with a real gutter between them stay
+    separate because the gutter is far wider than `gap`."""
+    # A backdrop that swallows the other rect (page watermark, coloured panel,
+    # figure frame) is NOT a slice of it -- without this, one full-page image
+    # unions every figure on the page into a single bogus group.
+    a1, a2 = _rect_area(r1), _rect_area(r2)
+    if a1 > 0 and a2 > 0:
+        big, small = (r1, r2) if a1 >= a2 else (r2, r1)
+        if _rect_contains(big, small) and max(a1, a2) >= 2.5 * min(a1, a2):
+            return False
+    l1, b1, r1x, t1 = r1
+    l2, b2, r2x, t2 = r2
+    # overlap (positive) or gap (negative) on each axis
+    x_ov = min(r1x, r2x) - max(l1, l2)
+    y_ov = min(t1, t2) - max(b1, b2)
+    if x_ov < -gap or y_ov < -gap:
+        return False  # separated on both/either axis by more than the tolerance
+    w_min = min(r1x - l1, r2x - l2)
+    h_min = min(t1 - b1, t2 - b2)
+    # stacked vertically: edges meet in y, and they share most of their width
+    if y_ov <= gap and x_ov >= 0.6 * max(w_min, 1e-6):
+        return True
+    # side by side horizontally: edges meet in x, and they share most of their height
+    if x_ov <= gap and y_ov >= 0.6 * max(h_min, 1e-6):
+        return True
+    # genuinely overlapping tiles (slicers sometimes overlap by a pixel)
+    if x_ov > gap and y_ov > gap:
+        return True
+    return False
+
+
+def _group_slice_rects(rects):
+    """Union-find over {key -> rect}; returns a list of key-lists, each list
+    being one printed figure. Keys with no rect are returned as singletons."""
+    keys = list(rects.keys())
+    parent = {k: k for k in keys}
+
+    def find(k):
+        while parent[k] != k:
+            parent[k] = parent[parent[k]]
+            k = parent[k]
+        return k
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            if _rects_are_slices(rects[keys[i]], rects[keys[j]]):
+                union(keys[i], keys[j])
+    groups = {}
+    for k in keys:
+        groups.setdefault(find(k), []).append(k)
+    return list(groups.values())
+
+
+def _slice_reading_key(rect):
+    """Reading order for slices of one figure: top edge first, then left.
+    The top edge is QUANTIZED to whole points because slicers emit strips
+    whose tops differ by ~0.1 pt of rounding -- an exact sort would then pick
+    the right-hand strip as the group's lead, and the saved filename (and so
+    every geometry lookup keyed off it) would flip between runs."""
+    return (-round(rect[3]), rect[0])
+
+
+def _group_lead(group, rects):
+    """The slice whose object id names the stitched file."""
+    return sorted(group, key=lambda k: _slice_reading_key(rects[k]))[0]
+
+
+def _stitch_slices(members, rects):
+    """Paste every slice onto one canvas at its page position.
+    `members` = [(key, PIL.Image), ...] all belonging to one figure.
+    Returns the stitched PIL image (RGB)."""
+    if len(members) == 1:
+        return members[0][1]
+    lefts = [rects[k][0] for k, _ in members]
+    bottoms = [rects[k][1] for k, _ in members]
+    rights = [rects[k][2] for k, _ in members]
+    tops = [rects[k][3] for k, _ in members]
+    u_l, u_b, u_r, u_t = min(lefts), min(bottoms), max(rights), max(tops)
+    u_w, u_h = max(u_r - u_l, 1e-6), max(u_t - u_b, 1e-6)
+    # keep the sharpest slice's resolution: points -> pixels scale
+    ppp_x = max((im.width / max(rects[k][2] - rects[k][0], 1e-6))
+                for k, im in members)
+    ppp_y = max((im.height / max(rects[k][3] - rects[k][1], 1e-6))
+                for k, im in members)
+    cw, ch = max(int(round(u_w * ppp_x)), 1), max(int(round(u_h * ppp_y)), 1)
+    canvas = Image.new("RGB", (cw, ch), (255, 255, 255))
+    for k, im in members:
+        l, b, r, t = rects[k]
+        tw = max(int(round((r - l) * ppp_x)), 1)
+        th = max(int(round((t - b) * ppp_y)), 1)
+        tile = im.convert("RGB")
+        if (tile.width, tile.height) != (tw, th):
+            tile = tile.resize((tw, th), Image.LANCZOS)
+        px = int(round((l - u_l) * ppp_x))
+        py = int(round((u_t - t) * ppp_y))  # PDF y grows up, image y grows down
+        canvas.paste(tile, (max(px, 0), max(py, 0)))
+    return canvas
+
+
 def extract_real_images(pdf_path, file_page, watermark_id, subject, out_dir):
     """
-    Extracts every embedded image on file_page EXCEPT the watermark object.
+    Extracts every printed FIGURE on file_page EXCEPT the watermark object.
     Returns a list of saved relative paths ("SUBJECT/filename.webp") --
-    exactly one entry per saved file (no duplicates, no watermarks).
+    exactly one entry per figure (no duplicates, no watermarks).
+
+    NOTE (run-25): one printed figure is frequently stored as several abutting
+    image XObjects. Saving one file per XObject produced N fragments of the
+    same photo, which the attribution pass then scattered across N different
+    questions (observed: DER p11's infant photo split into 3 files, all three
+    attributed to q15 while its real owner q22 got none). Slices are now
+    grouped by their drawn geometry and stitched back into a single image
+    before saving, so downstream sees one figure = one file.
     Caller is responsible for deciding which question/option/solution each
     belongs to (Gemini's response should say which figure goes where).
     """
@@ -559,6 +701,8 @@ def extract_real_images(pdf_path, file_page, watermark_id, subject, out_dir):
                        # names on one page -> would return the same path twice,
                        # and the second rename in process_pdf crashes with
                        # FileNotFoundError (observed in prod on PSY p264)
+    decoded = {}   # dedupe_key -> PIL image
+    order = {}     # dedupe_key -> position in the XObject dict (fallback order)
     for name, ref in _page_xobjects(page).items():
         obj = _resolve(ref)
         if obj.get("/Subtype") != "/Image":
@@ -570,7 +714,7 @@ def extract_real_images(pdf_path, file_page, watermark_id, subject, out_dir):
         seen_ids.add(dedupe_key)
         if watermark_id is not None and obj_id == watermark_id:
             continue  # the watermark -- never save it as a question figure
-        # Save exactly THIS image object. NOTE: don't shell out to
+        # Decode exactly THIS image object. NOTE: don't shell out to
         # `pdfimages -f P -l P` per object here -- it dumps EVERY image on
         # the page (watermark included) under one prefix each time, so
         # looping over N real images re-extracts the whole page N times
@@ -584,9 +728,53 @@ def extract_real_images(pdf_path, file_page, watermark_id, subject, out_dir):
             print(f"  [WARN] could not decode image {name} (obj {obj_id}) on "
                   f"page {file_page} -- skipping")
             continue
+        decoded[dedupe_key] = im
+        order[dedupe_key] = len(order)
+    if not decoded:
+        return []
+
+    # --- group slices of the same printed figure by drawn geometry ---------
+    try:
+        raw_pos = _image_positions_raw(pdf_path, file_page) or {}
+    except Exception as e:
+        print(f"  [WARN] geometry unavailable on page {file_page} ({e}) -- "
+              f"saving one file per image object")
+        raw_pos = {}
+    rects = {k: _rect_from_position(p) for k, p in raw_pos.items() if k in decoded}
+    placed = [k for k in decoded if k in rects]
+    unplaced = [k for k in decoded if k not in rects]  # no geometry -> standalone
+    groups = _group_slice_rects({k: rects[k] for k in placed}) if placed else []
+    groups += [[k] for k in unplaced]
+
+    def _group_sort_key(g):
+        # reading order: highest top edge first, then leftmost
+        gr = [rects[k] for k in g if k in rects]
+        if gr:
+            return (-max(r[3] for r in gr), min(r[0] for r in gr), 0)
+        return (float("inf"), 0.0, min(order[k] for k in g))
+
+    groups.sort(key=_group_sort_key)
+
+    for g in groups:
+        g_sorted = sorted(
+            g, key=lambda k: _slice_reading_key(rects[k]) if k in rects
+            else (float("inf"), order[k]))
+        members = [(k, decoded[k]) for k in g_sorted]
+        if len(members) > 1:
+            try:
+                im = _stitch_slices(members, rects)
+            except Exception as e:
+                print(f"  [WARN] slice stitch failed on page {file_page} "
+                      f"({e}) -- falling back to the largest slice")
+                im = max((m[1] for m in members), key=lambda i: i.width * i.height)
+            print(f"  [slices] page {file_page}: merged {len(members)} image "
+                  f"objects into 1 figure ({[str(k) for k in g_sorted]})")
+        else:
+            im = members[0][1]
         if im.size[0] * im.size[1] < 5000:
             continue  # skip tiny noise images
-        stem = obj_id if obj_id is not None else str(name).strip("/")
+        stem_key = g_sorted[0]
+        stem = stem_key if isinstance(stem_key, int) else str(stem_key).strip("/")
         fname = f"{subject}-p{file_page}-{stem}.webp"
         rel_path = f"{subject}/{fname}"
         im.convert("RGB").save(out_dir / subject / fname, "WEBP", quality=95)
@@ -4820,7 +5008,7 @@ def _mat_mult(m1, m2):
             e1 * a2 + f1 * c2 + e2, e1 * b2 + f1 * d2 + f2)
 
 
-def image_positions_on_page(pdf_path, file_page):
+def _image_positions_raw(pdf_path, file_page):
     """Best-effort map {image object idnum -> (y, x, draw_index, w, h)} for
     every image XObject drawn on a page, by walking the content stream and
     tracking the cm matrix before each `Do` -- RECURSING INTO Form XObjects
@@ -4919,6 +5107,38 @@ def image_positions_on_page(pdf_path, file_page):
         return positions
     except Exception:
         return {}
+
+
+def image_positions_on_page(pdf_path, file_page):
+    """Same contract as _image_positions_raw -- {key -> (y, x, draw_index, w, h)}
+    with (x, y) the BOTTOM-LEFT corner in PDF user space -- but SLICE-AWARE.
+
+    run-25: extract_real_images now stitches abutting slices of one printed
+    figure into a single file named after the group's FIRST slice. Every
+    consumer here (claim_block_images, _order_imgs_by_position, the bbox
+    overlay, ...) looks a file's geometry up by parsing that object id out of
+    the filename, so the id must resolve to the geometry of the WHOLE figure,
+    not of its top strip. We therefore report, for each group's lead id, the
+    union rect of all its slices, and drop the swallowed slice ids (no file
+    references them any more).
+    """
+    raw = _image_positions_raw(pdf_path, file_page)
+    if len(raw) < 2:
+        return raw
+    rects = {k: _rect_from_position(p) for k, p in raw.items()}
+    merged = {}
+    for g in _group_slice_rects(rects):
+        if len(g) == 1:
+            merged[g[0]] = raw[g[0]]
+            continue
+        lead = _group_lead(g, rects)
+        u_l = min(rects[k][0] for k in g)
+        u_b = min(rects[k][1] for k in g)
+        u_r = max(rects[k][2] for k in g)
+        u_t = max(rects[k][3] for k in g)
+        merged[lead] = (u_b, u_l, min(raw[k][2] for k in g),
+                        u_r - u_l, u_t - u_b)
+    return merged
 
 
 def pending_image_slots(chapter_records, image_files_by_q):
@@ -7031,6 +7251,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
             # and the 4th-pass model attribution only run on the LEFTOVERS and
             # can never override a deterministic assignment.
             window_rows = []
+            window_seq = []   # EVERY page this window owns, in order, images or not
             for pf in batch:
                 file_page_num = int(pf.stem.split("-")[-1])
                 if file_page_num in pages_imaged:
@@ -7038,10 +7259,22 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                 pages_imaged.add(file_page_num)
                 imgs = extract_real_images(pdf_path, file_page_num, watermark_id, subject, ASSETS_DIR / "questions")
                 if not imgs:
+                    # run-25 (Defect B): a page with NO images still PRINTS
+                    # headings, and the cross-page carry has to move past them.
+                    # This `continue` used to skip the page entirely, so the
+                    # carry advance (which lived in the claim loop below, over
+                    # window_rows only) never saw it: a figure at the top of
+                    # page N+1 was then attributed to a block that closed
+                    # several text-only pages earlier. Measured 29/210 carries
+                    # wrong (13.8%) on DER ch1-9, two of them crossing the
+                    # question->solution boundary. Keep the page in the
+                    # sequence with an empty row so the carry still advances.
+                    window_seq.append((file_page_num, []))
                     continue
                 pos = image_positions_on_page(pdf_path, file_page_num)
                 ordered = _order_imgs_by_position(imgs, pos)
                 window_rows.append((file_page_num, ordered))
+                window_seq.append((file_page_num, ordered))
 
             # GEOMETRY-FIRST (run-9 priority A/B/C): every image goes to the
             # closest question/solution heading ABOVE it (or the carried
@@ -7073,8 +7306,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
             # figure to the previous chapter's block. A chapter's first page
             # has no in-chapter predecessor by definition, so there is
             # nothing legitimate to seed from.
-            if active_block is None and window_rows:
-                _first_p = window_rows[0][0]
+            if active_block is None and window_seq:
+                _first_p = window_seq[0][0]
                 _floor = max(1, int(ch.get("file_start") or 1))
                 for _back in range(1, CARRY_SEED_LOOKBACK_PAGES + 1):
                     _prev = _first_p - _back
@@ -7091,7 +7324,18 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                               f"(window starts at page {_first_p})")
                         break
             leftover_by_page = {}
-            for file_page_num, rels in window_rows:
+            for file_page_num, rels in window_seq:
+                if not rels:
+                    # run-25 (Defect B): image-less page -- nothing to claim,
+                    # but the carry MUST still advance past the headings this
+                    # page prints. Fall through to the advance below.
+                    try:
+                        _last = last_block_on_page(pdf_path, file_page_num)
+                    except Exception:
+                        _last = None
+                    if _last is not None:
+                        active_block = _last
+                    continue
                 leftover = claim_page_images(rels, pdf_path, file_page_num, subject,
                                              ch["chapter_no"], chapter_records,
                                              image_files_by_q, active_block=active_block)
