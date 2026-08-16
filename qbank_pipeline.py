@@ -6028,13 +6028,36 @@ def full_page_vision_ownership(model, pdf_path, file_page, rels, positions,
         y_pt, x_pt, _didx, w_pt, h_pt = info
         x0 = int(x_pt * scale); y0 = int((page_h_pt - (y_pt + h_pt)) * scale)
         x1 = int((x_pt + w_pt) * scale); y1 = int((page_h_pt - y_pt) * scale)
+
+        # A PDF image may deliberately bleed beyond the MediaBox.  MIC page 3
+        # has a page-sized object at (-1.46, -1.33) whose rendered top is
+        # y=-2.  The old label rectangle clamped only its top to 0 but left
+        # its bottom at -2, producing [0, -2] and Pillow 11 raises:
+        #   ValueError: y1 must be greater than or equal to y0
+        # Normalize and clip the visible outline first.  If there is no room
+        # for the label above it, place the label just INSIDE the visible top
+        # edge.  This keeps the highlight useful and makes every rectangle
+        # coordinate ordered and in-bounds, including oversized/rotated PDF
+        # image matrices.
+        img_w, img_h = page_img.size
+        bx0 = max(0, min(img_w - 1, min(x0, x1)))
+        by0 = max(0, min(img_h - 1, min(y0, y1)))
+        bx1 = max(bx0, min(img_w - 1, max(x0, x1)))
+        by1 = max(by0, min(img_h - 1, max(y0, y1)))
         lw = max(3, int(scale / 8))
-        draw.rectangle([x0, y0, x1, y1], outline="red", width=lw)
+        draw.rectangle([bx0, by0, bx1, by1], outline="red", width=lw)
         if font:
             tw = max(10, int(len(label) * 9 * scale / 2))
-            draw.rectangle([x0, max(0, y0 - int(22 * scale / 2)),
-                            x0 + tw, y0], fill="red")
-            draw.text((x0 + 4, max(0, y0 - int(18 * scale / 2))),
+            label_h = max(1, int(22 * scale / 2))
+            lx0 = bx0
+            lx1 = max(lx0, min(img_w - 1, lx0 + tw))
+            if by0 >= label_h:
+                ly0, ly1 = by0 - label_h, by0
+            else:
+                ly0 = by0
+                ly1 = max(ly0, min(img_h - 1, ly0 + label_h))
+            draw.rectangle([lx0, ly0, lx1, ly1], fill="red")
+            draw.text((lx0 + 4, ly0 + max(1, int(2 * scale / 2))),
                       label, fill="white", font=font)
     # cross-page context (LEVEL 3b): a figure touching the top/bottom edge
     # may belong to a block that started/continues on the adjacent page

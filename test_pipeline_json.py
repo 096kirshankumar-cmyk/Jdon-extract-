@@ -2508,6 +2508,34 @@ class Run16MemoryAndResumeTests(unittest.TestCase):
         # the cached render is byte-identical to before the vision call
         self.assertEqual(cached_img.tobytes(), before)
 
+    def test_full_page_vision_handles_image_bleeding_past_page_top(self):
+        """MIC p3 regression: a page-sized image starts slightly outside the
+        MediaBox, so its rendered y0 is negative.  Pillow 11 must never receive
+        the old inverted label rectangle [top=0, bottom=-2]."""
+        pdf = self._mkpdf(1)
+        rel = "PSY/PSY-p1-2197.webp"
+        (qp.ASSETS_DIR / "questions" / rel).write_bytes(b"x" * 3000)
+        # Exact geometry class seen in the supplied MIC.pdf page 3.
+        pos = {2197: (-1.333286, -1.4571429, 0,
+                      614.9143245, 794.6666193)}
+
+        class _M:
+            def generate_content(self, parts, **kw):
+                class _R:
+                    candidates = [object()]
+                    text = json.dumps({"IMG-1": {"q_no": 1,
+                                                 "slot": "question",
+                                                 "confidence": "high",
+                                                 "evidence": "visible page anchor"}})
+                return _R()
+
+        claimed, still, verdicts = qp.full_page_vision_ownership(
+            _M(), pdf, 1, [rel], pos, "PSY", 1, {1: {}}, "PSY-001",
+            {"calls_today": 0}, {}, dpi=150)
+        self.assertEqual(still, [])
+        self.assertEqual([c[1] for c in claimed], ["PSY-001-001"])
+        self.assertIn(rel, verdicts)
+
     # -- 3. atomic per-chapter questions rewrite (resume safety) -----------
     def test_rewrite_removes_partial_chapter_and_dedups(self):
         path = qp.DATA_DIR / "questions.jsonl"
