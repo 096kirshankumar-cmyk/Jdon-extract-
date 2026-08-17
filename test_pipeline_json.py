@@ -58,6 +58,72 @@ def _write_test_pdf(path, texts, images, img_size=(20, 10)):
     path.write_bytes(out)
 
 
+def _write_multi_watermark_pdf(path):
+    """Ten-page PDF with two section-specific full-page watermarks, one
+    genuine repeated small figure, and one unique full-page image.
+
+    This mirrors MIC's object-id switch (1707 on one page range, 2197 on the
+    rest) and proves the detector does not remove either repeated real figures
+    or a legitimate one-off full-page scan.
+    """
+    from pypdf import PdfWriter
+    from pypdf.generic import (DecodedStreamObject, DictionaryObject,
+                               NameObject, NumberObject)
+
+    def image_object(width, height, data):
+        stream = DecodedStreamObject()
+        stream.set_data(data)
+        stream.update({
+            NameObject("/Type"): NameObject("/XObject"),
+            NameObject("/Subtype"): NameObject("/Image"),
+            NameObject("/Width"): NumberObject(width),
+            NameObject("/Height"): NumberObject(height),
+            NameObject("/ColorSpace"): NameObject("/DeviceRGB"),
+            NameObject("/BitsPerComponent"): NumberObject(8),
+        })
+        return stream
+
+    writer = PdfWriter()
+    sparse_a = bytearray(b"\xff\xff\xff" * (64 * 64))
+    for i in range(64):
+        for j in range(max(0, i - 1), min(64, i + 2)):
+            off = (i * 64 + j) * 3
+            sparse_a[off:off + 3] = b"\xd0\xd0\xd0"
+    sparse_b = bytearray(sparse_a)
+    sparse_b[30:33] = b"\xc0\xc0\xc0"  # a second watermark object/payload
+
+    wm_a = writer._add_object(image_object(64, 64, bytes(sparse_a)))
+    wm_b = writer._add_object(image_object(64, 64, bytes(sparse_b)))
+    repeated_real = writer._add_object(
+        image_object(90, 90, b"\xff\x00\x00" * (90 * 90)))
+    unique_full_page = writer._add_object(
+        image_object(120, 160, b"\x00\x00\xff" * (120 * 160)))
+
+    for page_no in range(1, 11):
+        page = writer.add_blank_page(width=612, height=792)
+        watermark = wm_a if page_no <= 4 else wm_b
+        xobjects = DictionaryObject({
+            NameObject("/WM"): watermark,
+            NameObject("/REAL"): repeated_real,
+        })
+        content = (b"q 612 0 0 792 0 0 cm /WM Do Q\n"
+                   b"q 90 0 0 90 300 300 cm /REAL Do Q\n")
+        if page_no == 1:
+            xobjects[NameObject("/UNIQUE")] = unique_full_page
+            content += b"q 612 0 0 792 0 0 cm /UNIQUE Do Q\n"
+        page[NameObject("/Resources")] = DictionaryObject({
+            NameObject("/XObject"): xobjects})
+        contents = DecodedStreamObject()
+        contents.set_data(content)
+        page[NameObject("/Contents")] = writer._add_object(contents)
+
+    with open(path, "wb") as fh:
+        writer.write(fh)
+    return {"watermarks": {wm_a.idnum, wm_b.idnum},
+            "repeated_real": repeated_real.idnum,
+            "unique_full_page": unique_full_page.idnum}
+
+
 class SolutionFigureMappingTests(unittest.TestCase):
     """Regression tests for the solutions-page figure mapping fix
     (user report: a 7-figure solutions page collapsed into 2 solutions
@@ -939,6 +1005,32 @@ class GeometryFirstImageTests(unittest.TestCase):
         # watermark_id = obj 6 -> only obj 7 survives extraction
         saved = qp.extract_real_images(pdf, 1, 6, "PSY", self.subj_dir)
         self.assertEqual(saved, ["PSY/PSY-p1-7.webp"])
+
+    def test_multiple_section_watermarks_excluded_without_losing_real_images(self):
+        pdf = self.tmp / "multi_watermark.pdf"
+        ids = _write_multi_watermark_pdf(pdf)
+
+        detected = qp.find_watermark_object_ids(pdf)
+        self.assertEqual(detected, frozenset(ids["watermarks"]))
+
+        # Page 1 contains watermark A, a genuine repeated small figure, and a
+        # legitimate one-off full-page scan. Only the watermark is removed.
+        saved_p1 = set(qp.extract_real_images(
+            pdf, 1, detected, "PSY", self.subj_dir))
+        self.assertEqual(saved_p1, {
+            f"PSY/PSY-p1-{ids['repeated_real']}.webp",
+            f"PSY/PSY-p1-{ids['unique_full_page']}.webp",
+        })
+
+        # Page 5 switches to watermark B. The same genuine repeated figure
+        # must still survive, proving frequency by itself never deletes it.
+        saved_p5 = qp.extract_real_images(
+            pdf, 5, detected, "PSY", self.subj_dir)
+        self.assertEqual(saved_p5,
+                         [f"PSY/PSY-p5-{ids['repeated_real']}.webp"])
+        for wm_id in ids["watermarks"]:
+            self.assertFalse((self.subj_dir / f"PSY-p1-{wm_id}.webp").exists())
+            self.assertFalse((self.subj_dir / f"PSY-p5-{wm_id}.webp").exists())
 
     # -- 8. ambiguous image -> unresolved, NOT decorative -------------------
     def test_ambiguous_image_recorded_as_unresolved_not_decorative(self):

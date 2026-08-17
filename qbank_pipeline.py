@@ -501,26 +501,143 @@ def _page_xobjects(page):
     xobjs = _resolve(res.get("/XObject"))
     return xobjs if xobjs else {}
 
-def find_watermark_object_id(pdf_path, sample_pages=30):
+# A book may contain MORE THAN ONE XObject id for the same repeating
+# watermark.  MIC is the production example: object 1707 is used on pages
+# 7-118, while object 2197 (the same "Sold by @Itachibot" full-page overlay)
+# is used on 503 other pages.  The old first-30-page vote returned only 1707,
+# so 2197 was extracted and then deterministically attached to many questions.
+# Cache by immutable file identity because recovery/smoke-test modes may ask
+# for the filter repeatedly for the same large PDF.
+_WATERMARK_IDS_CACHE = {}
+
+
+def _sparse_light_page_image(im):
+    """Conservative visual proof for a watermark/background candidate.
+
+    A candidate must already be repeated and drawn across almost the entire
+    PDF page.  This extra test protects genuine repeated diagrams/icons: the
+    image must also be overwhelmingly white with only sparse light-grey ink,
+    like the MIC seller watermark.  A normal scan/photo/diagram is retained.
+    """
+    try:
+        gray = im.convert("L")
+        gray.thumbnail((128, 128))
+        hist = gray.histogram()
+        total = max(sum(hist), 1)
+        mean = sum(i * n for i, n in enumerate(hist)) / total
+        below_245 = sum(hist[:245]) / total
+        below_180 = sum(hist[:180]) / total
+        return mean >= 245.0 and below_245 <= 0.15 and below_180 <= 0.03
+    except Exception:
+        return False
+
+
+def _object_is_full_page(pdf_path, reader, obj_id, pages):
+    """True only when obj_id is drawn over >=80% of page width AND height.
+
+    Frequency alone is unsafe: a publisher logo or a repeated clinical figure
+    can legitimately occur many times.  Drawn geometry makes the filter apply
+    only to page backgrounds/overlays, never ordinary question figures.
+    """
+    for page_no in list(pages)[:3]:
+        try:
+            pos = (_image_positions_raw(pdf_path, page_no) or {}).get(obj_id)
+            if pos is None:
+                continue
+            left, bottom, right, top = _rect_from_position(pos)
+            page = reader.pages[page_no - 1]
+            page_w = float(page.mediabox.width)
+            page_h = float(page.mediabox.height)
+            if (abs(right - left) >= 0.80 * page_w
+                    and abs(top - bottom) >= 0.80 * page_h):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def find_watermark_object_ids(pdf_path):
+    """Return every deterministically-proven watermark/background object id.
+
+    Detection has THREE independent gates so real image extraction is not
+    affected:
+      1. the same XObject id occurs on many pages across the WHOLE book;
+      2. it is drawn over at least 80% of both page dimensions;
+      3. its pixels are a sparse, overwhelmingly white/light-grey overlay.
+
+    Scanning the whole object table is zero-token and cheap (about a second on
+    the supplied 615-page MIC PDF).  It is necessary because a watermark id
+    can change after the first section, outside the old 30-page sample.
+    """
+    path = Path(pdf_path)
+    try:
+        st = path.stat()
+        cache_key = (str(path.resolve()), st.st_size, st.st_mtime_ns)
+    except OSError:
+        cache_key = (str(path), None, None)
+    cached = _WATERMARK_IDS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     reader = PdfReader(pdf_path)
+    total_pages = len(reader.pages)
     counts = {}
-    n = min(sample_pages, len(reader.pages))
-    for i in range(n):
-        for name, ref in _page_xobjects(reader.pages[i]).items():
+    pages_by_id = {}
+    first_use = {}
+    for page_no, page in enumerate(reader.pages, 1):
+        seen_on_page = set()
+        for name, ref in _page_xobjects(page).items():
             obj = _resolve(ref)
             if obj.get("/Subtype") != "/Image":
                 continue
             obj_id = getattr(ref, "idnum", None)
-            if obj_id is None:
-                continue  # inline/direct image -- can't track by object id
+            if obj_id is None or obj_id in seen_on_page:
+                continue
+            seen_on_page.add(obj_id)
             counts[obj_id] = counts.get(obj_id, 0) + 1
-    if not counts:
-        return None
-    # whichever object ID appears on (almost) every sampled page = watermark
-    watermark_id = max(counts, key=counts.get)
-    if counts[watermark_id] < n * 0.5:
-        return None  # no dominant repeated image -> no watermark to exclude
-    return watermark_id
+            pages_by_id.setdefault(obj_id, []).append(page_no)
+            first_use.setdefault(obj_id, (page_no, name, obj))
+
+    # 5% of a short/medium book; capped at 20 pages so section-specific
+    # watermarks in a very large book are still detected.  Geometry + visual
+    # gates below prevent a repeated real figure from being removed.
+    min_repeat = max(2, min(20, (total_pages + 19) // 20))
+    watermark_ids = set()
+    for obj_id, count in counts.items():
+        if count < min_repeat:
+            continue
+        if not _object_is_full_page(pdf_path, reader, obj_id,
+                                    pages_by_id.get(obj_id, [])):
+            continue
+        page_no, name, obj = first_use[obj_id]
+        try:
+            im = reader.pages[page_no - 1].images[name].image
+        except Exception:
+            im = _decode_image_fallback(obj)
+        if im is not None and _sparse_light_page_image(im):
+            watermark_ids.add(obj_id)
+
+    result = frozenset(watermark_ids)
+    _WATERMARK_IDS_CACHE[cache_key] = result
+    return result
+
+
+def find_watermark_object_id(pdf_path, sample_pages=30):
+    """Backward-compatible singular API; new pipeline code uses the set API."""
+    ids = find_watermark_object_ids(pdf_path)
+    return min(ids) if ids else None
+
+
+def _normalise_watermark_ids(value):
+    """Accept the new set filter and the legacy single integer argument."""
+    if value is None:
+        return frozenset()
+    if isinstance(value, int):
+        return frozenset({value})
+    try:
+        return frozenset(int(v) for v in value)
+    except (TypeError, ValueError):
+        return frozenset()
 
 def _decode_image_fallback(obj):
     """Best-effort decode of an image XObject using its raw stream, for
@@ -673,10 +790,11 @@ def _stitch_slices(members, rects):
     return canvas
 
 
-def extract_real_images(pdf_path, file_page, watermark_id, subject, out_dir):
+def extract_real_images(pdf_path, file_page, watermark_ids, subject, out_dir):
     """
-    Extracts every printed FIGURE on file_page EXCEPT the watermark object.
-    Returns a list of saved relative paths ("SUBJECT/filename.webp") --
+    Extracts every printed FIGURE on file_page EXCEPT deterministically-proven
+    watermark objects. `watermark_ids` accepts the new id set or a legacy
+    single integer. Returns saved relative paths ("SUBJECT/filename.webp") --
     exactly one entry per figure (no duplicates, no watermarks).
 
     NOTE (run-25): one printed figure is frequently stored as several abutting
@@ -696,6 +814,7 @@ def extract_real_images(pdf_path, file_page, watermark_id, subject, out_dir):
         return []
     page = reader.pages[file_page - 1]
     saved = []
+    watermark_ids = _normalise_watermark_ids(watermark_ids)
     (out_dir / subject).mkdir(parents=True, exist_ok=True)
     seen_ids = set()  # some PDFs alias the SAME image object under two XObject
                        # names on one page -> would return the same path twice,
@@ -712,8 +831,8 @@ def extract_real_images(pdf_path, file_page, watermark_id, subject, out_dir):
         if dedupe_key in seen_ids:
             continue  # alias of an image already saved from this page
         seen_ids.add(dedupe_key)
-        if watermark_id is not None and obj_id == watermark_id:
-            continue  # the watermark -- never save it as a question figure
+        if obj_id in watermark_ids:
+            continue  # proven watermark/background -- never save as a figure
         # Decode exactly THIS image object. NOTE: don't shell out to
         # `pdfimages -f P -l P` per object here -- it dumps EVERY image on
         # the page (watermark included) under one prefix each time, so
@@ -6758,8 +6877,9 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
     pdf_path = pdf_cfg["path"]
     progress = state["pdf_progress"].setdefault(subject, {"chapters_done": [], "current": None})
 
-    watermark_id = find_watermark_object_id(pdf_path)
-    print(f"[{subject}] watermark object id: {watermark_id}")
+    watermark_ids = find_watermark_object_ids(pdf_path)
+    wm_label = ", ".join(str(x) for x in sorted(watermark_ids)) or "none"
+    print(f"[{subject}] watermark object ids: {wm_label}")
 
     total_pages = len(PdfReader(pdf_path).pages)
     toc = extract_toc_chapters(pdf_path)
@@ -7439,7 +7559,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                 if file_page_num in pages_imaged:
                     continue  # overlap page -- images already extracted once
                 pages_imaged.add(file_page_num)
-                imgs = extract_real_images(pdf_path, file_page_num, watermark_id, subject, ASSETS_DIR / "questions")
+                imgs = extract_real_images(pdf_path, file_page_num, watermark_ids, subject, ASSETS_DIR / "questions")
                 if not imgs:
                     # run-25 (Defect B): a page with NO images still PRINTS
                     # headings, and the cross-page carry has to move past them.
@@ -8163,7 +8283,7 @@ def recover_pages(plan_path):
             continue
         pdf_path = pdf_cfg["path"]
         total_pages = len(PdfReader(pdf_path).pages)
-        watermark_id = find_watermark_object_id(pdf_path)
+        watermark_ids = find_watermark_object_ids(pdf_path)
 
         # rebuild existing chapter rows so recovery MERGES into them
         chapter_lines = [q for q in all_lines if q.get("chapter_id") == chapter_id]
@@ -8233,7 +8353,7 @@ def recover_pages(plan_path):
                 if file_page_num in pages_imaged:
                     continue
                 pages_imaged.add(file_page_num)
-                imgs = extract_real_images(pdf_path, file_page_num, watermark_id,
+                imgs = extract_real_images(pdf_path, file_page_num, watermark_ids,
                                            subject, ASSETS_DIR / "questions")
                 if imgs:
                     rec_leftover = claim_page_images(imgs, pdf_path, file_page_num,
