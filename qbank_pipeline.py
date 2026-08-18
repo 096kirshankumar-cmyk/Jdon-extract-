@@ -6413,15 +6413,28 @@ def _answer_option_mismatch(rec, correct_id, option_rows):
     opt_toks = {k: {w for w in re.findall(WORD, v.lower()) if len(w) > 3}
                 for k, v in opt_text.items() if v}
 
+    # ordered tokens for verbatim containment (the strongest signal: the
+    # winning option's text appears word-for-word inside the sentence)
+    opt_words = {k: re.findall(WORD, v.lower()) for k, v in opt_text.items() if v}
+
     def _overlap_letter(frag):
-        if not opt_toks:
-            return None
+        norm = " ".join(re.findall(WORD, frag.lower()))
+        if opt_words:
+            verbatim = [k for k, ws in opt_words.items()
+                        if ws and " ".join(ws) in norm]
+            # exactly ONE option's text is verbatim-contained and it is NOT
+            # the extracted answer -> the flip is provable on its own
+            if len(verbatim) == 1:
+                return verbatim[0]
+            # more than one contained: beside-the-point sentence, skip
+            if len(verbatim) > 1:
+                return None
         f = {w for w in re.findall(WORD, frag.lower()) if len(w) > 3}
         if len(f) < 3:
             return None
         scores = {k: len(f & s) for k, s in opt_toks.items()}
         best = max(scores, key=scores.get)
-        if scores[best] >= 2 * max(1, scores.get(correct_id, 0)) and scores[best] >= 3:
+        if scores[best] >= max(3, scores.get(correct_id, 0) + 2):
             return best
         return None
 
