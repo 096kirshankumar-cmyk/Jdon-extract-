@@ -231,6 +231,18 @@ def check_row(row, assets_questions):
     correct = row.get("correct_options") or []
     sol = row.get("solution") or {}
 
+    # AUDIT-FIX: the pipeline's own per-row verdict travels with the row --
+    # surface it in the report so a row never LOOKS fine while its status
+    # disagrees (the INCOMPLETE/REVIEW_NEEDED classes of the build step).
+    qa = row.get("qa_status")
+    if qa == "INCOMPLETE":
+        flags.append(flag(cid, "qa_incomplete",
+                          f"{row.get('id')}: pipeline-marked INCOMPLETE -- "
+                          f"{'; '.join(row.get('qa_reasons') or [])[:200]}", qn, HIGH))
+    elif qa == "REVIEW_NEEDED":
+        flags.append(flag(cid, "qa_review_needed",
+                          f"{row.get('id')}: REVIEW_NEEDED -- "
+                          f"{'; '.join(row.get('qa_reasons') or [])[:200]}", qn, LOW))
     if not qtext or not qtext.strip():
         flags.append(flag(cid, "empty_question", f"{row.get('id')}: empty question text", qn))
     # run-13: pipeline-quarantined suspect stem (kept, not deleted) -- the
@@ -379,6 +391,21 @@ def check_row(row, assets_questions):
                 flags.append(flag(cid, "suspicious_tiny_image",
                                   f"{row.get('id')}: {side} image only {fobj.stat().st_size}B "
                                   f"(< {MIN_IMAGE_BYTES}) -- likely a broken crop: {fpath}", qn))
+    # AUDIT-FIX (A5): a DECLARED figure with no attached image is a silent
+    # loss / wrong-owner indicator. Emitted LOW here (model declarations are
+    # noisy); validate_deterministic upgrades to HIGH when an unresolved or
+    # unmatched image exists on the row's own source pages -- that pattern is
+    # a REAL printed figure we failed to own (OPH-028 q8 class).
+    qimgs_now = (row.get("question") or {}).get("images") or []
+    simgs_now = (row.get("solution") or {}).get("images") or []
+    if row.get("declared_has_figure_in_question") and not qimgs_now:
+        flags.append(flag(cid, "declared_figure_missing",
+                          f"{row.get('id')}: extraction declared a QUESTION figure but no "
+                          f"image is attached (lost or misattributed to a neighbour)", qn, LOW))
+    if row.get("declared_has_figure_in_solution") and not simgs_now:
+        flags.append(flag(cid, "declared_figure_missing",
+                          f"{row.get('id')}: extraction declared a SOLUTION figure but no "
+                          f"image is attached (lost or misattributed to a neighbour)", qn, LOW))
     n_qimg = len((row.get("question") or {}).get("images") or [])
     if n_qimg > IMAGE_CAP_CEILING_QUESTION:
         flags.append(flag(cid, "over_attributed_images",
@@ -598,6 +625,60 @@ def validate_deterministic(output_root=OUTPUT_ROOT, explicit_source_gap=()):
                  f"page {ui.get('page')} figure unresolved after all ownership "
                  f"levels: {ui.get('file')} (method={ui.get('method') or '?'})",
                  pages=[ui.get("page")] if ui.get("page") else []))
+
+    # AUDIT-FIX (A5): surface the PIPELINE GATE's own anchor-accurate
+    # wrong-owner findings (figure_page_mismatch entries in
+    # data/export_gate.jsonl) instead of re-deriving page consistency from
+    # row.source_pages -- those pages legitimately include answer-key windows
+    # pages away from the stem page (q7's A-pass window made the naive check
+    # fire on a correct claim; false positive proven on OPH ch. 28).
+    rows_by_id = {r.get("id"): r for r in rows}
+    for gf in load_jsonl(data_dir / "export_gate.jsonl"):
+        if gf.get("kind") != "figure_page_mismatch":
+            continue
+        cid = gf.get("chapter_id")
+        row = rows_by_id.get(f"{cid}-{int(gf.get('q_no')):03d}") \
+            if gf.get("q_no") is not None else None
+        flags_by.setdefault(cid, []).append(
+            flag(cid, "image_owner_gate_miss",
+                 f"export gate: {gf.get('detail')}",
+                 gf.get("q_no"),
+                 severity=HIGH,
+                 source="export_gate"))
+    # upgrade declared_figure_missing LOW -> HIGH when an unresolved or
+    # unmatched image sits on that row's source pages (a REAL unclaimed
+    # figure, not model over-declaration)
+    figless = {}
+    for cid, crows in flags_by.items():
+        for fl in crows:
+            if fl.get("kind") == "declared_figure_missing":
+                figless[(cid, fl.get("q_no"))] = fl
+    if figless:
+        hot_pages = {}
+        for uj in load_jsonl(data_dir / "unresolved_images.jsonl") + \
+                  load_jsonl(data_dir / "unmatched_images.jsonl"):
+            if uj.get("page"):
+                hot_pages.setdefault(uj.get("chapter_id"), set()).add(
+                    int(uj["page"]))
+        rows_by_cq = {}
+        for r in rows:
+            if q_no_of(r) is not None:
+                rows_by_cq.setdefault((r.get("chapter_id"), q_no_of(r)),
+                                      []).append(r)
+        for (cid, qn), fl_rows in rows_by_cq.items():
+            fl = figless.get((cid, qn))
+            if fl is None:
+                continue
+            ch_hot = hot_pages.get(cid, set())
+            for r in fl_rows:
+                sp = set(r.get("source_pages") or [])
+                if sp and any(min(sp) - 1 <= hp <= max(sp) + 2
+                              for hp in ch_hot):
+                    fl["severity"] = HIGH
+                    fl["detail"] += (" | UPGRADED: unresolved/unmatched image "
+                                     "exists on this question's source pages "
+                                     "-- real printed figure left ownerless")
+                    break
 
     summary = {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),

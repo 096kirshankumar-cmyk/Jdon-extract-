@@ -965,7 +965,8 @@ def _source_pages_for(qn: int, qn_source_pages) -> list:
 
 
 def _build_question_row(qn: int, rec: dict, chapter_id: str, subject: str,
-                        chapter_no: int, image_files: dict) -> dict:
+                        chapter_no: int, image_files: dict,
+                        ownership_pages=None) -> dict:
     q_id = f"{subject}-{chapter_no:03d}-{int(qn):03d}"
     options = rec.get("options") or {}
     option_rows = []
@@ -974,8 +975,10 @@ def _build_question_row(qn: int, rec: dict, chapter_id: str, subject: str,
         opt_imgs = []
         if isinstance(image_files.get("option"), dict):
             opt_imgs = [
-                {"file": f, "source_pages": []} for f in
-                (image_files["option"].get(letter) or [])
+                {"file": f,
+                 "source_pages": ([(ownership_pages or {}).get(f)]
+                                  if (ownership_pages or {}).get(f) is not None else [])}
+                for f in (image_files["option"].get(letter) or [])
             ]
         option_rows.append({
             "id": letter,
@@ -983,8 +986,13 @@ def _build_question_row(qn: int, rec: dict, chapter_id: str, subject: str,
             "images": opt_imgs,
         })
     question_images = [
-        {"file": f, "source_pages": []} for f in
-        (image_files.get("question") or [])
+        # AUDIT-FIX: use the image's OWN extraction page from the ownership
+        # ledger (was: always []). The question's source_pages are NOT the
+        # image's provenance.
+        {"file": f,
+         "source_pages": ([(ownership_pages or {}).get(f)]
+                          if (ownership_pages or {}).get(f) is not None else [])}
+        for f in (image_files.get("question") or [])
     ]
     tables = rec.get("tables") or []
     # Phase-4: read per-field prov from q_no_anchors.field_provenance
@@ -1045,12 +1053,15 @@ def _build_answer_row(qn: int, rec: dict, chapter_id: str, subject: str,
 
 
 def _build_solution_row(qn: int, rec: dict, chapter_id: str, subject: str,
-                        chapter_no: int, image_files: dict) -> dict:
+                        chapter_no: int, image_files: dict,
+                        ownership_pages=None) -> dict:
     q_id = f"{subject}-{chapter_no:03d}-{int(qn):03d}"
     tables = rec.get("tables") or []
     sol_imgs = [
-        {"file": f, "source_pages": []} for f in
-        (image_files.get("solution") or [])
+        {"file": f,
+         "source_pages": ([(ownership_pages or {}).get(f)]
+                          if (ownership_pages or {}).get(f) is not None else [])}
+        for f in (image_files.get("solution") or [])
     ]
     qa = rec.get("q_no_anchors") or {}
     fp = qa.get("field_provenance") or {}
@@ -1197,7 +1208,8 @@ def write_split_outputs(*, chapter_id: str, subject: str, chapter_no: int,
                         chapter_unresolved_images: list,
                         pdf_path: str, page_files,
                         reconciled: dict,
-                        output_root) -> dict:
+                        output_root,
+                        ownership_pages=None) -> dict:
     """Write all seven per-chapter files atomically. chapter_completeness.json
     is written LAST as the "this chapter's split is fully on disk" signal.
     Returns the chapter_completeness.json content (the per-chapter summary
@@ -1218,7 +1230,8 @@ def write_split_outputs(*, chapter_id: str, subject: str, chapter_no: int,
     image_files_by_q = image_files_by_q or {}
     question_rows = [
         _build_question_row(qn, chapter_records[qn], chapter_id, subject,
-                            chapter_no, image_files_by_q.get(qn, {}))
+                            chapter_no, image_files_by_q.get(qn, {}),
+                            ownership_pages=ownership_pages)
         for qn in qns
     ]
     answer_rows = [
@@ -1228,7 +1241,8 @@ def write_split_outputs(*, chapter_id: str, subject: str, chapter_no: int,
     ]
     solution_rows = [
         _build_solution_row(qn, chapter_records[qn], chapter_id, subject,
-                            chapter_no, image_files_by_q.get(qn, {}))
+                            chapter_no, image_files_by_q.get(qn, {}),
+                            ownership_pages=ownership_pages)
         for qn in qns
     ]
 
@@ -1260,6 +1274,14 @@ def write_split_outputs(*, chapter_id: str, subject: str, chapter_no: int,
     # so the chapter-scoped manifest is a VIEW, not a separate source of
     # truth (the existing data/image_ownership.jsonl remains the global
     # source of truth per the user's signed-off design decision).
+    # AUDIT-FIX: the manifest used to list the QUESTION's source_pages for
+    # every image -- question pages are not image provenance. Each image now
+    # carries its own extraction_page from the ownership ledger; the
+    # question's pages remain as a secondary review hint only.
+    def _img_pages(f, qn):
+        p = (ownership_pages or {}).get(f)
+        return [p] if p is not None else _source_pages_for(qn, qn_source_pages)
+
     image_manifest_rows = []
     for qn in qns:
         entry = image_files_by_q.get(qn) or {}
@@ -1269,7 +1291,8 @@ def write_split_outputs(*, chapter_id: str, subject: str, chapter_no: int,
                 "type": "QUESTION",
                 "option_letter": None,
                 "file": f,
-                "source_pages": _source_pages_for(qn, qn_source_pages),
+                "source_pages": _img_pages(f, qn),
+                "extraction_page": (ownership_pages or {}).get(f),
             })
         for f in (entry.get("solution") or []):
             image_manifest_rows.append({
@@ -1277,7 +1300,8 @@ def write_split_outputs(*, chapter_id: str, subject: str, chapter_no: int,
                 "type": "SOLUTION",
                 "option_letter": None,
                 "file": f,
-                "source_pages": _source_pages_for(qn, qn_source_pages),
+                "source_pages": _img_pages(f, qn),
+                "extraction_page": (ownership_pages or {}).get(f),
             })
         for letter, files in (entry.get("option") or {}).items():
             for f in (files or []):
@@ -1286,7 +1310,8 @@ def write_split_outputs(*, chapter_id: str, subject: str, chapter_no: int,
                     "type": "OPTION",
                     "option_letter": str(letter).upper(),
                     "file": f,
-                    "source_pages": _source_pages_for(qn, qn_source_pages),
+                    "source_pages": _img_pages(f, qn),
+                    "extraction_page": (ownership_pages or {}).get(f),
                 })
     _atomic_jsonl_write(chapter_dir / "image_manifest.jsonl", image_manifest_rows)
 
