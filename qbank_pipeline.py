@@ -6451,7 +6451,8 @@ def _answer_option_mismatch(rec, correct_id, option_rows):
             if hit and hit != correct_id:
                 return (f"solution says the answer describes option {hit}'s "
                         f"content but correct_option is {correct_id}")
-    first = re.split(r"(?<=[.!?])" + "\s" + "+", sol, maxsplit=1)[0].strip()
+    _split_pat = re.compile(r"(?<=[.!?])\s+")
+    first = _split_pat.split(sol, maxsplit=1)[0].strip()
     hit = _overlap_letter(first)
     if hit and hit != correct_id:
         return (f"solution opens on option-{hit} content but correct_option is "

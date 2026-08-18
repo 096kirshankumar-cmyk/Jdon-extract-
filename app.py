@@ -241,6 +241,67 @@ def run_validator_and_log():
     log("🧪 Full report -> data/validation_report.json (inside the zip)")
     return rep
 
+def _find_input_pdf():
+    """The source PDF after persistence: prefer the Volume copy (survives
+    redeploys), else the ./pdfs upload dir, else None."""
+    try:
+        vol = Path("/data/input_pdfs")
+        if vol.exists():
+            pdfs = sorted(vol.glob("*.pdf"), key=lambda p: -p.stat().st_mtime)
+            if pdfs:
+                return pdfs[0]
+    except Exception:
+        pass
+    local = sorted(UPLOAD_DIR.glob("*.pdf"), key=lambda p: -p.stat().st_mtime) \
+        if UPLOAD_DIR.exists() else []
+    return local[0] if local else None
+
+
+def _write_review_digests():
+    """Generate per-subject review digests into <OUTPUT_ROOT>/review_digest/
+    (they land in output_results.zip via make_zip -- the masterdata the user
+    downloads). Runs after every successful run/fix/validate. Zero tokens.
+    Never raises: a digest failure must not hurt extraction."""
+    try:
+        import review_digest
+        out = Path(pipeline.OUTPUT_ROOT)
+        if not (out / "data" / "questions.jsonl").exists():
+            return
+        pdf_path = _find_input_pdf()
+        ranges = None
+        if pdf_path:
+            try:
+                toc = pipeline.extract_toc_chapters(str(pdf_path))
+                meta = {}
+                try:
+                    meta = _json.loads((INPUT_META_DIR / f"{pdf_path.stem.split('-')[0]}.json"
+                                        ).read_text()) if INPUT_META_DIR.exists() else {}
+                except Exception:
+                    meta = {}
+                offset = int(meta.get("page_offset", -1))
+                total = len(pipeline.PdfReader(str(pdf_path)).pages)
+                chs = pipeline.compute_page_ranges(toc, offset, total)
+                ranges = [(c["chapter_no"], (c["file_start"], c["file_end"]))
+                          for c in chs]
+            except Exception as re_:
+                log(f"📑 digest: TOC scan skipped ({re_}) -- key-awareness off; "
+                    "blockers still detected")
+        res = review_digest.build_digest(out, None,
+                                         str(pdf_path) if pdf_path else None,
+                                         ranges)
+        for sub, body in res.items():
+            import re as _r2
+            n_blk = _r2.search(r"BLOCKER: (\d+)", body)
+            n_rev = _r2.search(r"REVIEW: (\d+)", body)
+            n_noi = _r2.search(r"NOISE: (\d+)", body)
+            log(f"📑 review digest {sub}: {n_blk.group(1) if n_blk else '?'} blocker(s), "
+                f"{n_rev.group(1) if n_rev else '?'} review, "
+                f"{n_noi.group(1) if n_noi else '?'} noise -> "
+                f"review_digest/{sub}.md (zip me included)")
+    except Exception as e:
+        log(f"⚠️ review digest skipped (extraction unaffected): {e}")
+
+
 def run_pipeline_thread(subject_code, pdf_path, page_offset):
     if VOLUME_WARN:
         # HARD BLOCK: extraction without a mounted Volume = the whole output
@@ -292,6 +353,7 @@ def run_pipeline_thread(subject_code, pdf_path, page_offset):
         with state_lock:
             state["status"] = "completed"
         log("✅ Done (or paused at daily Gemini limit — tap Run again tomorrow to resume).")
+        _write_review_digests()   # per-book review page(s) land in the zip
         make_zip()
         # After a successful run, also build the MASTER_REVIEW package
         # (read-only copy of split/ + assets/ + data/) so it's ready
@@ -886,6 +948,7 @@ def fix():
             else:
                 log("✅ Nothing to heal -- data already clean (all patches skipped).")
             run_validator_and_log()
+            _write_review_digests()
             with state_lock:
                 state["status"] = "completed"
             make_zip()
@@ -913,6 +976,7 @@ def validate():
     def _do_validate():
         try:
             run_validator_and_log()
+            _write_review_digests()
             with state_lock:
                 state["status"] = "completed"
         except Exception as e:

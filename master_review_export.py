@@ -335,6 +335,22 @@ def build_master_review(output_root: str | Path) -> dict:
             qa_files_missing.append(fname)
             total_files_missing += 1
 
+    # ---- 3b. review_digest/ (per-book human review pages) ----
+    # These are the pages a reviewer opens per book: BLOCKER / REVIEW /
+    # NOISE sorted. Byte-for-byte copy into MASTER_REVIEW/review_digest/.
+    digest_src = output_root / "review_digest"
+    if digest_src.exists() and digest_src.is_dir():
+        dest_dir = review_dir / "review_digest"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        n = 0
+        for f in digest_src.rglob("*"):
+            if f.is_file():
+                _safe_copy_bytes(f, dest_dir / f.relative_to(digest_src))
+                n += 1
+        if n:
+            qa_files_copied.append(f"review_digest/ ({n} file(s))")
+            total_files_copied += n
+
     # ---- 4. MASTER_REVIEW_MANIFEST.json (summary) ----
     finished_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     elapsed = round(time.time() - started_perf, 3)
