@@ -9,8 +9,12 @@ detection, Gemini vision calls, checkpointing, rate-limit handling) lives
 in qbank_pipeline.py — this file does not duplicate or replace any of that.
 """
 
+import hashlib
+import ipaddress
+import json as _json
 import os
 import shutil
+import socket
 import threading
 import time
 import traceback
@@ -39,6 +43,179 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 state_lock = threading.Lock()
 state = {"status": "idle", "log": [], "error": None}
+
+
+def try_mark_processing():
+    """AUDIT-FIX: the busy-guard used to CHECK state['status'] outside the
+    lock and SET it later inside -- two concurrent taps both started
+    pipelines writing the same files (double Gemini spend, racing chapter
+    rewrites). Check-and-set must be one atomic step."""
+    with state_lock:
+        if state["status"] == "processing":
+            return False
+        state["status"] = "processing"
+        return True
+
+
+# ---- AUDIT-FIX: SSRF-hardened PDF fetching -------------------------------
+# The old /run-url fetched ANY user-supplied URL with redirects followed and
+# no size/time cap: cloud metadata endpoints (169.254.169.254), loopback,
+# private networks and slow-drip responses were all reachable, and the
+# 200MB MAX_CONTENT_LENGTH only applied to multipart uploads, never to the
+# URL download. fetch_pdf_guarded validates scheme + resolved IPs on EVERY
+# redirect hop, caps total bytes and total wall time, and verifies the %PDF
+# magic before the file is kept.
+_BLOCKED_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+    "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
+    "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4",
+    "::1/128", "fc00::/7", "fe80::/10"))
+
+PDF_URL_MAX_BYTES = 300 * 1024 * 1024   # URL downloads (uploads stay at 200MB)
+PDF_URL_MAX_SECONDS = 600
+
+
+def _url_block_reason(url):
+    from urllib.parse import urlparse
+    p = urlparse(url)
+    if p.scheme not in ("http", "https"):
+        return f"scheme {p.scheme!r} not allowed"
+    host = p.hostname
+    if not host:
+        return "no hostname in URL"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return f"hostname {host!r} does not resolve"
+    for info in infos:
+        ip = info[4][0]
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return f"unparseable resolved address {ip!r}"
+        for net in _BLOCKED_NETS:
+            if addr in net:
+                return (f"blocked: {host} resolves to private/loopback/"
+                        f"link-local address {ip}")
+    return None
+
+
+def fetch_pdf_guarded(url, dest, max_bytes=PDF_URL_MAX_BYTES,
+                      deadline_s=PDF_URL_MAX_SECONDS):
+    """Download `url` to `dest` with SSRF + resource-exhaustion guards.
+    Raises ValueError with a user-readable reason on any violation.
+    NOTE (residual risk): DNS is validated immediately before connect; an
+    attacker-controlled DNS could rebind afterwards. The residual window is
+    tiny; fully closing it needs per-connection IP pinning (custom adapter)."""
+    cur = url
+    for _hop in range(4):
+        blocked = _url_block_reason(cur)
+        if blocked:
+            raise ValueError(blocked)
+        r = requests.get(cur, stream=True, timeout=60, allow_redirects=False,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code in (301, 302, 303, 307, 308):
+            loc = r.headers.get("Location")
+            r.close()
+            if not loc:
+                raise ValueError("redirect without Location header")
+            cur = requests.compat.urljoin(cur, loc)
+            continue
+        r.raise_for_status()
+        # Google Drive big-file interstitial: sniff a BOUNDED prefix (the old
+        # code did r.text -- buffering the whole HTML page into memory).
+        if "text/html" in r.headers.get("Content-Type", ""):
+            head = r.raw.read(65536, decode_content=True)
+            r.close()
+            m = _re.search(rb"confirm=([0-9A-Za-z_-]+)", head)
+            if not m:
+                raise ValueError("link returned a webpage, not a PDF")
+            cur = (f"{cur}{'&' if '?' in cur else '?'}confirm="
+                   f"{m.group(1).decode()}")
+            continue
+        t_end = time.time() + deadline_s
+        total, first = 0, None
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                if first is None:
+                    first = chunk
+                f.write(chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    r.close()
+                    dest.unlink(missing_ok=True)
+                    raise ValueError(
+                        f"download exceeded the {max_bytes // (1024 * 1024)}MB cap")
+                if time.time() > t_end:
+                    r.close()
+                    dest.unlink(missing_ok=True)
+                    raise ValueError("download exceeded the time budget")
+        r.close()
+        if not first or not first.startswith(b"%PDF"):
+            dest.unlink(missing_ok=True)
+            raise ValueError("downloaded content is not a real PDF file")
+        return dest
+    raise ValueError("too many redirects")
+
+
+# ---- AUDIT-FIX: source PDFs persist on the /data volume ------------------
+# Uploads/downloads previously lived only in ./pdfs (ephemeral container
+# fs). A redeploy wiped them while state.json kept chapters_done, so resume
+# and --recover silently broke (or, worse, a DIFFERENT edition uploaded with
+# the same subject code was silently paired with the old state). The source
+# now persists under /data/input_pdfs with a sha256 identity record.
+INPUT_META_DIR = Path("/data/input_pdfs")
+
+
+def persist_input_pdf(pdf_path, subject_code, page_offset):
+    """Copy the source PDF to the /data volume and record its identity.
+    Returns the volume path (str) to use for the run, or None if no volume.
+    Also REFUSES (returns a dict {"error": ...}) when a different PDF is
+    being paired with an in-progress state for the same subject."""
+    try:
+        digest = hashlib.sha256(Path(pdf_path).read_bytes()).hexdigest()
+    except OSError as e:
+        return {"error": f"could not read uploaded PDF: {e}"}
+    meta_path = INPUT_META_DIR / f"{subject_code}.json"
+    if INPUT_META_DIR.parent.exists() and Path("/data").is_mount():
+        INPUT_META_DIR.mkdir(parents=True, exist_ok=True)
+        if meta_path.exists():
+            try:
+                old = _json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                old = {}
+            old_hash = old.get("sha256")
+            if old_hash and old_hash != digest:
+                st = {}
+                try:
+                    st = _json.loads(pipeline.STATE_FILE.read_text())
+                except Exception:
+                    pass
+                done = (st.get("pdf_progress", {}).get(subject_code, {})
+                        .get("chapters_done") or [])
+                if done:
+                    return {"error": (
+                        f"A DIFFERENT PDF was uploaded for {subject_code} "
+                        f"while {len(done)} chapter(s) are already extracted "
+                        f"(hash mismatch). Rules me ye pairing bilkul galat "
+                        f"hai -- pehle RESET karo ya wahi asli PDF dobara do.")}
+        dest = INPUT_META_DIR / f"{subject_code}.pdf"
+        shutil.copyfile(pdf_path, dest)
+        try:
+            from pypdf import PdfReader as _PR
+            n_pages = len(_PR(str(dest)).pages)
+        except Exception:
+            n_pages = None
+        meta_path.write_text(_json.dumps({
+            "subject": subject_code, "sha256": digest, "path": str(dest),
+            "size_bytes": dest.stat().st_size, "page_offset": page_offset,
+            "total_pages": n_pages,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}, indent=2),
+            encoding="utf-8")
+        return {"path": str(dest)}
+    return None
 
 def log(msg):
     print(msg, flush=True)  # so it shows in Railway's Deploy Logs too, not just the dashboard box
@@ -84,6 +261,21 @@ def run_pipeline_thread(subject_code, pdf_path, page_offset):
             raise RuntimeError(
                 "No Gemini API key configured in Railway variables "
                 "(set GEMINI_API_KEYS, GEMINI_API_KEY_1..N, or GEMINI_API_KEY)")
+        # AUDIT-FIX: persist the source PDF onto the /data volume BEFORE any
+        # Gemini call, so quota resumes and recoveries survive redeploys.
+        # Also refuse pairing a DIFFERENT book with this subject's existing
+        # extraction state (hash mismatch) -- that silently misaligned every
+        # page number in the old output.
+        persisted = persist_input_pdf(pdf_path, subject_code, page_offset)
+        if isinstance(persisted, dict) and persisted.get("error"):
+            with state_lock:
+                state["status"] = "failed"
+                state["error"] = persisted["error"]
+            log(f"❌ RUN BLOCKED: {persisted['error']}")
+            return
+        if isinstance(persisted, dict) and persisted.get("path"):
+            pdf_path = persisted["path"]
+            log(f"💾 Source PDF saved to the Volume at {pdf_path} (redeploy-safe).")
         pipeline.PDFS[:] = [{"subject": subject_code, "path": str(pdf_path), "page_offset": page_offset}]
         pipeline.main()
         # zero-token deterministic validation right after every run -- the
@@ -402,64 +594,26 @@ def parse_page_offset():
 
 @app.route("/run-url", methods=["POST"])
 def run_url():
-    if state["status"] == "processing":
+    if not try_mark_processing():          # AUDIT-FIX: atomic busy-guard
         return redirect(url_for("index"))
     pdf_url = resolve_download_url(request.form.get("pdf_url", "").strip())
     subject_code = request.form.get("subject_code", "").strip().upper()
     page_offset = parse_page_offset()
     if not pdf_url:
+        with state_lock:
+            state["status"] = "idle"
         return "No URL provided", 400
-    # Mark busy NOW (before the background download starts) -- otherwise the
-    # status stays "idle" during the download and a second tap on Run starts
-    # a duplicate pipeline writing to the same output files.
-    with state_lock:
-        state["status"] = "processing"
 
     def download_then_run():
         try:
             log("⬇️ Downloading PDF from link...")
-            # secure_filename: a hostile/odd URL tail like "../../x" must not
-            # be able to write outside ./pdfs
-            fname = secure_filename(pdf_url.split("/")[-1].split("?")[0]) or f"{subject_code}.pdf"
-            if not fname.lower().endswith(".pdf"):
-                fname = f"{subject_code}.pdf"
+            # AUDIT-FIX: unique name per (URL, subject) -- two different
+            # books whose share links end in the same tail name no longer
+            # overwrite each other in ./pdfs.
+            url_hash = hashlib.sha1(pdf_url.encode()).hexdigest()[:8]
+            fname = f"{subject_code or 'PDF'}-{url_hash}.pdf"
             pdf_path = UPLOAD_DIR / fname
-            r = requests.get(pdf_url, stream=True, timeout=120,
-                              headers={"User-Agent": "Mozilla/5.0"})
-            r.raise_for_status()
-
-            # Google Drive shows an interstitial "can't scan for viruses"
-            # confirm page for some files instead of the raw bytes -- detect
-            # that and follow the confirm link before saving.
-            content_type = r.headers.get("Content-Type", "")
-            if "text/html" in content_type:
-                text = r.text
-                confirm_match = _re.search(r'confirm=([0-9A-Za-z_-]+)', text)
-                if confirm_match:
-                    confirm_token = confirm_match.group(1)
-                    r = requests.get(f"{pdf_url}&confirm={confirm_token}",
-                                      stream=True, timeout=120,
-                                      headers={"User-Agent": "Mozilla/5.0"})
-                    r.raise_for_status()
-
-            first_chunk = None
-            with open(pdf_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        if first_chunk is None:
-                            first_chunk = chunk
-                        f.write(chunk)
-
-            if not first_chunk or not first_chunk.startswith(b"%PDF"):
-                pdf_path.unlink(missing_ok=True)
-                log("❌ The link didn't return a real PDF file (got a webpage instead). "
-                    "For Google Drive: right-click the file → Share → 'Anyone with the "
-                    "link' → copy that link, and make sure the file itself (not a folder) is shared.")
-                with state_lock:
-                    state["status"] = "failed"
-                    state["error"] = "Downloaded content is not a valid PDF"
-                return
-
+            fetch_pdf_guarded(pdf_url, pdf_path)   # SSRF + size/time guards
             log(f"✅ Downloaded {fname} ({pdf_path.stat().st_size // 1024} KB)")
             run_pipeline_thread(subject_code, pdf_path, page_offset)
         except Exception as e:
@@ -479,8 +633,6 @@ def v2_test():
     """Smoke-test the v2 3-pass flow on ONE chapter, output into an isolated
     <OUTPUT_ROOT>_v2test/ folder -- never touches real data. Phone-friendly
     equivalent of running test_v2_chapter.py on the server."""
-    if state["status"] == "processing":
-        return redirect(url_for("index"))
     pdf_url = resolve_download_url(request.form.get("pdf_url", "").strip())
     subject_code = request.form.get("subject_code", "").strip().upper() or "TST"
     try:
@@ -490,38 +642,16 @@ def v2_test():
     page_offset = parse_page_offset()
     if not pdf_url:
         return "No URL provided", 400
-    with state_lock:
-        state["status"] = "processing"
+    if not try_mark_processing():          # AUDIT-FIX: atomic busy-guard
+        return redirect(url_for("index"))
 
     def download_then_test():
         try:
             log("⬇️ [V2-TEST] Downloading PDF...")
-            fname = secure_filename(pdf_url.split("/")[-1].split("?")[0]) or f"{subject_code}.pdf"
-            if not fname.lower().endswith(".pdf"):
-                fname = f"{subject_code}.pdf"
+            url_hash = hashlib.sha1(pdf_url.encode()).hexdigest()[:8]
+            fname = f"{subject_code}-{url_hash}.pdf"
             pdf_path = UPLOAD_DIR / fname
-            r = requests.get(pdf_url, stream=True, timeout=120,
-                             headers={"User-Agent": "Mozilla/5.0"})
-            r.raise_for_status()
-            if "text/html" in r.headers.get("Content-Type", ""):
-                m = _re.search(r'confirm=([0-9A-Za-z_-]+)', r.text)
-                if m:
-                    r = requests.get(f"{pdf_url}&confirm={m.group(1)}", stream=True,
-                                     timeout=120, headers={"User-Agent": "Mozilla/5.0"})
-                    r.raise_for_status()
-            first_chunk = None
-            with open(pdf_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        first_chunk = first_chunk or chunk
-                        f.write(chunk)
-            if not first_chunk or not first_chunk.startswith(b"%PDF"):
-                pdf_path.unlink(missing_ok=True)
-                with state_lock:
-                    state["status"] = "failed"
-                    state["error"] = "Downloaded content is not a valid PDF"
-                log("❌ [V2-TEST] link se asli PDF nahi mila (webpage aa gaya).")
-                return
+            fetch_pdf_guarded(pdf_url, pdf_path)   # SSRF + size/time guards
             log(f"✅ [V2-TEST] Downloaded {fname}")
 
             # A smoke test must never redirect a later full-book run into the
@@ -625,23 +755,33 @@ def v2_test():
 
 @app.route("/run", methods=["POST"])
 def run():
-    if state["status"] == "processing":
+    if not try_mark_processing():          # AUDIT-FIX: atomic busy-guard
         return redirect(url_for("index"))
     f = request.files.get("file")
     subject_code = request.form.get("subject_code", "").strip().upper()
     page_offset = parse_page_offset()
     if f and f.filename.lower().endswith(".pdf"):
-        pdf_path = UPLOAD_DIR / (secure_filename(f.filename) or f"{subject_code}.pdf")
+        # AUDIT-FIX: subject-scoped upload name -- a same-named upload for a
+        # different subject no longer overwrites another book's cached PDF.
+        base = secure_filename(f.filename) or "book.pdf"
+        pdf_path = UPLOAD_DIR / f"{subject_code or 'PDF'}-{base}"
         f.save(pdf_path)
     else:
         # no new file uploaded -> reuse whatever PDF is already in ./pdfs
         existing = list(UPLOAD_DIR.glob("*.pdf"))
         if not existing:
-            return "No PDF uploaded and none found in ./pdfs", 400
-        pdf_path = existing[0]
-    # same double-tap guard as /run-url
-    with state_lock:
-        state["status"] = "processing"
+            # AUDIT-FIX: fall back to the persisted volume copy (survives
+            # redeploys) before declaring the input lost.
+            vol = INPUT_META_DIR / f"{subject_code}.pdf"
+            if vol.exists():
+                pdf_path = vol
+                log(f"ℹ️ ./pdfs empty -- reusing persisted Volume copy {vol}")
+            else:
+                with state_lock:
+                    state["status"] = "idle"
+                return "No PDF uploaded and none found in ./pdfs", 400
+        else:
+            pdf_path = existing[0]
     t = threading.Thread(target=run_pipeline_thread, args=(subject_code, pdf_path, page_offset))
     t.daemon = True
     t.start()
@@ -654,10 +794,12 @@ def recover():
     if VOLUME_WARN:
         return ("Volume /data pe attach nahi hai -- pehle Railway Settings me Volume lagao "
                 "(Mount Path: /data), warna jo bhi likha jayega wo next redeploy pe udd jayega.", 400)
-    if state["status"] == "processing":
+    if not try_mark_processing():          # AUDIT-FIX: atomic busy-guard
         return redirect(url_for("index"))
     plan_text = request.form.get("plan", "").strip()
     if not plan_text:
+        with state_lock:
+            state["status"] = "idle"
         return "No plan provided", 400
     import json as _json
     try:
@@ -667,10 +809,10 @@ def recover():
             assert isinstance(spec.get("pages"), list) and spec["pages"], \
                 f"{cid}: needs a non-empty 'pages' list"
     except (ValueError, AssertionError) as e:
+        with state_lock:
+            state["status"] = "idle"
         return f"Invalid plan JSON: {e}", 400
     RECOVERY_PLAN_PATH.write_text(plan_text)
-    with state_lock:
-        state["status"] = "processing"
 
     def _do_recover():
         try:
@@ -704,10 +846,8 @@ def fix():
     if VOLUME_WARN:
         return ("Volume /data pe attach nahi hai -- pehle Railway Settings me Volume lagao "
                 "(Mount Path: /data), warna jo bhi likha jayega wo next redeploy pe udd jayega.", 400)
-    if state["status"] == "processing":
+    if not try_mark_processing():          # AUDIT-FIX: atomic busy-guard
         return redirect(url_for("index"))
-    with state_lock:
-        state["status"] = "processing"
 
     def _do_fix():
         try:
@@ -767,10 +907,8 @@ def validate():
     if VOLUME_WARN:
         return ("Volume /data pe attach nahi hai -- pehle Railway Settings me Volume lagao "
                 "(Mount Path: /data), warna jo bhi likha jayega wo next redeploy pe udd jayega.", 400)
-    if state["status"] == "processing":
+    if not try_mark_processing():          # AUDIT-FIX: atomic busy-guard
         return redirect(url_for("index"))
-    with state_lock:
-        state["status"] = "processing"
 
     def _do_validate():
         try:
@@ -910,15 +1048,15 @@ def restore_drive():
     if VOLUME_WARN:
         return ("Volume /data pe attach nahi hai -- pehle Railway Settings me Volume lagao "
                 "(Mount Path: /data), warna jo bhi likha jayega wo next redeploy pe udd jayega.", 400)
-    if state["status"] == "processing":
+    if not try_mark_processing():          # AUDIT-FIX: atomic busy-guard
         return redirect(url_for("index"))
     folder = request.form.get("folder", "").strip()
     m = _re.search(r"(?:folders/|[?&]id=|^\s*)([A-Za-z0-9_-]{10,})", folder)
     if not m:
+        with state_lock:
+            state["status"] = "idle"
         return "Drive folder link samajh nahi aaya", 400
     folder_id = m.group(1)
-    with state_lock:
-        state["status"] = "processing"
 
     def _do_restore():
         try:
@@ -990,15 +1128,15 @@ def restore_zip():
     if VOLUME_WARN:
         return ("Volume /data pe attach nahi hai -- pehle Railway Settings me Volume lagao "
                 "(Mount Path: /data), warna jo bhi likha jayega wo next redeploy pe udd jayega.", 400)
-    if state["status"] == "processing":
+    if not try_mark_processing():          # AUDIT-FIX: atomic busy-guard
         return redirect(url_for("index"))
     f = request.files.get("file")
     if not f or not f.filename.lower().endswith(".zip"):
+        with state_lock:
+            state["status"] = "idle"
         return "output_results.zip file chahiye", 400
     tmp = UPLOAD_DIR / "restore_upload.zip"
     f.save(tmp)
-    with state_lock:
-        state["status"] = "processing"
 
     def _do_restore_zip():
         try:
