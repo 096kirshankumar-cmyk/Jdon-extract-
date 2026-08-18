@@ -231,6 +231,18 @@ def check_row(row, assets_questions):
     correct = row.get("correct_options") or []
     sol = row.get("solution") or {}
 
+    # AUDIT-FIX: the pipeline's own per-row verdict travels with the row --
+    # surface it in the report so a row never LOOKS fine while its status
+    # disagrees (the INCOMPLETE/REVIEW_NEEDED classes of the build step).
+    qa = row.get("qa_status")
+    if qa == "INCOMPLETE":
+        flags.append(flag(cid, "qa_incomplete",
+                          f"{row.get('id')}: pipeline-marked INCOMPLETE -- "
+                          f"{'; '.join(row.get('qa_reasons') or [])[:200]}", qn, HIGH))
+    elif qa == "REVIEW_NEEDED":
+        flags.append(flag(cid, "qa_review_needed",
+                          f"{row.get('id')}: REVIEW_NEEDED -- "
+                          f"{'; '.join(row.get('qa_reasons') or [])[:200]}", qn, LOW))
     if not qtext or not qtext.strip():
         flags.append(flag(cid, "empty_question", f"{row.get('id')}: empty question text", qn))
     # run-13: pipeline-quarantined suspect stem (kept, not deleted) -- the

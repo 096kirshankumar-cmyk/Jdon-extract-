@@ -539,5 +539,93 @@ class TestSSectionBareListFilter(AuditEnv):
                       "bare-number headings are legitimate on question pages")
 
 
+
+
+# ============================================================================
+# STATUS SYSTEM (user ask): anything not provable must be flagged, never
+# silently COMPLETE. build_final_question computes qa_status from the record,
+# the ownership ledger (method/confidence per image) and gate notices.
+# ============================================================================
+class TestQAStatusRollup(AuditEnv):
+    def _healthy_rec(self, qn=4):
+        return {"q_no": qn, "question_text": f"Stem text of q{qn}?",
+                "options": {"A": "alpha", "B": "beta", "C": "gamma",
+                            "D": "delta"},
+                "correct_option": "C",
+                "solution_text": f"Solution text of q{qn} ending properly.",
+                "tables": [], "has_figure_in_question": False,
+                "has_figure_in_solution": False}
+
+    def _mk_image(self, name):
+        (qp.ASSETS_DIR / "questions" / SUBJECT).mkdir(parents=True, exist_ok=True)
+        _noise_webp(qp.ASSETS_DIR / "questions" / SUBJECT / name, seed=len(name))
+
+    def test_complete_row_is_ready(self):
+        row = qp.build_final_question(SUBJECT, CH_ID, CH_NO, 4,
+                                      self._healthy_rec(), {"question": [], "solution": []})
+        self.assertEqual(row["qa_status"], "READY")
+        self.assertEqual(row["qa_reasons"], [])
+        self.assertFalse(row["manual_review"])
+
+    def test_missing_answer_is_incomplete_not_ready(self):
+        rec = self._healthy_rec()
+        rec["correct_option"] = None
+        row = qp.build_final_question(SUBJECT, CH_ID, CH_NO, 4, rec,
+                                      {"question": [], "solution": []})
+        self.assertEqual(row["qa_status"], "INCOMPLETE")
+        self.assertTrue(any("correct_option" in r for r in row["qa_reasons"]))
+        self.assertTrue(row["manual_review"])
+
+    def test_model_only_image_marks_review_needed(self):
+        self._mk_image(f"{CH_ID}-004_Q_01.webp")
+        # ledger: image claimed only by isolated_crop_vision
+        qp._record_image_ownership(SUBJECT, CH_ID, 482, f"{SUBJECT}/OPH-p482-101.webp",
+                                   "OPH-028-004", "question",
+                                   "isolated_crop_vision", "model crop verdict",
+                                   confidence="high", outcome="claimed",
+                                   final_file=f"OPH/OPH-028-004_Q_01.webp")
+        row = qp.build_final_question(SUBJECT, CH_ID, CH_NO, 4,
+                                      self._healthy_rec(),
+                                      {"question": [f"OPH/OPH-028-004_Q_01.webp"],
+                                       "solution": []})
+        self.assertEqual(row["qa_status"], "REVIEW_NEEDED")
+        self.assertTrue(any("model-only" in r for r in row["qa_reasons"]))
+
+    def test_positional_image_stays_ready(self):
+        self._mk_image(f"{CH_ID}-004_Q_02.webp")
+        qp._record_image_ownership(SUBJECT, CH_ID, 482, f"{SUBJECT}/OPH-p482-102.webp",
+                                   "OPH-028-004", "question",
+                                   "positional", "closest heading above image",
+                                   confidence="high", outcome="claimed",
+                                   final_file=f"OPH/OPH-028-004_Q_02.webp")
+        row = qp.build_final_question(SUBJECT, CH_ID, CH_NO, 4,
+                                      self._healthy_rec(),
+                                      {"question": [f"OPH/OPH-028-004_Q_02.webp"],
+                                       "solution": []})
+        self.assertEqual(row["qa_status"], "READY")
+
+    def test_gate_notice_marks_review_needed(self):
+        row = qp.build_final_question(SUBJECT, CH_ID, CH_NO, 4,
+                                      self._healthy_rec(),
+                                      {"question": [], "solution": []},
+                                      gate_notices=[("figure_page_mismatch",
+                                                     "image from p99, anchors [482]")])
+        self.assertEqual(row["qa_status"], "REVIEW_NEEDED")
+        self.assertTrue(any("figure_page_mismatch" in r for r in row["qa_reasons"]))
+
+    def test_answer_vs_solution_letter_flip_is_flagged_never_autocorrected(self):
+        rec = self._healthy_rec()
+        rec["correct_option"] = "B"           # false flip
+        # solution opens on option C's content
+        rec["solution_text"] = ("Gamma ray bursts are the brightest. " + rec["solution_text"])
+        rec["options"]["C"] = "gamma ray bursts are the brightest explosions"
+        row = qp.build_final_question(SUBJECT, CH_ID, CH_NO, 4, rec,
+                                      {"question": [], "solution": []})
+        self.assertEqual(row["correct_options"], ["B"],
+                         "the mismatch is NEVER auto-corrected")
+        self.assertEqual(row["qa_status"], "REVIEW_NEEDED")
+        self.assertTrue(any("answer_suspect" in r for r in row["qa_reasons"]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

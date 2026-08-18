@@ -5290,7 +5290,8 @@ def _anchorless_record(rec):
 
 
 def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files,
-                         source_pages=None, ownership_pages=None):
+                         source_pages=None, ownership_pages=None,
+                         gate_notices=None):
     qid = f"{subject}-{chapter_no:03d}-{q_no:03d}"
 
     def valid_images(imgs, kind):
@@ -5337,11 +5338,14 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
     # option blank, preserve usability with the solution's opening sentence
     # and make the repair conspicuous for validator/manual review.
     correct_id = str(rec.get("correct_option") or "").strip().upper()
+    _build_flags = []
     for opt in option_rows:
         if opt["id"] == correct_id and not str(opt.get("text") or "").strip():
             first = re.split(r"(?<=[.!?])\s+", sol_text.strip(), maxsplit=1)[0].strip()
             if first:
                 opt["text"] = first
+                _build_flags.append(f"option {correct_id} text reconstructed "
+                                    "from the solution's opening sentence")
                 print(f"  [OPTION_BACKFILLED] {qid}: correct option {correct_id} reconstructed from solution opening")
     # Correct clearly mislabelled "Option X:" explanation lines only when the
     # description overlaps another option at least twice as strongly.
@@ -5353,9 +5357,82 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
         best = max(scores, key=scores.get) if scores else label
         if best != label and scores.get(best, 0) >= 2 * max(1, scores.get(label, 0)):
             print(f"  [LABEL_CORRECTED] {qid}: Option {label} -> Option {best}")
+            _build_flags.append(f"printed 'Option {label}:' explanation line "
+                                f"points at option {best}'s content")
             return f"Option {best}: {desc}"
         return m.group(0)
     sol_text = re.sub(r"(?m)Option\s+([A-D])\s*:\s*([^\n]+)", relabel, sol_text)
+
+    # ---- qa_status: NEVER silent -----------------------------------------
+    # READY         = extracted content + every image backed by deterministic
+    #                 or high-confidence evidence; no review reason.
+    # REVIEW_NEEDED = content complete but something needs human eyes
+    #                 (model-claim-only figures, gate mismatch, sweep
+    #                 findings, backfilled option, answer/solution letter
+    #                 disagreement, quarantined stem/options).
+    # INCOMPLETE    = structural fields missing (stem/4 options/answer/
+    #                 solution) -- aap manually review karenge.
+    # Nothing here corrects data; it only flags (aapke rule ke hisaab se --
+    # no brute-force fix).
+    status_reasons = list(rec.get("_review_reasons") or [])
+    structural_missing = []
+    if not (rec.get("question_text") or "").strip():
+        structural_missing.append("question_text")
+    opts = rec.get("options") or {}
+    if len(opts) < 4 or any(not str(v or "").strip() for v in opts.values()):
+        structural_missing.append("options")
+    if not rec.get("correct_option"):
+        structural_missing.append("correct_option")
+    if not (rec.get("solution_text") or "").strip():
+        structural_missing.append("solution_text")
+    if structural_missing:
+        status_reasons.append(f"missing structural fields: {structural_missing}")
+
+    # image-evidence review: any attached image whose only ownership proof is
+    # a non-deterministic (model) method or non-high confidence
+    ownership_methods = _ownership_method_map(chapter_id)
+    weak_img_files = []
+    for side, imgs in (("question", q_images), ("solution", sol_images)):
+        for im in imgs:
+            ev = ownership_methods.get(im["file"], {})
+            meth, conf = ev.get("method"), ev.get("confidence")
+            if meth == "isolated_crop_vision" or (
+                    meth == "full_page_vision" and conf != "high"):
+                weak_img_files.append(f"{im['file']} ({meth}/{conf or '?'})")
+    opt_blob = (image_files.get("option") or {})
+    for letter, files in opt_blob.items():
+        for fn, meta in [] if not ownership_methods else [
+                (f, ownership_methods.get(f, {})) for f in files]:
+            meth, conf = meta.get("method"), meta.get("confidence")
+            if meth == "isolated_crop_vision" or (
+                    meth == "full_page_vision" and conf != "high"):
+                weak_img_files.append(f"{fn} ({meth}/{conf or '?'})")
+    if weak_img_files:
+        status_reasons.append("image(s) attached by model-only evidence: "
+                              + "; ".join(weak_img_files))
+
+    # gate notices for this question (wrong-owner suspect, strong missing
+    # figure, etc.)
+    for knd, detail in (gate_notices or []):
+        status_reasons.append(f"export-gate {knd}: {detail}")
+
+    for mark, label in ((rec.get("_stem_suspect_reason"), "stem_suspect"),
+                        (rec.get("_options_suspect_reason"), "options_suspect")):
+        if mark and not any(r.startswith(label) for r in status_reasons):
+            status_reasons.append(f"{label}: {mark}")
+
+    am = _answer_option_mismatch(rec, correct_id, option_rows)
+    if am:
+        status_reasons.append("answer_suspect: " + am)
+
+    status_reasons.extend(_build_flags)
+
+    if structural_missing:
+        qa_status = "INCOMPLETE"
+    elif status_reasons:
+        qa_status = "REVIEW_NEEDED"
+    else:
+        qa_status = "READY"
 
     return {
         "id": qid,
@@ -5389,9 +5466,17 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
         # cases -- they used to live only in integrity_flags.jsonl, leaving
         # the exported row looking clean. None on healthy records.
         "review_reasons": list(rec.get("_review_reasons") or []) or None,
-        "manual_review": bool(rec.get("_stem_suspect_reason")
-                              or rec.get("_options_suspect_reason")
-                              or rec.get("_review_reasons")),
+        "manual_review": bool((rec.get("_stem_suspect_reason")
+                               or rec.get("_options_suspect_reason")
+                               or rec.get("_review_reasons")
+                               or _build_flags)
+                              or status_reasons),
+        # AUDIT-FIX (user ask): the export now carries an explicit per-row
+        # status with its machine-readable reasons. A question that could not
+        # be proven is NEVER silently COMPLETE -- INCOMPLETE rows and
+        # REVIEW_NEEDED rows are distinguishable and reviewable manually.
+        "qa_status": qa_status,
+        "qa_reasons": status_reasons or [],
     }
 
 
@@ -6281,6 +6366,84 @@ def _record_image_ownership(subject, chapter_id, page, rel, qid, slot,
         entry["final_file"] = final_file
     _append_jsonl(DATA_DIR / "image_ownership.jsonl", entry)
 
+
+def _ownership_method_map(chapter_id):
+    """final_file -> {method, confidence, page} from the ownership ledger
+    (claimed rows only). Drives the per-row qa_status evidence: any image
+    claimed only by a model fallback (isolated/full-page vision at non-high
+    confidence) makes its owner row REVIEW_NEEDED, never silent."""
+    out = {}
+    path = DATA_DIR / "image_ownership.jsonl"
+    if not path.exists():
+        return out
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("chapter_id") != chapter_id or row.get("outcome") != "claimed":
+            continue
+        for key in ("final_file", "file"):
+            v = row.get(key)
+            if v:
+                out[v] = {"method": row.get("method"),
+                          "confidence": row.get("confidence"),
+                          "page": row.get("page")}
+    return out
+
+
+def _answer_option_mismatch(rec, correct_id, option_rows):
+    """Deterministic 'answer letter disagrees with its own solution' detector.
+    Returns a reason string or None. NEVER corrects the data -- only flags it.
+    (Live case proven on OPH-009-002: extracted B while the printed key and
+    its own solution both point at C.)"""
+    if not correct_id:
+        return None
+    sol = (rec.get("solution_text") or "").strip()
+    if not sol:
+        return None
+    WORD = r"[0-9A-Za-z_]+"
+    opt_text = {o["id"]: str(o.get("text") or "") for o in option_rows}
+    opt_toks = {k: {w for w in re.findall(WORD, v.lower()) if len(w) > 3}
+                for k, v in opt_text.items() if v}
+
+    def _overlap_letter(frag):
+        if not opt_toks:
+            return None
+        f = {w for w in re.findall(WORD, frag.lower()) if len(w) > 3}
+        if len(f) < 3:
+            return None
+        scores = {k: len(f & s) for k, s in opt_toks.items()}
+        best = max(scores, key=scores.get)
+        if scores[best] >= 2 * max(1, scores.get(correct_id, 0)) and scores[best] >= 3:
+            return best
+        return None
+
+    m = re.search("(?:correct" + r"\s+" + "answer|answer)" + r"\s*" + "(?:is|:)" + r"\s*" +
+                  "(?:option" + r"\s+" + ")?" + "(?:the" + r"\s+" + ")?" + "([A-Da-d]|the" + r"\s+" + "[^.]+)", sol, re.I)
+    if m:
+        letter = m.group(1).strip()
+        if len(letter) == 1 and letter.upper() in opt_text:
+            if letter.upper() != correct_id:
+                return (f"printed phrase 'answer is {letter}' disagrees with "
+                        f"extracted correct_option {correct_id}")
+        else:
+            hit = _overlap_letter(letter)
+            if hit and hit != correct_id:
+                return (f"solution says the answer describes option {hit}'s "
+                        f"content but correct_option is {correct_id}")
+    first = re.split(r"(?<=[.!?])" + "\s" + "+", sol, maxsplit=1)[0].strip()
+    hit = _overlap_letter(first)
+    if hit and hit != correct_id:
+        return (f"solution opens on option-{hit} content but correct_option is "
+                f"{correct_id} (key-letter flip suspect)")
+    return None
 
 def _ownership_page_map(chapter_id):
     """{final_rel_or_temp_rel: pdf_page} for one chapter, from the ownership
@@ -9008,12 +9171,20 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                   f"master pipeline output unaffected, split files NOT written")
 
         chapter_rows = []
+        # AUDIT-FIX: this chapter's export-gate findings are threaded into the
+        # row builder so the WRONG-OWNER / figure-missing states land on the
+        # row itself (qa_status REVIEW_NEEDED), not only in a side ledger.
+        gate_by_qn = {}
+        for kind, qn_v, detail in (violations or []):
+            if qn_v is not None:
+                gate_by_qn.setdefault(qn_v, []).append((kind, detail))
         for qn, rec in sorted(chapter_records.items(), key=lambda x: x[0]):
             final_q = build_final_question(
                 subject, chapter_id, ch["chapter_no"], qn, rec,
                 image_files_by_q.get(qn, {"question": [], "solution": []}),
                 source_pages=qn_source_pages.get(qn),
-                ownership_pages=ownership_pages
+                ownership_pages=ownership_pages,
+                gate_notices=gate_by_qn.get(qn, [])
             )
             chapter_rows.append(final_q)
         # run-16 CRASH-SAFE COMMIT: the master questions.jsonl is rewritten
@@ -9046,10 +9217,14 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
         # MISSING-STEM VISIBILITY (run-11 RC-3): "0 missing answer / 0 missing
         # solution" previously MASKED stem-less records (ch1 q4/q10, ch2
         # q25/q26 shipped stem-less with those counters at 0).
+        _qa_ready = sum(1 for r in chapter_rows if r.get("qa_status") == "READY")
+        _qa_review = sum(1 for r in chapter_rows if r.get("qa_status") == "REVIEW_NEEDED")
+        _qa_incomp = sum(1 for r in chapter_rows if r.get("qa_status") == "INCOMPLETE")
         print(f"[{subject}] chapter {ch['chapter_no']} ({ch['chapter_title']}) done -> "
               f"{len(chapter_records)} questions ({n_no_answer} missing answer, "
               f"{n_no_solution} missing solution, {n_no_stem} missing stem, "
-              f"{n_bad_opts} bad options)")
+              f"{n_bad_opts} bad options | qa_status: {_qa_ready} READY, "
+              f"{_qa_review} REVIEW_NEEDED, {_qa_incomp} INCOMPLETE)")
         stats["missing_stems"] = stats.get("missing_stems", 0) + n_no_stem
         stats["bad_options"] = stats.get("bad_options", 0) + n_bad_opts
         if n_no_solution and chapter_records:
