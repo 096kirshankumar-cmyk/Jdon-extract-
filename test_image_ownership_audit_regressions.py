@@ -497,6 +497,47 @@ class TestPhantomAnchorFilter(AuditEnv):
         headers = qp.union_block_headers_on_page(PDF, 99, records)
         self.assertEqual(headers, [("question", 6, 700.0)])
 
+# ============================================================================
+# LIVE-RUN regression (ch. 25 p571-573): bare-N numbered list items inside
+# the SOLUTIONS section must not anchor figures onto the question side.
+# ============================================================================
+class TestSSectionBareListFilter(AuditEnv):
+    def test_bare_number_list_items_dropped_in_s_section(self):
+        records = {i: _full_rec(i) for i in range(1, 26)}
+        # text layer: real "Solution to Question 12:" + bare numbered list
+        # items "2. Vitreomacular traction ..." and "3. Vitreomacular ..."
+        self.stub("_page_word_lines", lambda pdf, page: [
+            (700.0, [(50.0, "Solution to Question 12:")]),
+            (500.0, [(50.0, "2."), (70.0, "Vitreomacular traction...")]),
+            (200.0, [(50.0, "3."), (70.0, "Vitreomacular adhesion...")])])
+        self.stub("ocr_page_anchors_xy", lambda png, scale, h: [
+            ("question", 4, 620.0, 172.0, 0)])     # bare OCR anchor, no keyword
+        hdrs = qp.union_block_headers_on_page(PDF, 571, records, section="S")
+        self.assertFalse(any(k == "question" for k, _q, _y in hdrs),
+                         f"bare list items must not anchor in S section: {hdrs}")
+        self.assertIn(("solution", 12, 700.0), hdrs)
+
+    def test_keyword_question_heading_survives_in_s_section(self):
+        records = {i: _full_rec(i) for i in range(1, 26)}
+        self.stub("_page_word_lines", lambda pdf, page: [
+            (700.0, [(50.0, "Question 13:")]),
+            (500.0, [(50.0, "2."), (70.0, "list item")])])
+        self.stub("ocr_page_anchors_xy", lambda png, scale, h: [])
+        hdrs = qp.union_block_headers_on_page(PDF, 571, records, section="S")
+        self.assertIn(("question", 13, 700.0), hdrs,
+                      "an explicit 'Question N:' heading stays (the run-18 "
+                      "activation case depends on it)")
+        self.assertNotIn(("question", 2, 500.0), hdrs)
+
+    def test_bare_question_heading_survives_in_q_section(self):
+        records = {6: _full_rec(6)}
+        self.stub("_page_word_lines", lambda pdf, page: [
+            (800.0, [(50.0, "6."), (70.0, "Some stem text")])])
+        self.stub("ocr_page_anchors_xy", lambda png, scale, h: [])
+        hdrs = qp.union_block_headers_on_page(PDF, 607, records, section="Q")
+        self.assertIn(("question", 6, 800.0), hdrs,
+                      "bare-number headings are legitimate on question pages")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

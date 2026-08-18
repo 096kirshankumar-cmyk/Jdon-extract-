@@ -2,7 +2,7 @@
 """
 QBank PDF -> JSON extraction pipeline.
 Run this on your own machine / Railway (needs: poppler-utils, pypdf, Pillow,
-google-generativeai, requests). Designed to survive a 100-req/day Gemini
+google-generativeai, requests). Dedonened to survive a 100-req/day Gemini
 free-tier limit by checkpointing progress and resuming across multiple runs
 (e.g. via a daily cron job / Railway scheduled task).
 
@@ -5729,7 +5729,7 @@ def _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q,
 
 
 def claim_page_images_one_to_one(imgs, pdf_path, file_page, subject, chapter_no,
-                                 chapter_records, image_files_by_q):
+                                 chapter_records, image_files_by_q, section=None):
     """Gap-2 core matcher: distribute one page's N extracted images across
     the chapter's needy slots ONE-TO-ONE, in reading order: images sorted
     top->bottom by their drawn y-position (positions parsed from the PDF
@@ -5771,7 +5771,8 @@ def claim_page_images_one_to_one(imgs, pdf_path, file_page, subject, chapter_no,
         # and the image must sit INSIDE its block extent (below the heading,
         # above the next detected anchor). Anything else stays for the
         # explicit-attribution / manual levels.
-        headers = union_block_headers_on_page(pdf_path, file_page, chapter_records)
+        headers = union_block_headers_on_page(pdf_path, file_page, chapter_records,
+                                          section=section)
         pos = image_positions_on_page(pdf_path, file_page)
         idx = next((i for i, (k, q, _y) in enumerate(headers) if q == qn), None)
         if idx is None or not pos:
@@ -5817,7 +5818,8 @@ def claim_page_images_one_to_one(imgs, pdf_path, file_page, subject, chapter_no,
 
 
 def claim_block_images(imgs, pdf_path, file_page, subject, chapter_no,
-                       chapter_records, image_files_by_q, active_block=None):
+                       chapter_records, image_files_by_q, active_block=None,
+                       section=None):
     """GEOMETRY-FIRST deterministic owner for figures inside question OR
     solution blocks (run-9, generalized from the solution-only mapper).
 
@@ -5856,7 +5858,8 @@ def claim_block_images(imgs, pdf_path, file_page, subject, chapter_no,
     # figures to the PREVIOUS question (OPH-028-006 collected Q5/Q7's
     # figures while Q7/Q8 shipped with none). OCR anchors are cached
     # (_ocr_anchors_for_page), so the union costs no extra renders.
-    headers = union_block_headers_on_page(pdf_path, file_page, chapter_records)
+    headers = union_block_headers_on_page(pdf_path, file_page, chapter_records,
+                                          section=section)
     pos = image_positions_on_page(pdf_path, file_page)
     if (not headers and active_block is None) or not pos:
         # No block evidence (or unparsable positions) -> claim NOTHING by
@@ -6138,12 +6141,8 @@ def _ocr_anchors_from_data(data, scale, img_h):
         # also satisfies the question regex once any prefix is lost to OCR, and
         # whichever branch runs first wins -- so the more specific pattern must
         # go first, and a line carrying it never falls through to "question".
-        # AUDIT-FIX: anchor-strength marker. A bare-number line ("6.") with a
-        # single word is the shape of a tesseract phantom read off figure
-        # texture / watermark ink. Real printed headings either carry the
-        # keyword ("Question 6:" / "Solution to Question N:") or sit on a
-        # line with siblings. `strong=False` anchors must pass the union
-        # corroboration gate in union_block_headers_on_page.
+        # keyword marker for the S-section bare-list guard: kw = explicit
+        # "Question N"/"Q N" prefix (see union_block_headers_on_page).
         n_words = len(wl)
         sol_hits = list(re.finditer(r"Solution\s+to\s+Question\s+(\d{1,3})", line, re.I))
         if sol_hits:
@@ -6154,9 +6153,11 @@ def _ocr_anchors_from_data(data, scale, img_h):
         m = QSTEM_HEADING_RE.match(line)
         if m:
             has_kw = bool(re.match(r"^\s*Q(?:uestion)?\s*[.:]?\s*\d", line, re.I))
+            # 5th field: 2 = explicit keyword (Question N:/Q N.), 1 = bare but
+            # multiword line, 0 = bare single token ('2.')
+            strength = 2 if has_kw else (1 if n_words >= 2 else 0)
             anchors.append(("question", int(m.group(1)),
-                            (img_h - _yc) / scale, wl[0][0] / scale,
-                            has_kw or n_words >= 2))
+                            (img_h - _yc) / scale, wl[0][0] / scale, strength))
     return sorted(set(anchors), key=lambda a: -a[2])
 
 
@@ -6312,7 +6313,7 @@ def _ownership_page_map(chapter_id):
 
 def claim_block_images_ocr(imgs, pdf_path, file_page, subject, chapter_no,
                            chapter_records, image_files_by_q, chapter_id=None,
-                           active_block=None, dpi=150):
+                           active_block=None, dpi=150, section=None):
     """run-13 LEVEL 2 (deterministic OCR-anchored geometry): the SAME
     closest-heading-above rule as claim_block_images, but the block headings
     come from OCR of the RENDERED page instead of the (garbled/absent) PDF
@@ -6331,7 +6332,7 @@ def claim_block_images_ocr(imgs, pdf_path, file_page, subject, chapter_no,
     # (previously L1=text-only/record-filtered, L2=OCR-only -- two different
     # views of the same page could disagree).
     headers = union_block_headers_on_page(pdf_path, file_page, chapter_records,
-                                          dpi=dpi)
+                                          dpi=dpi, section=section)
     if not headers and active_block is None:
         return imgs
     pos = image_positions_on_page(pdf_path, file_page)
@@ -6670,7 +6671,8 @@ def claim_figure_map_images(fig_map, window_rows, subject, chapter_no,
 
 
 def claim_page_images(imgs, pdf_path, file_page, subject, chapter_no,
-                      chapter_records, image_files_by_q, active_block=None):
+                      chapter_records, image_files_by_q, active_block=None,
+                      section=None):
     """Deterministic claimer for one page's images (run-9 geometry-first):
 
       1. block-header mapping -- every image drawn under a question-stem
@@ -6690,11 +6692,12 @@ def claim_page_images(imgs, pdf_path, file_page, subject, chapter_no,
     attribution / manual review)."""
     leftover = claim_block_images(imgs, pdf_path, file_page, subject,
                                   chapter_no, chapter_records, image_files_by_q,
-                                  active_block=active_block)
+                                  active_block=active_block, section=section)
     if leftover:
         leftover = claim_page_images_one_to_one(leftover, pdf_path, file_page,
                                                 subject, chapter_no, chapter_records,
-                                                image_files_by_q)
+                                                image_files_by_q,
+                                                section=section)
     return leftover
 
 
@@ -6773,9 +6776,11 @@ def _ocr_anchors_for_page(pdf_path, file_page, dpi=150):
                     rects.append(r)
                 if rects:
                     kept = []
+                    kept_xy = []
                     for k, q, y, x, strong in anchors_xy:
                         if x is None:
                             kept.append((k, q, y))   # legacy stub: no geometry
+                            kept_xy.append((k, q, y, x, strong))
                             continue
                         if any(_rect_contains(r, (x - 0.5, y - 0.5,
                                                   x + 0.5, y + 0.5), pad=6.0)
@@ -6786,7 +6791,13 @@ def _ocr_anchors_for_page(pdf_path, file_page, dpi=150):
                                   f"not a real heading")
                             continue
                         kept.append((k, q, y))
+                        kept_xy.append((k, q, y, x, strong))
                     anchors = kept
+                    anchors_xy = kept_xy   # AUDIT-FIX: the xy cache must carry
+                                           # the FILTERED anchors -- the union
+                                           # reads it first (phantoms were
+                                           # leaking back in through the raw
+                                           # side-channel)
             except Exception:
                 pass                     # filter is best-effort, never blocks
     _OCR_ANCHOR_CACHE[key] = anchors
@@ -6799,12 +6810,14 @@ def _ocr_anchors_for_page(pdf_path, file_page, dpi=150):
 
 
 def _raw_text_headers_on_page(pdf_path, file_page):
-    """[(kind, q_no, y_baseline)] -- every line-start question/solution
+    """[(kind, q_no, y_baseline, has_kw)] -- every line-start question/solution
     heading the text layer prints, WITHOUT the chapter_records membership
     filter. (The filtered variants question_headers_on_page /
     solution_headers_on_page keep their existing contract for other
     callers; membership is a CLAIM-time decision, not a detection-time
-    one.)"""
+    one.) has_kw = the line carried an explicit 'Question'/'Q' prefix --
+    used to keep bare numbered LIST items ('2. Vitreomacular traction...')
+    out of anchor duty inside the solutions section."""
     headers, seen = [], set()
     for y, wl in _page_word_lines(pdf_path, file_page):
         line = " ".join(t for _, t in wl)
@@ -6815,14 +6828,16 @@ def _raw_text_headers_on_page(pdf_path, file_page):
                 qn = int(m.group(1))
                 if ("solution", qn) not in seen:
                     seen.add(("solution", qn))
-                    headers.append(("solution", qn, y))
+                    headers.append(("solution", qn, y, True))
             continue
         m = QSTEM_HEADING_RE.match(line)
         if m and "solution" not in line.lower():
             qn = int(m.group(1))
             if ("question", qn) not in seen:
                 seen.add(("question", qn))
-                headers.append(("question", qn, y))
+                has_kw = bool(re.match(r"^\s*Q(?:uestion)?\s*[.:]?\s*\d",
+                                       line, re.I))
+                headers.append(("question", qn, y, has_kw))
     return headers
 
 
@@ -6842,7 +6857,8 @@ def _plausible_qn_for_chapter(qn, chapter_records):
     return min(recs) <= qn <= max(recs) + 2
 
 
-def union_block_headers_on_page(pdf_path, file_page, chapter_records, dpi=150):
+def union_block_headers_on_page(pdf_path, file_page, chapter_records, dpi=150,
+                                section=None):
     """[(kind, q_no, y)] block anchors for one page = text layer UNION OCR,
     sorted top-first (largest y first) -- the SAME consumer contract as
     block_headers_on_page.
@@ -6856,12 +6872,32 @@ def union_block_headers_on_page(pdf_path, file_page, chapter_records, dpi=150):
       * question anchors below the FIRST (topmost) solution header are
         dropped (list items inside solution prose are not stems) -- this is
         the docstring block_headers_on_page always had; its code used min()
-        (LOWEST solution header) instead of max() (audit B1).
+        (LOWEST solution header) instead of max() (audit B1);
+      * section='S' (solutions-section page): QUESTION anchors without an
+        explicit 'Question N:' / 'Q N.' keyword prefix are dropped -- a bare
+        '2.' line there is a numbered list item / figure label inside
+        solution prose, not a question stem (ch. 25 p571-573: the OCT figure
+        list stole real figures onto the question side of q2/q4/q5).
     """
-    text_h = [(k, q, y) for k, q, y in _raw_text_headers_on_page(pdf_path, file_page)
-              if _plausible_qn_for_chapter(q, chapter_records)]
-    ocr_h = [(k, q, y) for k, q, y in _ocr_anchors_for_page(pdf_path, file_page, dpi=dpi)
-             if _plausible_qn_for_chapter(q, chapter_records)]
+    text_full = [(k, q, y, kw) for k, q, y, kw in
+                 _raw_text_headers_on_page(pdf_path, file_page)
+                 if _plausible_qn_for_chapter(q, chapter_records)]
+    ocr_full = [(k, q, y, st) for k, q, y, st in
+                [(a[0], a[1], a[2], a[4] if len(a) > 4 else 2)
+                 for a in _OCR_ANCHOR_XY.get(
+                     (str(pdf_path), int(file_page), int(dpi)),
+                     [(k, q, y, None, 2) for k, q, y in _ocr_anchors_for_page(
+                         pdf_path, file_page, dpi=dpi)])]
+                if _plausible_qn_for_chapter(q, chapter_records)]
+    if section == "S":
+        # drop bare-number question anchors entirely: text keeps only
+        # explicit-keyword lines (kw=True); OCR keeps only strength==2
+        # (an explicit 'Question N:'/'Q N.' prefix). Bare '2.' list items
+        # must not anchor anything in the solutions section.
+        text_full = [t for t in text_full if t[0] != "question" or bool(t[3])]
+        ocr_full = [t for t in ocr_full if t[0] != "question" or t[3] == 2]
+    text_h = [(k, q, y) for k, q, y, _kw in text_full]
+    ocr_h = [(k, q, y) for k, q, y, _st in ocr_full]
     merged = list(text_h)
     ocr_only = []
     for k, q, y in ocr_h:
@@ -6910,7 +6946,8 @@ def union_block_headers_on_page(pdf_path, file_page, chapter_records, dpi=150):
     return sorted(qs + ss, key=lambda t: -t[2])
 
 
-def chapter_anchor_pages(pdf_path, page_numbers, chapter_records, dpi=150):
+def chapter_anchor_pages(pdf_path, page_numbers, chapter_records, dpi=150,
+                         page_sections=None):
     """{q_no: {"pages": set, "question": set, "solution": set}} -- printed
     anchor index for one chapter, zero-token (text layer + cached OCR per
     page). `pages` = union of both kinds (used by figure_page_mismatch);
@@ -6921,7 +6958,8 @@ def chapter_anchor_pages(pdf_path, page_numbers, chapter_records, dpi=150):
     for p in page_numbers:
         try:
             for kind, qn, _y in union_block_headers_on_page(
-                    pdf_path, p, chapter_records, dpi=dpi):
+                    pdf_path, p, chapter_records, dpi=dpi,
+                    section=(page_sections or {}).get(p)):
                 rec = idx.setdefault(qn, {"pages": set(), "question": set(),
                                           "solution": set()})
                 rec["pages"].add(int(p))
@@ -6931,7 +6969,8 @@ def chapter_anchor_pages(pdf_path, page_numbers, chapter_records, dpi=150):
     return idx
 
 
-def last_block_on_page(pdf_path, file_page, dpi=150, chapter_records=None):
+def last_block_on_page(pdf_path, file_page, dpi=150, chapter_records=None,
+                       section=None):
     """(kind, q_no) of the LAST (lowest) printed block heading on a page, or
     None when the page prints no heading.
 
@@ -6949,7 +6988,8 @@ def last_block_on_page(pdf_path, file_page, dpi=150, chapter_records=None):
     phantom anchors the union rejects. One anchor source end-to-end.
     """
     headers = union_block_headers_on_page(pdf_path, file_page,
-                                          chapter_records or {}, dpi=dpi)
+                                          chapter_records or {}, dpi=dpi,
+                                          section=section)
     if not headers:
         return None
     kind, qn, _y = headers[-1]        # sorted top-first: last == lowest
@@ -7686,6 +7726,9 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                                                    # solutions_section_seen)
         q_covered_pages = set()                    # run-14: pages the Q-pass has
                                                    # actually run on (per chapter)
+        page_section = {}                          # AUDIT-FIX: page -> "Q"/"S"
+                                                   # from window specs, reused by
+                                                   # every claim/gate call below
         prev_window_last_page = None
 
         # SECTION-AWARE WINDOWS (run-6): detect questions/answers/solutions
@@ -7717,6 +7760,9 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
         prev_section = None
         for batch, section in window_specs:
             window_pages = [int(p.stem.split("-")[-1]) for p in batch]
+            if section:
+                for _pn in window_pages:
+                    page_section.setdefault(_pn, section)
             # provenance anchor used by the log lines / orphan records below
             # (the fixed-window loop used its index; the section loop uses the
             # window's first PDF page -- equally unique per window)
@@ -8337,7 +8383,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                         break
                     try:
                         _seed = last_block_on_page(pdf_path, _prev,
-                                               chapter_records=chapter_records)
+                                               chapter_records=chapter_records,
+                                               section=page_section.get(_prev))
                     except Exception:
                         _seed = None
                     # AUDIT-FIX: an OCR seed must pass the same plausibility
@@ -8364,7 +8411,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                     # page prints. Fall through to the advance below.
                     try:
                         _last = last_block_on_page(pdf_path, file_page_num,
-                                       chapter_records=chapter_records)
+                                       chapter_records=chapter_records,
+                                       section=page_section.get(file_page_num))
                     except Exception:
                         _last = None
                     if _last is not None and _plausible_qn_for_chapter(
@@ -8373,7 +8421,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                     continue
                 leftover = claim_page_images(rels, pdf_path, file_page_num, subject,
                                              ch["chapter_no"], chapter_records,
-                                             image_files_by_q, active_block=active_block)
+                                             image_files_by_q, active_block=active_block,
+                                             section=page_section.get(file_page_num))
                 # run-13 LEVEL 2 (deterministic OCR-anchored geometry): the
                 # text layer on this book's QUESTION pages is garbled, so
                 # L1 finds no headings there and question-side figures would
@@ -8383,7 +8432,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                 leftover = claim_block_images_ocr(
                     leftover, pdf_path, file_page_num, subject, ch["chapter_no"],
                     chapter_records, image_files_by_q, chapter_id=chapter_id,
-                    active_block=active_block)
+                    active_block=active_block,
+                    section=page_section.get(file_page_num))
                 leftover_by_page[file_page_num] = leftover
                 # run-21 §2.1: advance the cross-page carry to the LAST block
                 # printed on this page, so the next page's header-less top
@@ -8393,7 +8443,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                 # is still open across it).
                 try:
                     _last = last_block_on_page(pdf_path, file_page_num,
-                                       chapter_records=chapter_records)
+                                       chapter_records=chapter_records,
+                                       section=page_section.get(file_page_num))
                 except Exception:
                     _last = None
                 if _last is not None and _plausible_qn_for_chapter(
@@ -8481,7 +8532,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
             # one-to-one matcher.
             leftover2 = claim_page_images(um["files"], pdf_path, um["page"],
                                           subject, ch["chapter_no"],
-                                          chapter_records, image_files_by_q)
+                                          chapter_records, image_files_by_q,
+                                          section=page_section.get(um["page"]))
             um["files"] = leftover2
             if not leftover2:
                 print(f"  [INFO] second pass: page {um['page']} image(s) matched to a question")
@@ -8511,7 +8563,8 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                 # page's anchor geometry: the union anchors above the image
                 # decide (closest anchor of either kind).
                 _hdrs = union_block_headers_on_page(pdf_path, um["page"],
-                                                    chapter_records)
+                                                    chapter_records,
+                                                    section=page_section.get(um["page"]))
                 _pos = image_positions_on_page(pdf_path, um["page"])
                 _qn_hdr = next(((k, q, y) for k, q, y in _hdrs if q == qn), None)
                 if _qn_hdr is None or not _pos:
@@ -8651,6 +8704,39 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                 slot = verdict.get("slot")
                 if slot not in ("question", "solution"):
                     slot = "question"
+                # AUDIT-FIX: the over-attribution/tiny-crop guards refuse a
+                # file for an owner and send it here "for review"; letting the
+                # isolated model pass then attach the SAME file to the SAME
+                # owner on the other side voids the guard entirely (ch. 25:
+                # cap-refused solution figures reappeared as question images).
+                # A prior refusal for this (file, owner) blocks the re-claim.
+                try:
+                    _own_log = DATA_DIR / "image_ownership.jsonl"
+                    _was_refused = False
+                    if _own_log.exists():
+                        _qid_try = f"{subject}-{ch['chapter_no']:03d}-{qn_attr:03d}"
+                        for _l in _own_log.read_text(encoding="utf-8").splitlines():
+                            if not _l.strip():
+                                continue
+                            try:
+                                _r = json.loads(_l)
+                            except json.JSONDecodeError:
+                                continue
+                            if (_r.get("chapter_id") ==
+                                    f"{subject}-{ch['chapter_no']:03d}"
+                                    and _r.get("file") == rel
+                                    and _r.get("owner") == _qid_try
+                                    and str(_r.get("outcome", "")).startswith("refused")):
+                                _was_refused = True
+                                break
+                except OSError:
+                    _was_refused = False
+                if _was_refused:
+                    print(f"  [IMG] fourth pass: page {um['page']} {rel} -> "
+                          f"q{qn_attr} was already guard-refused for this owner "
+                          f"-- NOT re-attaching (stays for review)")
+                    still.append(rel)
+                    continue
                 new_rel = _rename_for_slot(rel, qn_attr, slot, subject, ch["chapter_no"],
                                            image_files_by_q,
                                            claim_source="isolated_crop_vision")
@@ -8831,7 +8917,7 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
         try:
             chapter_anchor_idx = chapter_anchor_pages(
                 pdf_path, [int(p.stem.split("-")[-1]) for p in page_files],
-                chapter_records)
+                chapter_records, page_sections=page_section)
         except Exception as _anch_e:
             print(f"  [WARN] anchor-index build failed ({_anch_e}) -- gate's "
                   f"figure-page checks skip this chapter (conservative)")
