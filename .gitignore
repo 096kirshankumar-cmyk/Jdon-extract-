@@ -1,0 +1,5 @@
+qbank_output/
+__pycache__/
+fixtures/
+*.pyc
+.venv/
