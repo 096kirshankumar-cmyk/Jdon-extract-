@@ -18,7 +18,10 @@ import random
 import unittest
 from pathlib import Path
 
-REPO = Path("/home/user/repo")
+# Portable: the checkout containing THIS test file (was hardcoded to a local
+# dev path /home/user/repo -- that pinned imports to a stale sibling copy and
+# shadowed the real app module in combined suite runs).
+REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO))
 
 _TMP = Path(tempfile.mkdtemp(prefix="auditfix_env_"))

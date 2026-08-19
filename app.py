@@ -28,6 +28,7 @@ from werkzeug.utils import secure_filename
 import qbank_pipeline as pipeline
 import gemini_keys
 import master_review_export  # MASTER_REVIEW/ package builder (read-only)
+import review_queue          # human review engine (union of ALL flag sources; offline)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200MB per PDF upload
@@ -451,6 +452,8 @@ PAGE = """
     {% if state.error %}<p class="text-red-600 text-sm">{{ state.error }}</p>{% endif %}
     <a href="/download" class="inline-block mt-2 bg-emerald-600 text-white text-sm px-3 py-2 rounded">Download results (.zip)</a>
     <a href="/download-master-review" class="inline-block mt-2 bg-amber-600 text-white text-sm px-3 py-2 rounded">📒 Download MASTER_REVIEW (.zip)</a>
+    <a href="/review" class="inline-block mt-2 bg-rose-600 text-white text-sm px-3 py-2 rounded">🧑‍⚖️ Review queue (manual edit)</a>
+    <a href="/download-final" class="inline-block mt-2 bg-indigo-600 text-white text-sm px-3 py-2 rounded">🚀 Final zip (review-gated)</a>
     {% if state.get('test_ready') %}
     <a href="/download-test" class="inline-block mt-2 bg-violet-600 text-white text-sm px-3 py-2 rounded">⬇️ Download TEST results (.zip)</a>
     {% endif %}
@@ -1298,6 +1301,288 @@ def download_master_review():
         log(f"📒 MASTER_REVIEW zip ready -> {zip_path}")
     return send_file(str(zip_path), as_attachment=True,
                      download_name="MASTER_REVIEW.zip")
+
+# ---------------------------------------------------------------------------
+# MANUAL REVIEW SCREEN (contract: pipeline freezes after extraction; humans
+# edit here; every decision is disk-persisted; final zip gates on a clear
+# queue). All logic lives in review_queue.py — this is only the wiring.
+# ---------------------------------------------------------------------------
+
+REVIEW_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Review Queue</title>
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 p-3">
+<div class="max-w-2xl mx-auto space-y-3">
+  <div class="flex items-center justify-between">
+    <h1 class="text-lg font-bold">🧑‍⚖️ Review Queue</h1>
+    <a href="/" class="text-xs text-sky-700 underline">← dashboard</a>
+  </div>
+
+  {% if msg %}
+  <div class="rounded p-3 text-sm font-semibold {{ 'bg-emerald-100 text-emerald-900' if ok else 'bg-red-100 text-red-900' }}">{{ msg }}</div>
+  {% endif %}
+
+  <div class="bg-white rounded shadow p-3 text-sm flex gap-4">
+    <span>🔴 <b>{{ counts.blocker }}</b> blocker</span>
+    <span>🟡 <b>{{ counts.review }}</b> review</span>
+    <span>✅ <b>{{ counts.resolved }}</b> resolved</span>
+  </div>
+
+  {% for w in warnings %}
+  <div class="bg-red-600 text-white rounded p-3 text-xs">⚠️ {{ w }}</div>
+  {% endfor %}
+
+  {% if clear %}
+  <div class="bg-emerald-600 text-white rounded shadow p-4 text-sm font-bold">
+    ✅ Queue CLEAR — every flag decided. Final zip unlocked:
+    <a href="/download-final" class="underline">🚀 Build &amp; download final zip</a>
+  </div>
+  {% else %}
+  <div class="bg-rose-600 text-white rounded shadow p-3 text-xs">
+    🔒 Final zip locked — {{ counts.blocker + counts.review }} row(s) still open.
+    Sab decide karne ke baad final milega.
+  </div>
+  {% endif %}
+
+  {% for r in rows %}
+  <div class="bg-white rounded shadow p-3 space-y-2 border-l-4 {{ 'border-red-500' if r.severity == 'BLOCKER' else 'border-amber-400' }}">
+    <div class="flex flex-wrap items-center gap-2 text-xs">
+      <span class="font-bold {{ 'text-red-700' if r.severity == 'BLOCKER' else 'text-amber-700' }}">{{ r.severity }}</span>
+      <span class="font-mono">{{ r.q_id or r.chapter_id or '—' }}</span>
+      <span class="bg-gray-200 rounded px-1">{{ r.kind }}</span>
+      <span class="text-gray-500">src: {{ r.source }}</span>
+    </div>
+    <p class="text-xs text-gray-700 whitespace-pre-wrap">{{ r.detail }}</p>
+    {% if r.stale_note %}<p class="text-xs text-orange-600 font-semibold">♻️ {{ r.stale_note }}</p>{% endif %}
+
+    <form method="POST" action="/review-decide" class="flex flex-wrap gap-2 items-center">
+      <input type="hidden" name="flag_key" value="{{ r.flag_key }}">
+      <input type="hidden" name="q_id" value="{{ r.q_id or '' }}">
+      <input name="reason" placeholder="reason (optional)" class="text-xs border rounded px-2 py-1 flex-1">
+      <button name="action" value="approved" class="bg-emerald-600 text-white text-xs px-2 py-1 rounded">✔ Approve</button>
+      <button name="action" value="ignored" class="bg-gray-500 text-white text-xs px-2 py-1 rounded">Skip/ignore</button>
+    </form>
+
+    {% if r.q_id and masters.get(r.q_id) %}
+    {% set m = masters[r.q_id] %}
+    <details class="text-xs bg-gray-50 rounded p-2">
+      <summary class="font-bold cursor-pointer">✏️ Edit content of {{ r.q_id }}</summary>
+      <div class="space-y-2 mt-2">
+        <form method="POST" action="/review/apply-text">
+          <input type="hidden" name="q_id" value="{{ r.q_id }}">
+          <input type="hidden" name="field" value="question_text">
+          <label class="font-semibold">Stem</label>
+          <textarea name="value" class="w-full border rounded p-1" rows="2">{{ m.question.text }}</textarea>
+          <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 w-full">
+          <button class="bg-sky-600 text-white px-2 py-1 rounded mt-1">Save stem</button>
+        </form>
+        {% for o in m.options %}
+        <form method="POST" action="/review/apply-text" class="flex gap-1 items-center">
+          <input type="hidden" name="q_id" value="{{ r.q_id }}">
+          <input type="hidden" name="field" value="option">
+          <input type="hidden" name="option_letter" value="{{ o.id }}">
+          <b>{{ o.id }}.</b>
+          <input name="value" value="{{ o.text }}" class="border rounded px-1 py-0.5 flex-1">
+          <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 w-20">
+          <button class="bg-sky-600 text-white px-2 py-1 rounded whitespace-nowrap">Save {{ o.id }}</button>
+        </form>
+        {% endfor %}
+        <form method="POST" action="/review/apply-text" class="flex gap-2 items-center">
+          <input type="hidden" name="q_id" value="{{ r.q_id }}">
+          <input type="hidden" name="field" value="correct_option">
+          <label class="font-semibold">Answer</label>
+          <select name="value" class="border rounded px-1 py-0.5">
+            {% for L in ['A','B','C','D'] %}
+            <option value="{{ L }}" {% if m.correct_options and m.correct_options[0] == L %}selected{% endif %}>{{ L }}</option>
+            {% endfor %}
+          </select>
+          <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 flex-1">
+          <button class="bg-sky-600 text-white px-2 py-1 rounded">Save answer</button>
+        </form>
+        {% if m.solution.tables %}
+        {% for t in m.solution.tables %}
+        <form method="POST" action="/review/apply-text">
+          <input type="hidden" name="q_id" value="{{ r.q_id }}">
+          <input type="hidden" name="field" value="table">
+          <input type="hidden" name="table_index" value="{{ loop.index0 }}">
+          <label class="font-semibold">Table {{ loop.index }} ({{ t.type }}) — markdown</label>
+          <textarea name="value" class="w-full font-mono border rounded p-1" rows="4">{{ t.markdown }}</textarea>
+          <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 w-full">
+          <button class="bg-sky-600 text-white px-2 py-1 rounded mt-1">Save table {{ loop.index }}</button>
+        </form>
+        {% endfor %}
+        {% endif %}
+        <form method="POST" action="/review/apply-text">
+          <input type="hidden" name="q_id" value="{{ r.q_id }}">
+          <input type="hidden" name="field" value="solution_text">
+          <label class="font-semibold">Solution</label>
+          <textarea name="value" class="w-full border rounded p-1" rows="4">{{ m.solution.text }}</textarea>
+          <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 w-full">
+          <button class="bg-sky-600 text-white px-2 py-1 rounded mt-1">Save solution</button>
+        </form>
+
+        <div class="border-t pt-2 space-y-1">
+          <p class="font-semibold">🖼️ Images</p>
+          {% for side, imgs in [('question', m.question.images), ('solution', m.solution.images)] %}
+          {% for im in imgs %}
+          <form method="POST" action="/review/apply-image" class="flex flex-wrap gap-1 items-center text-[11px]">
+            <input type="hidden" name="q_id" value="{{ r.q_id }}">
+            <input type="hidden" name="file" value="{{ im.file }}">
+            <input type="hidden" name="side" value="{{ side }}">
+            <input type="hidden" name="op" value="">
+            <span class="font-mono break-all">[{{ side }}] {{ im.file }}</span>
+            <button data-op="detach" class="bg-gray-600 text-white px-2 py-0.5 rounded">Detach</button>
+            <input name="to_qid" placeholder="OBG-003-005" class="border rounded px-1 py-0.5 w-28">
+            <button data-op="move" class="bg-amber-600 text-white px-2 py-0.5 rounded">Move→</button>
+            <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 flex-1">
+          </form>
+          {% endfor %}
+          {% endfor %}
+          <form method="POST" action="/review/apply-image" class="flex flex-wrap gap-1 items-center text-[11px]">
+            <input type="hidden" name="q_id" value="{{ r.q_id }}">
+            <input type="hidden" name="op" value="attach">
+            <span>Attach:</span>
+            <input name="file" placeholder="OBG/OBG-p61-999.webp" class="border rounded px-1 py-0.5 flex-1 font-mono">
+            <select name="side" class="border rounded px-1 py-0.5">
+              <option value="solution">solution</option>
+              <option value="question">question</option>
+            </select>
+            <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 w-20">
+            <button class="bg-emerald-600 text-white px-2 py-0.5 rounded">Attach</button>
+          </form>
+        </div>
+      </div>
+    </details>
+    {% endif %}
+  </div>
+  {% endfor %}
+
+  <p class="text-[10px] text-gray-500 text-center pb-6">State lives in data/review_decisions.jsonl + human_edit_ledger.jsonl — refresh/redeploy safe.</p>
+</div>
+<script>
+// one button per row picks the op; avoid two submits fighting
+document.querySelectorAll('button[data-op]').forEach(function(b){
+  b.addEventListener('click', function(ev){
+    ev.preventDefault();
+    var form = ev.target.closest('form');
+    form.querySelector('input[name="op"]').value = ev.target.dataset.op;
+    if (ev.target.dataset.op === 'move' && !form.querySelector('input[name="to_qid"]').value.trim()) {
+      alert('move ke liye to_qid chahiye'); return;
+    }
+    form.submit();
+  });
+});
+</script>
+</body>
+</html>
+"""
+
+
+def _review_context(msg=None, ok=True):
+    """Assemble the page purely from disk (never from memory)."""
+    out = Path(pipeline.OUTPUT_ROOT)
+    q = review_queue.collect_review_queue(out)
+    masters = {}
+    for r in q["rows"]:
+        qid = r.get("q_id")
+        if not qid or qid in masters:
+            continue
+        row = review_queue._find_master_row(out, qid)
+        if row is not None:
+            masters[qid] = row
+    return {"rows": q["rows"], "counts": q["counts"], "warnings": q["warnings"],
+            "clear": q["clear"], "masters": masters, "msg": msg, "ok": ok}
+
+
+@app.route("/review")
+def review_home():
+    msg = request.args.get("msg")
+    ok = request.args.get("ok", "1") == "1"
+    return render_template_string(REVIEW_PAGE, **_review_context(msg, ok))
+
+
+def _review_redirect(result, ok_word="done"):
+    ok = bool(result.get("ok"))
+    msg = (result.get("msg") or ok_word) if ok else \
+        ("FAILED: " + str(result.get("error") or "unknown"))
+    return redirect(url_for("review_home", ok="1" if ok else "0", msg=msg))
+
+
+@app.route("/review-decide", methods=["POST"])
+def review_decide():
+    res = review_queue.record_decision(
+        Path(pipeline.OUTPUT_ROOT),
+        request.form.get("flag_key") or "",
+        request.form.get("action") or "",
+        request.form.get("reason") or "",
+        request.form.get("q_id") or None)
+    return _review_redirect(res, "decision saved")
+
+
+@app.route("/review/apply-text", methods=["POST"])
+def review_apply_text():
+    if state.get("status") == "processing":
+        return _review_redirect(
+            {"ok": False, "error": "extraction chal rahi hai — run khatam hone "
+                                   "ke baad edit karo (freeze rule)"})
+    ti = request.form.get("table_index")
+    res = review_queue.apply_edit(
+        Path(pipeline.OUTPUT_ROOT),
+        request.form.get("q_id") or "",
+        request.form.get("field") or "",
+        request.form.get("value"),
+        reason=request.form.get("reason") or "",
+        option_letter=request.form.get("option_letter") or None,
+        table_index=(int(ti) if ti not in (None, "") else None))
+    if res.get("ok") and not res.get("verified"):
+        res = {"ok": False,
+               "error": "disk read-back verify FAILED — screen me 'saved' "
+                        "dikhana galat hoga; files check karo"}
+    return _review_redirect(res, "saved + verified on disk")
+
+
+@app.route("/review/apply-image", methods=["POST"])
+def review_apply_image():
+    if state.get("status") == "processing":
+        return _review_redirect(
+            {"ok": False, "error": "extraction chal rahi hai — run khatam hone "
+                                   "ke baad edit karo (freeze rule)"})
+    res = review_queue.apply_image_op(
+        Path(pipeline.OUTPUT_ROOT),
+        request.form.get("q_id") or "",
+        request.form.get("op") or "",
+        request.form.get("file") or "",
+        side=request.form.get("side") or "solution",
+        option_letter=request.form.get("option_letter") or None,
+        to_qid=request.form.get("to_qid") or None,
+        reason=request.form.get("reason") or "")
+    return _review_redirect(res, "image op done")
+
+
+@app.route("/download-final")
+def download_final():
+    """Review-gated slim package: split/ + referenced assets + chapters.json +
+    FORMAT.md + REVIEW_RECEIPT.json. REFUSES (423) while any queue row is
+    undecided — a final file is only built after 'sab confirm ho gaya'."""
+    out = Path(pipeline.OUTPUT_ROOT)
+    gate = review_queue.gate_final_zip(out)
+    if gate["locked"]:
+        return (f"🔒 Final zip LOCKED: {gate['why']}. Pehle /review par sab "
+                f"decide karo.", 423)
+    res = review_queue.build_final_zip(out)
+    if not res.get("ok"):
+        return f"final zip build failed: {res}", 500
+    log(f"🚀 FINAL zip built: {res['receipt']['chapters']} chapter(s), "
+        f"{res['receipt']['images_shipped']} image(s), "
+        f"{res['receipt']['human_edits']} human edit(s) -> final_export.zip")
+    return send_file(res["path"], as_attachment=True,
+                     download_name="final_export.zip")
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
