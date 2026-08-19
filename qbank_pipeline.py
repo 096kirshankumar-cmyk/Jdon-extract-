@@ -6568,6 +6568,112 @@ def _ownership_page_map(chapter_id):
     return out
 
 
+# Locked final-name convention written by _rename_for_slot:
+#   {SUBJ}/{SUBJ}-{chap:03d}-{qn:03d}_{Q|SOL|OPT_[A-D]}_{slot:02d}.webp
+_FINAL_IMG_NAME_RE = re.compile(
+    r"^(?P<subj>[^/]+)/(?P=subj)-(?P<chap>\d{3})-(?P<qn>\d{3})_"
+    r"(?P<kind>Q|SOL|OPT_[A-D])_(?P<slotn>\d{2})\.webp$")
+
+
+def _relink_resume_owned_images(chapter_id, subject, chapter_no,
+                                chapter_records, image_files_by_q,
+                                ownership_pages=None):
+    """AUDIT-FIX (OBG-003, 2026-08-19): the RESUME path used to lose images.
+
+    When a chapter is re-run after a pause/crash, its figures are already
+    claimed and renamed under the final convention, so extract_real_images
+    prints "figure bytes already owned on disk -- skipping duplicate
+    extraction" and hands NOTHING to the claimers. The fresh chapter_records
+    then export with EMPTY image lists while the correctly-named files sit on
+    disk -- the chapter's live exports "forget" every figure an earlier run
+    owned (proven live: OBG ch3 q3-q11 all exported empty solution_images
+    after the quota-paused run was resumed).
+
+    The ownership ledger is append-only and survives the restart, so the
+    previous run's claim rows are still on disk with full provenance. This
+    re-attaches them -- EVIDENCE ONLY, no position/filename guessing:
+      1. ledger row for THIS chapter with outcome claimed|shared,
+      2. final_file matches the locked naming convention for THIS chapter,
+      3. the file truly exists under ASSETS_DIR/questions/,
+      4. the owner question still exists in this run's chapter_records
+         (a claim whose record was later reconciled away is skipped and
+         LOUDLY noted -- it is a stale claim, not attachable evidence).
+    Owner and slot come from the ledger row (never re-derived), so a
+    multi-draw "shared" row re-attaches to BOTH owners exactly as claimed.
+    On a non-resume run every row here is already present in
+    image_files_by_q (added by _rename_for_slot in memory), so this is a
+    no-op. Mutates image_files_by_q (and ownership_pages) in place; returns
+    the list of relink notes for logging."""
+    notes = []
+    path = DATA_DIR / "image_ownership.jsonl"
+    if not path.exists():
+        return notes
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return notes
+    seen = set()
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("chapter_id") != chapter_id:
+            continue
+        if row.get("outcome") not in ("claimed", "shared"):
+            continue
+        final_rel = row.get("final_file") or ""
+        m = _FINAL_IMG_NAME_RE.match(final_rel)
+        if not m or m.group("subj") != subject:
+            continue
+        if int(m.group("chap")) != int(chapter_no):
+            continue
+        owner = row.get("owner") or ""
+        try:
+            qn = int(owner.rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if chapter_records is not None and qn not in chapter_records:
+            print(f"  [IMG] resume-relink skipped: ledger row {final_rel} -> "
+                  f"{owner}, but that question is not in this run's records "
+                  f"(stale claim; left for review, never re-attached blind)")
+            continue
+        if not (ASSETS_DIR / "questions" / final_rel).exists():
+            continue
+        entry = image_files_by_q.setdefault(
+            qn, {"question": [], "solution": []})
+        kind = m.group("kind")
+        if kind == "SOL":
+            slot_list = entry.setdefault("solution", [])
+        elif kind == "Q":
+            slot_list = entry.setdefault("question", [])
+        else:
+            slot_list = entry.setdefault("option", {}).setdefault(kind[-1], [])
+        key = (qn, final_rel)
+        if key in seen or final_rel in slot_list:
+            continue
+        seen.add(key)
+        slot_list.append(final_rel)
+        slot_list.sort()  # _01, _02, ... slot order is deterministic
+        if ownership_pages is not None and row.get("page") is not None:
+            ownership_pages.setdefault(final_rel, row.get("page"))
+        notes.append({"q_no": qn, "kind": kind, "file": final_rel,
+                      "method": row.get("method"), "page": row.get("page"),
+                      "outcome": row.get("outcome"),
+                      "owner_seen": owner})
+    for n in notes:
+        print(f"  [IMG] resume-relink: {n['file']} -> q{n['q_no']} "
+              f"({n['kind']}) restored from prior run's ledger claim "
+              f"({n['outcome']} via {n['method']}, page {n['page']})")
+    if notes:
+        print(f"  [IMG] resume-relink: {len(notes)} prior-run claim(s) "
+              f"restored for {chapter_id} (evidence: ownership ledger + "
+              f"locked file names, zero guessing)")
+    return notes
+
+
 def claim_block_images_ocr(imgs, pdf_path, file_page, subject, chapter_no,
                            chapter_records, image_files_by_q, chapter_id=None,
                            active_block=None, dpi=150, section=None):
@@ -9180,6 +9286,16 @@ def process_pdf(pdf_cfg, state, genai_model, chapters_out, questions_path,
                   f"figure-page checks skip this chapter (conservative)")
             chapter_anchor_idx = None
         ownership_pages = _ownership_page_map(chapter_id)
+        # RESUME-RELINK: restore any figures a previous (crashed/paused) run
+        # of THIS chapter claimed and renamed. Their extraction is skipped on
+        # resume ("bytes already owned on disk"), so without this the fresh
+        # records export image-less. Ledger-backed only; no-op on live runs.
+        relink_notes = _relink_resume_owned_images(
+            chapter_id, subject, ch["chapter_no"], chapter_records,
+            image_files_by_q, ownership_pages)
+        if relink_notes:
+            stats["resume_image_relinks"] = (stats.get("resume_image_relinks", 0)
+                                             + len(relink_notes))
         violations = _export_gate_violations(chapter_records, image_files_by_q,
                                              unresolved_ledger, chapter_id,
                                              chapter_unresolved_images, orphans,
