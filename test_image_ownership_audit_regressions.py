@@ -18,7 +18,7 @@ import random
 import unittest
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent
+REPO = Path("/home/user/repo")
 sys.path.insert(0, str(REPO))
 
 _TMP = Path(tempfile.mkdtemp(prefix="auditfix_env_"))
@@ -625,6 +625,77 @@ class TestQAStatusRollup(AuditEnv):
                          "the mismatch is NEVER auto-corrected")
         self.assertEqual(row["qa_status"], "REVIEW_NEEDED")
         self.assertTrue(any("answer_suspect" in r for r in row["qa_reasons"]))
+
+
+
+
+# ============================================================================
+# MULTI-DRAW SHARING (OBGYN ed8 p54/p63 user report): one image object drawn
+# twice on a page (a continuation copy + a copy under the next printed
+# heading) must attach BOTH usages -- not silently keep only the last one.
+# ============================================================================
+class TestMultiDrawSharing(AuditEnv):
+    def _pdf_two_draws(self, path):
+        from pypdf import PdfWriter
+        from pypdf.generic import (DecodedStreamObject, NameObject,
+                                   NumberObject, DictionaryObject)
+        import random as _r
+        w = PdfWriter()
+        page = w.add_blank_page(width=612, height=792)
+        rnd = _r.Random(7)
+        raw = bytes(rnd.getrandbits(8) for _ in range(110 * 110 * 3))
+        img = DecodedStreamObject(); img.set_data(raw)
+        img.update({NameObject("/Type"): NameObject("/XObject"),
+                    NameObject("/Subtype"): NameObject("/Image"),
+                    NameObject("/Width"): NumberObject(110),
+                    NameObject("/Height"): NumberObject(110),
+                    NameObject("/ColorSpace"): NameObject("/DeviceRGB"),
+                    NameObject("/BitsPerComponent"): NumberObject(8)})
+        ref = w._add_object(img)
+        content = DecodedStreamObject()
+        content.set_data(
+            b"BT /F1 14 Tf 162 740 Td (Question 12:) Tj ET\n"
+            b"q 220 0 0 110 196 500 cm /Im1 Do Q\n"
+            b"BT /F1 14 Tf 162 400 Td (Question 13:) Tj ET\n"
+            b"q 220 0 0 110 196 150 cm /Im1 Do Q\n")
+        cref = w._add_object(content)
+        page[NameObject("/Contents")] = cref
+        page[NameObject("/Resources")] = DictionaryObject({
+            NameObject("/XObject"): DictionaryObject({NameObject("/Im1"): ref}),
+            NameObject("/Font"): DictionaryObject({NameObject("/F1"): DictionaryObject({
+                NameObject("/Type"): NameObject("/Font"),
+                NameObject("/Subtype"): NameObject("/Type1"),
+                NameObject("/BaseFont"): NameObject("/Helvetica")})})})
+        with open(path, "wb") as fh:
+            w.write(fh)
+
+    def test_both_printings_are_owned(self):
+        pdf = self.root / "dup.pdf"
+        self._pdf_two_draws(pdf)
+        saved = qp.extract_real_images(str(pdf), 1, frozenset(), SUBJECT,
+                                       qp.ASSETS_DIR / "questions")
+        self.assertEqual(len(saved), 1,
+                         "same object on one page = one extracted file")
+        pos = qp._image_positions_raw(str(pdf), 1)
+        alias = [k for k in pos if isinstance(k, str) and "@d" in k]
+        self.assertTrue(alias, "extra draws must surface as alias keys")
+
+        recs = {12: _full_rec(12), 13: _full_rec(13)}
+        by_q = {}
+        leftover = qp.claim_page_images(saved, str(pdf), 1, SUBJECT, CH_NO,
+                                        recs, by_q, active_block=None)
+        self.assertEqual(leftover, [])
+        q12 = (by_q.get(12) or {}).get("question", [])
+        q13 = (by_q.get(13) or {}).get("question", [])
+        self.assertTrue(q12 and q13, f"both owners must hold the shared ref: "
+                                     f"q12={q12} q13={q13}")
+        self.assertEqual(q12[0], q13[0],
+                         "sharing = same file reference under both owners")
+        outs = [r["outcome"] for r in self.ledger()]
+        self.assertIn("claimed", outs)
+        self.assertIn("shared", outs)
+        self.assertTrue(any(r["method"] == "multi_draw_geometry"
+                            for r in self.ledger()))
 
 
 if __name__ == "__main__":
