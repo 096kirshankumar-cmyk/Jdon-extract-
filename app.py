@@ -1417,6 +1417,28 @@ REVIEW_PAGE = """
         </form>
         {% endfor %}
         {% endif %}
+        {% for t in (m.question.tables or []) %}
+        <form method="POST" action="/review/apply-text">
+          <input type="hidden" name="q_id" value="{{ r.q_id }}">
+          <input type="hidden" name="field" value="table_q">
+          <input type="hidden" name="table_index" value="{{ loop.index0 }}">
+          <label class="font-semibold">Question table {{ loop.index }} ({{ t.type }}) — markdown</label>
+          <textarea name="value" class="w-full font-mono border rounded p-1" rows="4">{{ t.markdown }}</textarea>
+          <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 w-full">
+          <button class="bg-sky-600 text-white px-2 py-1 rounded mt-1">Save Q-table {{ loop.index }}</button>
+        </form>
+        {% endfor %}
+        {% for side_field, side_label, side_tabs in [('table', 'solution', (m.solution.tables or [])), ('table_q', 'question', (m.question.tables or []))] %}
+        <form method="POST" action="/review/apply-text" class="border-t pt-1">
+          <input type="hidden" name="q_id" value="{{ r.q_id }}">
+          <input type="hidden" name="field" value="{{ side_field }}">
+          <input type="hidden" name="table_index" value="{{ side_tabs|length }}">
+          <label class="font-semibold text-[11px]">➕ Add new {{ side_label }} table (slot {{ side_tabs|length }}; uneven columns refused)</label>
+          <textarea name="value" placeholder="| col | col |&#10;|---|---|&#10;| 1 | 2 |" class="w-full font-mono border rounded p-1" rows="3"></textarea>
+          <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 w-full">
+          <button class="bg-emerald-600 text-white px-2 py-1 rounded mt-1">Add {{ side_label }} table</button>
+        </form>
+        {% endfor %}
         <form method="POST" action="/review/apply-text">
           <input type="hidden" name="q_id" value="{{ r.q_id }}">
           <input type="hidden" name="field" value="solution_text">

@@ -71,7 +71,8 @@ class QEnv(unittest.TestCase):
                              "images": list(o["images"])}
                             for o in m["options"]],
                 "question_images": list(m["question"]["images"]),
-                "tables": [], "source_pages": m["source_pages"],
+                "tables": [dict(t) for t in m["question"].get("tables", [])],
+                "source_pages": m["source_pages"],
                 "extraction_status": "COMPLETE"}
 
     def _split_a(self, m):
@@ -84,7 +85,8 @@ class QEnv(unittest.TestCase):
     def _split_s(self, m):
         return {"q_id": m["id"], "chapter_id": CH, "subject": SUB,
                 "chapter_no": 3, "q_no": int(m["id"].rsplit("-", 1)[1]),
-                "solution_text": m["solution"]["text"], "tables": [],
+                "solution_text": m["solution"]["text"],
+                "tables": [dict(t) for t in m["solution"].get("tables", [])],
                 "solution_images": list(m["solution"]["images"]),
                 "source_pages": m["source_pages"],
                 "extraction_status": "COMPLETE"}
@@ -257,6 +259,30 @@ class TestTextEdits(QEnv):
     def test_bad_answer_letter_refused(self):
         res = rq.apply_edit(self.root, f"{CH}-001", "correct_option", "E")
         self.assertFalse(res["ok"])
+
+    def test_table_append_slot_creates_and_verifies(self):
+        """A row with NO tables: table_index 0 (== len) creates the slot;
+        disk read-back must prove master AND split show it."""
+        res = rq.apply_edit(self.root, f"{CH}-001", "table",
+                            "| x | y |\n|---|---|\n| 1 | 2 |", table_index=0)
+        self.assertTrue(res["ok"] and res["verified"], res)
+        m = rq._find_master_row(self.root, f"{CH}-001")
+        self.assertEqual(m["solution"]["tables"][0]["type"], "human_added")
+        # a gap beyond the append slot is refused
+        res2 = rq.apply_edit(self.root, f"{CH}-001", "table",
+                             "| x | y |\n|---|---|\n| 1 | 2 |", table_index=5)
+        self.assertFalse(res2["ok"])
+        self.assertIn("append slot", res2["error"])
+
+    def test_question_side_table_edit(self):
+        self.masters[0]["question"]["tables"] = [
+            {"type": "qt", "markdown": "| a |\n|---|\n| 1 |"}]
+        self._write_masters(self.masters); self._write_split()
+        res = rq.apply_edit(self.root, f"{CH}-001", "table_q",
+                            "| a |\n|---|\n| 9 |", table_index=0)
+        self.assertTrue(res["ok"] and res["verified"], res)
+        m = rq._find_master_row(self.root, f"{CH}-001")
+        self.assertEqual(m["question"]["tables"][0]["markdown"], "| a |\n|---|\n| 9 |")
 
 
 class TestImageOps(QEnv):

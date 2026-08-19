@@ -427,6 +427,30 @@ FIELD_PATHS = {
     "correct_option": (("correct_options",), "split_a", ("correct_option",)),
 }
 
+# table = solution-side tables, table_q = question-side tables. Appending a
+# NEW table is allowed at table_index == len(tables) (slot is created as
+# type "human_added" then filled); any larger gap is refused.
+
+
+def _table_target(row, field):
+    holder = row.setdefault("question" if field == "table_q" else "solution", {})
+    return holder.setdefault("tables", [])
+
+
+def _table_write(tabs, table_index, value, create):
+    """Set tabs[table_index].markdown = value. create=True allows the append
+    slot (index == len). Returns error string or None."""
+    if table_index is None:
+        return "table index missing"
+    table_index = int(table_index)
+    if table_index == len(tabs) and create:
+        tabs.append({"type": "human_added", "markdown": ""})
+    if not (0 <= table_index < len(tabs)):
+        return ("table index out of range (have %d, next append slot is %d)"
+                % (len(tabs), len(tabs)))
+    tabs[table_index]["markdown"] = value
+    return None
+
 
 def apply_edit(output_root, q_id: str, field: str, value, reason: str = "",
                option_letter: str = None, table_index: int = None) -> dict:
@@ -448,10 +472,43 @@ def apply_edit(output_root, q_id: str, field: str, value, reason: str = "",
         option_letter = (option_letter or "").strip().upper()
         if option_letter not in ("A", "B", "C", "D"):
             return {"ok": False, "error": "option letter must be A-D"}
-    if field == "table":
+    if field in ("table", "table_q"):
         err = _table_md_error(str(value or ""))
         if err:
             return {"ok": False, "error": err}
+
+    # ---- PRE-FLIGHT for table edits: never a half-written edit --------------
+    # apply_to_* may raise inside the write loop; every copy must therefore
+    # be checked BEFORE the first file is touched, and all copies must agree
+    # on the table count (append slot == len for ALL, or index < len for ALL).
+    if field in ("table", "table_q"):
+        side_key = "question" if field == "table_q" else "solution"
+        lens = []
+        row0 = _find_master_row(out_root, q_id)
+        if row0 is not None:
+            lens.append(len((row0.get(side_key) or {}).get("tables") or []))
+        for name in ("subjects", "chapter_file"):
+            p = files.get(name)
+            if p and p.exists():
+                for r in _read_jsonl(p):
+                    if r.get("id") == q_id:
+                        lens.append(len((r.get(side_key) or {}).get("tables") or []))
+        sp = files["split_s" if field == "table" else "split_q"]
+        if sp.exists():
+            for r in _read_jsonl(sp):
+                if r.get("q_id") == q_id:
+                    lens.append(len(r.get("tables") or []))
+        if table_index is None:
+            return {"ok": False, "error": "table index missing"}
+        if not lens:
+            return {"ok": False, "error": f"row {q_id} not found in any output file"}
+        if len(set(lens)) != 1:
+            return {"ok": False, "error": f"copies diverge on table count "
+                    f"({lens}) -- manual check, refusing partial write"}
+        have = lens[0]
+        if not (0 <= int(table_index) <= have):
+            return {"ok": False, "error": f"table index out of range (have "
+                    f"{have}, next append slot is {have})"}
 
     # ---- what to write where --------------------------------------------------
     def apply_to_master(row):
@@ -465,11 +522,11 @@ def apply_edit(output_root, q_id: str, field: str, value, reason: str = "",
             for o in row.get("options") or []:
                 if o.get("id") == option_letter:
                     o["text"] = value
-        elif field == "table":
-            tabs = (row.setdefault("solution", {})).setdefault("tables", [])
-            if table_index is None or not (0 <= int(table_index) < len(tabs)):
-                raise ValueError("table index out of range")
-            tabs[int(table_index)]["markdown"] = value
+        elif field in ("table", "table_q"):
+            err = _table_write(_table_target(row, field), table_index, value,
+                               create=True)
+            if err:
+                raise ValueError(err)
         row["qa_human_edit"] = True
 
     def apply_to_split(rows, split_kind):
@@ -485,10 +542,15 @@ def apply_edit(output_root, q_id: str, field: str, value, reason: str = "",
             elif split_kind == "split_s" and field == "solution_text":
                 r["solution_text"] = value
             elif split_kind == "split_s" and field == "table":
-                tabs = r.setdefault("tables", [])
-                if table_index is None or not (0 <= int(table_index) < len(tabs)):
-                    raise ValueError("table index out of range")
-                tabs[int(table_index)]["markdown"] = value
+                err = _table_write(r.setdefault("tables", []), table_index,
+                                   value, create=True)
+                if err:
+                    raise ValueError(err)
+            elif split_kind == "split_q" and field == "table_q":
+                err = _table_write(r.setdefault("tables", []), table_index,
+                                   value, create=True)
+                if err:
+                    raise ValueError(err)
             elif split_kind == "split_a" and field == "correct_option":
                 r["correct_option"] = value
         return rows
@@ -500,6 +562,8 @@ def apply_edit(output_root, q_id: str, field: str, value, reason: str = "",
         targets.append(split_kind)
     elif field == "table":
         targets.append("split_s")
+    elif field == "table_q":
+        targets.append("split_q")
 
     # ---- load, modify, write, per file ---------------------------------------
     changed = []
@@ -580,6 +644,14 @@ def _verify_edit(out_root, q_id, field, value, option_letter=None,
         m = (isinstance(table_index, int) and 0 <= table_index < len(tabs)
              and tabs[table_index].get("markdown") == value)
         stabs = (split_row("split_s") or {}).get("tables") or []
+        s = (isinstance(table_index, int) and 0 <= table_index < len(stabs)
+             and stabs[table_index].get("markdown") == value)
+        return m and s
+    if field == "table_q":
+        tabs = (row.get("question") or {}).get("tables") or []
+        m = (isinstance(table_index, int) and 0 <= table_index < len(tabs)
+             and tabs[table_index].get("markdown") == value)
+        stabs = (split_row("split_q") or {}).get("tables") or []
         s = (isinstance(table_index, int) and 0 <= table_index < len(stabs)
              and stabs[table_index].get("markdown") == value)
         return m and s
