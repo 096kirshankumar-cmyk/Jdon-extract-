@@ -1,0 +1,985 @@
+#!/usr/bin/env python3
+"""review_queue.py — the manual-review engine for the QBank pipeline.
+
+DESIGN CONTRACT (user-signed-off, 2026-08-19)
+===========================================
+1. PIPELINE FREEZES CONTENT after extraction. Only a human edits, via here.
+2. The review queue is the UNION of EVERY known flag source — never just the
+   digest, never just completeness. A flag written to any file MUST surface.
+3. Catch-all: validator-reported flags per chapter are unioned in too, so a
+   kind nobody mapped still shows up. Unknown flag *.jsonl files raise a
+   watchdog warning row instead of being silently skipped.
+4. Every decision (edit/approve/ignore) is persisted to disk in append-only
+   ledgers IMMEDIATELY. The browser holds no state; refresh/redeploy/resume
+   from any device returns the same queue. If the underlying row content
+   changed since the decision (pipeline re-ran the chapter), the decision is
+   marked STALE and the flag returns to the queue — safe direction only.
+5. Edits update EVERY copy of the field atomically (master, subjects bundle,
+   chapter file, split rows, image manifest) and then are READ BACK from disk
+   and verified. The screen only says "saved" when the disk says so.
+6. The final zip is GATED: it refuses to build while any queue row is open.
+7. Images: never deleted by UI (detach only unlinks). Owner moves rename the
+   file to the new slot and append a provenance row to image_ownership.jsonl
+   with method="human_edit" so the gate chain never breaks. A multi-draw
+   shared file cannot be blindly moved (would break the other owner) — the op
+   refuses with a clear message.
+8. This module NEVER calls Gemini. Zero tokens, offline, idempotent.
+"""
+
+import hashlib
+import json
+import re
+import time
+import zipfile
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# 1. FLAG SOURCE REGISTRY — every known place a problem can be recorded.
+#    If a new flag file is ever added to the pipeline and not registered here,
+#    WATCHDOG (below) raises it instead of letting it slip.
+# ---------------------------------------------------------------------------
+
+FLAG_SOURCES = {
+    # filename -> how to read it
+    "export_gate.jsonl": "rows: chapter_id/q_no/kind/detail (gate violations)",
+    "export_gate_advisory.jsonl": "rows: advisory gate notes",
+    "integrity_flags.jsonl": "rows: answer-key disagreements etc.",
+    "orphans.jsonl": "rows: unclaimed fragments (chapter_id, batch_start, ...)",
+    "still_incomplete_after_retry.jsonl": "rows: gaps retry could not close",
+    "stem_conflicts.jsonl": "rows: stem text conflicts",
+    "unmatched_images.jsonl": "rows: extracted images with no owner",
+}
+
+# data/ jsonl files that are NOT flags (core state; expected)
+CORE_DATA_FILES = {
+    "questions.jsonl", "image_ownership.jsonl", "page_ledger.jsonl",
+    "integrity_flags.jsonl", "chapters.json", "export_gate.jsonl",
+    "export_gate_advisory.jsonl", "orphans.jsonl",
+    "still_incomplete_after_retry.jsonl", "stem_conflicts.jsonl",
+    "unmatched_images.jsonl", "human_edit_ledger.jsonl",
+    "review_decisions.jsonl",
+} | set(FLAG_SOURCES)
+
+BLOCKER_KINDS = {
+    "answer_key_disagrees",     # printed key contradicts extracted answer
+    "unresolved_qid",           # record could not be anchored
+    "incomplete_records",       # completeness.json says records missing
+}
+
+HUMAN_EDIT_LEDGER = "human_edit_ledger.jsonl"
+REVIEW_DECISIONS = "review_decisions.jsonl"
+
+_RE_FLAGS_KNOWN_FILE = re.compile(r"\.jsonl$")
+
+
+# ---------------------------------------------------------------------------
+# Small IO helpers (atomic, append-safe, read-back friendly)
+# ---------------------------------------------------------------------------
+
+def _read_jsonl(path: Path):
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                out.append({"_unparseable": line[:120]})
+    return out
+
+
+def _write_jsonl_atomic(path: Path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows)
+                   + ("\n" if rows else ""), encoding="utf-8")
+    tmp.replace(path)  # os.replace semantics: never a half-written file
+
+
+def _append_jsonl(path: Path, row):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# ---------------------------------------------------------------------------
+# 2. Queue construction — UNION of all sources + dedupe + decisions overlay
+# ---------------------------------------------------------------------------
+
+def _mk_flag(kind, severity, detail, source, chapter_id=None, q_id=None,
+             q_no=None, subject=None, extra=None):
+    flag = {
+        "kind": kind, "severity": severity, "detail": str(detail)[:400],
+        "source": source, "chapter_id": chapter_id, "q_id": q_id,
+        "q_no": q_no, "subject": subject,
+    }
+    if extra:
+        flag.update(extra)
+    flag["flag_key"] = decision_key(flag)
+    return flag
+
+
+def decision_key(flag) -> str:
+    """Stable identity of a flag across runs: kind + who + a pinch of detail.
+    Detail digest is short on purpose — cosmetic rewording shouldn't resurrect
+    a decided flag, but a different problem on the same row must."""
+    raw = "|".join(str(x or "") for x in (
+        flag.get("kind"), flag.get("q_id") or "", flag.get("chapter_id") or "",
+        flag.get("source") or ""))
+    det = hashlib.sha1(str(flag.get("detail", "")).encode()).hexdigest()[:8]
+    return hashlib.sha1((raw + "|" + det).encode()).hexdigest()[:16]
+
+
+def _chapter_from_qid(q_id):
+    """OBG-003-016 -> OBG-003"""
+    parts = (q_id or "").split("-")
+    return "-".join(parts[:2]) if len(parts) >= 3 else None
+
+
+def _qn_from_qid(q_id):
+    try:
+        return int((q_id or "").rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def collect_review_queue(output_root) -> dict:
+    """Read EVERYTHING and return the normalized queue. See contract 2/3."""
+    out_root = Path(output_root)
+    data = out_root / "data"
+    rows = []
+    warnings = []
+
+    # -- A. subject bundle rows: qa_status drives the primary row flags ------
+    masters = _read_jsonl(data / "questions.jsonl")
+    by_id = {}
+    for r in masters:
+        rid = r.get("id")
+        if rid:
+            by_id[rid] = r
+        st = r.get("qa_status")
+        if st == "INCOMPLETE":
+            rows.append(_mk_flag(
+                "incomplete", "BLOCKER",
+                "; ".join(r.get("qa_reasons") or []) or "structural fields missing",
+                "qa_status", chapter_id=r.get("chapter_id"), q_id=rid,
+                q_no=_qn_from_qid(rid), subject=r.get("subject")))
+        elif st == "REVIEW_NEEDED":
+            rows.append(_mk_flag(
+                "review_needed", "REVIEW",
+                "; ".join(r.get("qa_reasons") or []) or "qa review requested",
+                "qa_status", chapter_id=r.get("chapter_id"), q_id=rid,
+                q_no=_qn_from_qid(rid), subject=r.get("subject")))
+
+    # -- B. every registered flag file ---------------------------------------
+    for fname, _desc in FLAG_SOURCES.items():
+        path = data / fname
+        for frow in _read_jsonl(path):
+            kind = frow.get("kind") or fname.replace(".jsonl", "")
+            qn = frow.get("q_no")
+            cid = frow.get("chapter_id")
+            q_id = f"{cid}-{int(qn):03d}" if (cid and isinstance(qn, int)) else frow.get("q_id")
+            sev = "BLOCKER" if kind in BLOCKER_KINDS else "REVIEW"
+            detail = frow.get("detail") or json.dumps(
+                {k: v for k, v in frow.items()
+                 if k not in ("kind", "q_no", "chapter_id", "ts")},
+                ensure_ascii=False, default=str)
+            rows.append(_mk_flag(
+                kind, sev, detail, fname, chapter_id=cid, q_id=q_id,
+                q_no=qn if isinstance(qn, int) else _qn_from_qid(q_id or ""),
+                subject=(q_id or "").split("-")[0] if q_id else None))
+
+    # -- C. per-chapter split-layer completeness / unresolved ------------------
+    split_root = out_root / "split"
+    if split_root.exists():
+        for comp in sorted(split_root.glob("*/*/chapter_completeness.json")):
+            try:
+                c = json.loads(comp.read_text())
+            except Exception:
+                continue
+            cid = c.get("chapter_id")
+            inc = sum(int(c.get(k) or 0) for k in (
+                "incomplete_questions", "incomplete_answers", "incomplete_solutions"))
+            if inc:
+                rows.append(_mk_flag(
+                    "incomplete_records", "BLOCKER",
+                    f"{inc} split record(s) INCOMPLETE "
+                    f"(Q{c.get('incomplete_questions')}/A{c.get('incomplete_answers')}"
+                    f"/S{c.get('incomplete_solutions')})",
+                    "chapter_completeness", chapter_id=cid))
+            if int(c.get("unresolved_qid_count") or 0):
+                rows.append(_mk_flag(
+                    "unresolved_qid", "BLOCKER",
+                    f"unresolved q_nos: {c.get('unresolved_qid_q_nos')}",
+                    "chapter_completeness", chapter_id=cid))
+            if int(c.get("orphan_count") or 0):
+                rows.append(_mk_flag(
+                    "orphan_unresolved", "REVIEW",
+                    f"{c['orphan_count']} unclaimed fragment(s) — see orphans.jsonl",
+                    "chapter_completeness", chapter_id=cid))
+
+    # -- D. validator mega-aggregate (CATCH-ALL): any flag the validator
+    #       computed is surfaced, even if no mapping above understood it.
+    #       This is the "no flag may slip" guarantee, contract 2.
+    vrep_path = data / "validation_report.json"
+    surfaced_keys = {r["flag_key"] for r in rows}
+    if vrep_path.exists():
+        try:
+            vrep = json.loads(vrep_path.read_text())
+        except Exception:
+            vrep = {}
+        for chap, flags in (vrep.get("chapters") or {}).items():
+            for f in (flags or []):
+                kind = f.get("kind") or "validator"
+                qn = f.get("q_no")
+                q_id = f"{chap}-{int(qn):03d}" if isinstance(qn, int) else None
+                sev = ("BLOCKER" if kind in BLOCKER_KINDS else "REVIEW")
+                detail = f.get("detail") or json.dumps(
+                    {k: v for k, v in f.items() if k not in ("kind", "q_no")},
+                    ensure_ascii=False, default=str)
+                row = _mk_flag(kind, sev, detail, "validation_report",
+                               chapter_id=chap, q_id=q_id,
+                               q_no=qn if isinstance(qn, int) else None,
+                               subject=chap.split("-")[0] if chap else None)
+                if row["flag_key"] not in surfaced_keys:
+                    surfaced_keys.add(row["flag_key"])
+                    rows.append(row)
+
+    # -- E. WATCHDOG: a flag-file we don't know must never be silent ----------
+    if data.exists():
+        for p in sorted(data.glob("*.jsonl")):
+            if p.name not in CORE_DATA_FILES:
+                warnings.append(
+                    f"unknown flag file '{p.name}' exists in data/ but is not "
+                    f"registered in review_queue.FLAG_SOURCES — its rows are "
+                    f"NOT in this queue; check it manually and register it")
+                rows.append(_mk_flag(
+                    "watchdog_unregistered_file", "BLOCKER", warnings[-1],
+                    p.name))
+
+    # -- F. decisions overlay: close decided flags, resurrect stale ones ------
+    decisions = _load_decisions(out_root)
+    latest = {}
+    for d in decisions:
+        latest[d["flag_key"]] = d            # append-only log; last wins
+    open_rows, done = [], 0
+    for r in rows:
+        d = latest.get(r["flag_key"])
+        if not d:
+            r["state"] = "open"
+            open_rows.append(r)
+            continue
+        sig = _row_current_signature(out_root, r)
+        if sig is not None and d.get("content_sig") and sig != d["content_sig"]:
+            r["state"] = "open"
+            r["stale_note"] = ("previously " + d["action"] + " but the row "
+                               "content changed since — decide again")
+            open_rows.append(r)
+        else:
+            r["state"] = d["action"]
+            done += 1
+
+    order = {"BLOCKER": 0, "REVIEW": 1}
+    open_rows.sort(key=lambda r: (order.get(r["severity"], 2),
+                                  str(r.get("chapter_id") or ""),
+                                  r.get("q_no") or 0, r["kind"]))
+    return {
+        "rows": open_rows,
+        "counts": {
+            "blocker": sum(1 for r in open_rows if r["severity"] == "BLOCKER"),
+            "review": sum(1 for r in open_rows if r["severity"] == "REVIEW"),
+            "resolved": done,
+        },
+        "warnings": warnings,
+        "clear": not open_rows,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 3. Decisions & content signatures (refresh-proof, stale-aware)
+# ---------------------------------------------------------------------------
+
+def _row_current_signature(out_root: Path, flag: dict):
+    q_id = flag.get("q_id")
+    if not q_id:
+        return None
+    row = _find_master_row(out_root, q_id)
+    if row is None:
+        return None
+    return _row_signature(row)
+
+
+def _row_signature(row: dict) -> str:
+    q = row.get("question") or {}
+    s = row.get("solution") or {}
+    blob = "|".join([
+        str(q.get("text") or ""),
+        "|".join(str(o.get("text") or "") for o in (row.get("options") or [])),
+        "|".join(row.get("correct_options") or []),
+        str(s.get("text") or ""),
+        "|".join(i.get("file", "") for i in (q.get("images") or [])),
+        "|".join(i.get("file", "") for i in (s.get("images") or [])),
+    ])
+    return hashlib.sha1(blob.encode()).hexdigest()[:16]
+
+
+def _load_decisions(out_root: Path):
+    return _read_jsonl(out_root / "data" / REVIEW_DECISIONS)
+
+
+def record_decision(output_root, flag_key: str, action: str, reason: str = "",
+                    q_id: str = None) -> dict:
+    """action: approved | ignored | resolved | edited. Persist FIRST; the
+    caller re-reads the queue afterwards (never trust memory)."""
+    if action not in ("approved", "ignored", "resolved", "edited"):
+        return {"ok": False, "error": f"bad action {action!r}"}
+    out_root = Path(output_root)
+    sig = None
+    if q_id:
+        row = _find_master_row(out_root, q_id)
+        if row is not None:
+            sig = _row_signature(row)
+    entry = {"flag_key": flag_key, "action": action, "reason": reason or "",
+             "q_id": q_id, "content_sig": sig, "ts": _now()}
+    _append_jsonl(out_root / "data" / REVIEW_DECISIONS, entry)
+    return {"ok": True, "entry": entry}
+
+
+# ---------------------------------------------------------------------------
+# 4. Row location + atomic multi-copy field updates
+# ---------------------------------------------------------------------------
+
+def _copies(output_root, q_id: str):
+    """Every file that carries this row's content. Master bundle, subjects
+    view, per-chapter file, and the three split files."""
+    out_root = Path(output_root)
+    subject, chap = None, None
+    parts = q_id.split("-")
+    if len(parts) >= 3:
+        subject = parts[0]
+        chap = f"{parts[0]}-{parts[1]}"
+    files = {"master": out_root / "data" / "questions.jsonl"}
+    if subject:
+        files["subjects"] = out_root / "subjects" / subject / "questions.jsonl"
+    if chap:
+        files["chapter_file"] = out_root / "subjects" / subject / "chapters" / f"{chap}.jsonl"
+        ch_dir = out_root / "split" / subject / chap
+        files["split_q"] = ch_dir / "questions.jsonl"
+        files["split_a"] = ch_dir / "answers.jsonl"
+        files["split_s"] = ch_dir / "solutions.jsonl"
+        files["manifest"] = ch_dir / "image_manifest.jsonl"
+    return subject, chap, files
+
+
+def _find_master_row(output_root, q_id: str):
+    for r in _read_jsonl(Path(output_root) / "data" / "questions.jsonl"):
+        if r.get("id") == q_id:
+            return r
+    return None
+
+
+def _json_path_get(row, path):
+    """path like ('question','text') or ('options','A','text')"""
+    cur = row
+    for p in path:
+        if isinstance(cur, list):
+            cur = next((o for o in cur if str(o.get("id")) == str(p)), None)
+        elif isinstance(cur, dict):
+            cur = cur.get(p)
+        else:
+            return None
+        if cur is None:
+            return None
+    return cur
+
+
+def _json_path_set(row, path, value):
+    cur = row
+    for p in path[:-1]:
+        if isinstance(cur, list):
+            cur = next((o for o in cur if str(o.get("id")) == str(p)), None)
+        else:
+            cur = cur.get(p) if isinstance(cur, dict) else None
+        if cur is None:
+            return False
+    last = path[-1]
+    if isinstance(cur, list):
+        tgt = next((o for o in cur if str(o.get("id")) == str(last)), None)
+        if tgt is None:
+            return False
+        return True  # list target handled by caller w/ leaf key
+    if isinstance(cur, dict):
+        cur[last] = value
+        return True
+    return False
+
+
+FIELD_PATHS = {
+    # logical field -> (master bundle path, split file, split path)
+    "question_text": (("question", "text"), "split_q", ("question_text",)),
+    "solution_text": (("solution", "text"), "split_s", ("solution_text",)),
+    "correct_option": (("correct_options",), "split_a", ("correct_option",)),
+}
+
+# table = solution-side tables, table_q = question-side tables. Appending a
+# NEW table is allowed at table_index == len(tables) (slot is created as
+# type "human_added" then filled); any larger gap is refused.
+
+
+def _table_target(row, field):
+    holder = row.setdefault("question" if field == "table_q" else "solution", {})
+    return holder.setdefault("tables", [])
+
+
+def _table_write(tabs, table_index, value, create):
+    """Set tabs[table_index].markdown = value. create=True allows the append
+    slot (index == len). Returns error string or None."""
+    if table_index is None:
+        return "table index missing"
+    table_index = int(table_index)
+    if table_index == len(tabs) and create:
+        tabs.append({"type": "human_added", "markdown": ""})
+    if not (0 <= table_index < len(tabs)):
+        return ("table index out of range (have %d, next append slot is %d)"
+                % (len(tabs), len(tabs)))
+    tabs[table_index]["markdown"] = value
+    return None
+
+
+def apply_edit(output_root, q_id: str, field: str, value, reason: str = "",
+               option_letter: str = None, table_index: int = None) -> dict:
+    """Update ONE logical field in EVERY file copy, atomically, then read
+    back and verify. Returns {ok, verified, changed_files} — the screen must
+    show ok only after verified=True."""
+    out_root = Path(output_root)
+    subject, chap, files = _copies(out_root, q_id)
+    if not chap:
+        return {"ok": False, "error": f"cannot parse q_id {q_id!r}"}
+    value = (value or "").strip() if isinstance(value, str) else value
+
+    # ---- validation per field ----------------------------------------------
+    if field == "correct_option":
+        value = str(value).strip().upper()
+        if value not in ("A", "B", "C", "D"):
+            return {"ok": False, "error": "answer must be one of A/B/C/D"}
+    if field == "option":
+        option_letter = (option_letter or "").strip().upper()
+        if option_letter not in ("A", "B", "C", "D"):
+            return {"ok": False, "error": "option letter must be A-D"}
+    if field in ("table", "table_q"):
+        err = _table_md_error(str(value or ""))
+        if err:
+            return {"ok": False, "error": err}
+
+    # ---- PRE-FLIGHT for table edits: never a half-written edit --------------
+    # apply_to_* may raise inside the write loop; every copy must therefore
+    # be checked BEFORE the first file is touched, and all copies must agree
+    # on the table count (append slot == len for ALL, or index < len for ALL).
+    if field in ("table", "table_q"):
+        side_key = "question" if field == "table_q" else "solution"
+        lens = []
+        row0 = _find_master_row(out_root, q_id)
+        if row0 is not None:
+            lens.append(len((row0.get(side_key) or {}).get("tables") or []))
+        for name in ("subjects", "chapter_file"):
+            p = files.get(name)
+            if p and p.exists():
+                for r in _read_jsonl(p):
+                    if r.get("id") == q_id:
+                        lens.append(len((r.get(side_key) or {}).get("tables") or []))
+        sp = files["split_s" if field == "table" else "split_q"]
+        if sp.exists():
+            for r in _read_jsonl(sp):
+                if r.get("q_id") == q_id:
+                    lens.append(len(r.get("tables") or []))
+        if table_index is None:
+            return {"ok": False, "error": "table index missing"}
+        if not lens:
+            return {"ok": False, "error": f"row {q_id} not found in any output file"}
+        if len(set(lens)) != 1:
+            return {"ok": False, "error": f"copies diverge on table count "
+                    f"({lens}) -- manual check, refusing partial write"}
+        have = lens[0]
+        if not (0 <= int(table_index) <= have):
+            return {"ok": False, "error": f"table index out of range (have "
+                    f"{have}, next append slot is {have})"}
+
+    # ---- what to write where --------------------------------------------------
+    def apply_to_master(row):
+        if field == "question_text":
+            row.setdefault("question", {})["text"] = value
+        elif field == "solution_text":
+            row.setdefault("solution", {})["text"] = value
+        elif field == "correct_option":
+            row["correct_options"] = [value]
+        elif field == "option":
+            for o in row.get("options") or []:
+                if o.get("id") == option_letter:
+                    o["text"] = value
+        elif field in ("table", "table_q"):
+            err = _table_write(_table_target(row, field), table_index, value,
+                               create=True)
+            if err:
+                raise ValueError(err)
+        row["qa_human_edit"] = True
+
+    def apply_to_split(rows, split_kind):
+        for r in rows:
+            if r.get("q_id") != q_id:
+                continue
+            if split_kind == "split_q" and field == "question_text":
+                r["question_text"] = value
+            elif split_kind == "split_q" and field == "option":
+                for o in r.get("options") or []:
+                    if o.get("id") == option_letter:
+                        o["text"] = value
+            elif split_kind == "split_s" and field == "solution_text":
+                r["solution_text"] = value
+            elif split_kind == "split_s" and field == "table":
+                err = _table_write(r.setdefault("tables", []), table_index,
+                                   value, create=True)
+                if err:
+                    raise ValueError(err)
+            elif split_kind == "split_q" and field == "table_q":
+                err = _table_write(r.setdefault("tables", []), table_index,
+                                   value, create=True)
+                if err:
+                    raise ValueError(err)
+            elif split_kind == "split_a" and field == "correct_option":
+                r["correct_option"] = value
+        return rows
+
+    targets = []
+    if field in FIELD_PATHS or field == "option":
+        split_kind = {"question_text": "split_q", "solution_text": "split_s",
+                      "correct_option": "split_a"}.get(field, "split_q")
+        targets.append(split_kind)
+    elif field == "table":
+        targets.append("split_s")
+    elif field == "table_q":
+        targets.append("split_q")
+
+    # ---- load, modify, write, per file ---------------------------------------
+    changed = []
+    for name in ("master", "subjects", "chapter_file"):
+        p = files.get(name)
+        if not p or not p.exists():
+            continue
+        rows = _read_jsonl(p)
+        hit = False
+        for r in rows:
+            if r.get("id") == q_id:
+                apply_to_master(r)
+                hit = True
+        if hit:
+            _write_jsonl_atomic(p, rows)
+            changed.append(str(p.relative_to(out_root)))
+    for name in targets:
+        p = files.get(name)
+        if not p or not p.exists():
+            continue
+        rows = apply_to_split(_read_jsonl(p), name)
+        _write_jsonl_atomic(p, rows)
+        changed.append(str(p.relative_to(out_root)))
+
+    if not changed:
+        return {"ok": False, "error": f"row {q_id} not found in any output file"}
+
+    # ---- READ-BACK VERIFY (contract 5) ----------------------------------------
+    verified = _verify_edit(out_root, q_id, field, value, option_letter,
+                            table_index)
+    _append_jsonl(out_root / "data" / HUMAN_EDIT_LEDGER, {
+        "q_id": q_id, "field": field, "option_letter": option_letter,
+        "table_index": table_index,
+        "new_value": (str(value)[:300] if not isinstance(value, (list, dict))
+                      else json.dumps(value)[:300]),
+        "reason": reason or "", "verified": bool(verified),
+        "changed_files": changed, "ts": _now()})
+    return {"ok": True, "verified": bool(verified), "changed_files": changed}
+
+
+def _verify_edit(out_root, q_id, field, value, option_letter=None,
+                 table_index=None):
+    """Read-back from BOTH the master bundle AND the delivery split file —
+    'saved' is only true when the copy the converter will read says so."""
+    row = _find_master_row(out_root, q_id)
+    if row is None:
+        return False
+    subject, chap, files = _copies(out_root, q_id)
+
+    def split_row(fname):
+        for r in _read_jsonl(files[fname]):
+            if r.get("q_id") == q_id:
+                return r
+        return None
+
+    if field == "question_text":
+        m = (row.get("question") or {}).get("text") == value
+        s = (split_row("split_q") or {}).get("question_text") == value
+        return m and s
+    if field == "solution_text":
+        m = (row.get("solution") or {}).get("text") == value
+        s = (split_row("split_s") or {}).get("solution_text") == value
+        return m and s
+    if field == "correct_option":
+        m = row.get("correct_options") == [value]
+        s = (split_row("split_a") or {}).get("correct_option") == value
+        return m and s
+    if field == "option":
+        letter = (option_letter or "").upper()
+        m = any(o.get("id") == letter and o.get("text") == value
+                for o in (row.get("options") or []))
+        srow = split_row("split_q") or {}
+        s = any(o.get("id") == letter and o.get("text") == value
+                for o in (srow.get("options") or []))
+        return m and s
+    if field == "table":
+        tabs = (row.get("solution") or {}).get("tables") or []
+        m = (isinstance(table_index, int) and 0 <= table_index < len(tabs)
+             and tabs[table_index].get("markdown") == value)
+        stabs = (split_row("split_s") or {}).get("tables") or []
+        s = (isinstance(table_index, int) and 0 <= table_index < len(stabs)
+             and stabs[table_index].get("markdown") == value)
+        return m and s
+    if field == "table_q":
+        tabs = (row.get("question") or {}).get("tables") or []
+        m = (isinstance(table_index, int) and 0 <= table_index < len(tabs)
+             and tabs[table_index].get("markdown") == value)
+        stabs = (split_row("split_q") or {}).get("tables") or []
+        s = (isinstance(table_index, int) and 0 <= table_index < len(stabs)
+             and stabs[table_index].get("markdown") == value)
+        return m and s
+    return False
+
+
+_COL_SPLIT = re.compile(r"(?<!\\)\|")
+
+
+def _table_md_error(md: str):
+    """Guard: a table whose rows disagree on column count will crash/ugly the
+    app renderer. Block the save BEFORE any file is touched."""
+    lines = [l for l in md.splitlines() if l.strip()]
+    if len(lines) < 2:
+        return "table too small (need header + separator)"
+    counts = [len(_COL_SPLIT.split(l.strip().strip('|'))) for l in lines]
+    if len(set(counts)) != 1:
+        return (f"broken table: uneven column counts {sorted(set(counts))} "
+                f"— fix before saving (app renderer guard)")
+    if not re.match(r"^\s*\|?[\s:|-]+\|", lines[1]):
+        return "second line must be the --- separator row"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 5. IMAGE OPERATIONS (contract 7: unlink never deletes; moves keep the ledger)
+# ---------------------------------------------------------------------------
+
+_KIND_FOR = {"question": "Q", "solution": "SOL", "option": "OPT"}
+
+
+def _assets_rel(output_root):
+    return Path(output_root) / "assets" / "questions"
+
+
+def _image_refs(output_root, file_rel: str):
+    """q_ids currently referencing this file (master bundle view)."""
+    users = []
+    for r in _read_jsonl(Path(output_root) / "data" / "questions.jsonl"):
+        for side in ("question", "solution"):
+            for im in ((r.get(side) or {}).get("images") or []):
+                if im.get("file") == file_rel:
+                    users.append(r.get("id"))
+        for o in (r.get("options") or []):
+            for im in (o.get("images") or []):
+                if im.get("file") == file_rel:
+                    users.append(r.get("id"))
+    return sorted(set(u for u in users if u))
+
+
+def _ledger_page_map(output_root):
+    out = {}
+    for row in _read_jsonl(Path(output_root) / "data" / "image_ownership.jsonl"):
+        if row.get("outcome") in ("claimed", "shared") and row.get("final_file"):
+            out[row["final_file"]] = row.get("page")
+    return out
+
+
+def _next_slot(output_root, subject, q_id, kind_letter):
+    base = _assets_rel(output_root) / subject
+    prefix = f"{q_id}_{kind_letter}_"
+    mx = 0
+    if base.exists():
+        for p in base.glob(f"{prefix}*.webp"):
+            m = re.match(re.escape(prefix) + r"(\d{2})\.webp", p.name)
+            if m:
+                mx = max(mx, int(m.group(1)))
+    return mx + 1
+
+
+def _update_image_lists(output_root, q_id, side, option_letter, file_rel,
+                        add=False, remove=False, rename_to=None,
+                        new_owner=None, keep_manifest_from=None):
+    """Rewrite image references in master+subjects+chapter+split+manifest."""
+    subject, chap, files = _copies(output_root, q_id)
+    changed = []
+
+    def edit_imgs(imgs):
+        nonlocal file_rel
+        imgs = [dict(i) for i in (imgs or [])]
+        if rename_to:
+            for i in imgs:
+                if i.get("file") == file_rel:
+                    i["file"] = rename_to
+        if remove:
+            imgs = [i for i in imgs if i.get("file") != file_rel]
+        if add:
+            if not any(i.get("file") == file_rel for i in imgs):
+                imgs.append({"file": file_rel, "source_pages": (
+                    _ledger_pages.get(file_rel) and
+                    [_ledger_pages[file_rel]] or [])})
+        return imgs
+
+    _ledger_pages = _ledger_page_map(output_root)
+
+    for name in ("master", "subjects", "chapter_file"):
+        p = files.get(name)
+        if not p or not p.exists():
+            continue
+        rows, hit = _read_jsonl(p), False
+        for r in rows:
+            if r.get("id") != q_id:
+                continue
+            container = r.get(side) if side in ("question", "solution") else None
+            if container is not None:
+                container["images"] = edit_imgs(container.get("images"))
+                hit = True
+            elif side == "option":
+                for o in (r.get("options") or []):
+                    if o.get("id") == (option_letter or "").upper():
+                        o["images"] = edit_imgs(o.get("images"))
+                        hit = True
+        if hit:
+            _write_jsonl_atomic(p, rows)
+            changed.append(str(p.relative_to(output_root)))
+
+    # split-side
+    sp = files["split_q"] if side in ("question", "option") else files["split_s"]
+    if sp.exists():
+        rows = _read_jsonl(sp)
+        for r in rows:
+            if r.get("q_id") != q_id:
+                continue
+            if side == "question":
+                r["question_images"] = edit_imgs(r.get("question_images"))
+            elif side == "option":
+                for o in (r.get("options") or []):
+                    if o.get("id") == (option_letter or "").upper():
+                        o["images"] = edit_imgs(o.get("images"))
+            else:
+                r["solution_images"] = edit_imgs(r.get("solution_images"))
+        _write_jsonl_atomic(sp, rows)
+        changed.append(str(sp.relative_to(output_root)))
+
+    return changed
+
+
+def _rebuild_manifest(output_root, subject, chap, keep_pages):
+    """Manifest is a VIEW of the split rows — rebuild it after every op."""
+    ch_dir = Path(output_root) / "split" / subject / chap
+    q_path, s_path = ch_dir / "questions.jsonl", ch_dir / "solutions.jsonl"
+    if not q_path.exists():
+        return
+    rows = []
+    def img_rows(q_id, typ, letter, imgs):
+        for i in (imgs or []):
+            f = i.get("file") or ""
+            pg = keep_pages.get(f)
+            rows.append({"q_id": q_id, "type": typ, "option_letter": letter,
+                         "file": f,
+                         "source_pages": ([pg] if pg is not None
+                                          else (i.get("source_pages") or [])),
+                         "extraction_page": pg})
+    for r in _read_jsonl(q_path):
+        img_rows(r["q_id"], "QUESTION", None, r.get("question_images"))
+        for o in (r.get("options") or []):
+            img_rows(r["q_id"], "OPTION", o.get("id"), o.get("images"))
+    for r in _read_jsonl(s_path):
+        img_rows(r["q_id"], "SOLUTION", None, r.get("solution_images"))
+    _write_jsonl_atomic(ch_dir / "image_manifest.jsonl", rows)
+
+
+def apply_image_op(output_root, q_id: str, op: str, file: str,
+                   side: str = "solution", option_letter: str = None,
+                   to_qid: str = None, reason: str = "") -> dict:
+    """op: attach | detach | move. Full rules: contract 7."""
+    out_root = Path(output_root)
+    subject, chap, files = _copies(out_root, q_id)
+    if not chap:
+        return {"ok": False, "error": f"cannot parse q_id {q_id!r}"}
+    side = (side or "solution").lower()
+    if side not in ("question", "solution", "option"):
+        return {"ok": False, "error": "side must be question/solution/option"}
+    file = (file or "").strip()
+    if op not in ("attach", "detach", "move"):
+        return {"ok": False, "error": f"bad op {op!r}"}
+
+    asset = _assets_rel(out_root) / file
+    refs = _image_refs(out_root, file)
+
+    if op == "detach":
+        if not refs:
+            return {"ok": False, "error": f"{file} is not attached anywhere"}
+        changed = _update_image_lists(out_root, q_id, side, option_letter,
+                                      file, remove=True)
+        _rebuild_manifest(out_root, subject, chap, _ledger_page_map(out_root))
+        _append_jsonl(out_root / "data" / HUMAN_EDIT_LEDGER, {
+            "q_id": q_id, "field": "image", "op": "detach", "file": file,
+            "side": side, "reason": reason or "", "ts": _now(),
+            "note": "file kept on disk; only the link was removed",
+            "changed_files": changed})
+        return {"ok": True, "changed_files": changed}
+
+    if op == "attach":
+        if not asset.exists():
+            return {"ok": False, "error": f"{file} not under assets/questions/"}
+        if q_id in refs:
+            return {"ok": False, "error": f"{file} already attached to {q_id}"}
+        changed = _update_image_lists(out_root, q_id, side, option_letter,
+                                      file, add=True)
+        _rebuild_manifest(out_root, subject, chap, _ledger_page_map(out_root))
+        _append_jsonl(out_root / "data" / HUMAN_EDIT_LEDGER, {
+            "q_id": q_id, "field": "image", "op": "attach", "file": file,
+            "side": side, "reason": reason or "", "ts": _now(),
+            "note": ("shared with " + ",".join(refs)) if refs else "fresh attach",
+            "changed_files": changed})
+        return {"ok": True, "changed_files": changed,
+                "shared_with": [r for r in refs if r != q_id]}
+
+    # ---- move ---------------------------------------------------------------
+    if not to_qid:
+        return {"ok": False, "error": "move needs to_qid"}
+    if to_qid == q_id:
+        return {"ok": False, "error": "to_qid is the current owner — nothing to move"}
+    others = [r for r in refs if r != q_id]
+    if others:
+        return {"ok": False,
+                "error": (f"{file} is SHARED with {others} (multi-draw). "
+                          f"Blind move would break the other owner. Either "
+                          f"detach here, or attach a copy to {to_qid} first.")}
+    if q_id not in refs:
+        return {"ok": False, "error": f"{file} is not attached to {q_id}"}
+    to_subject, to_chap, _ = _copies(out_root, to_qid)
+    if to_subject != subject or to_chap != chap:
+        return {"ok": False, "error": "cross-chapter moves not allowed (attach "
+                                      "on the target side instead)"}
+    kind = _KIND_FOR[side]
+    letter = f"{kind}_{option_letter.upper()}" if side == "option" else kind
+    slot = _next_slot(out_root, subject, to_qid, letter)
+    new_name = f"{subject}/{to_qid}_{letter}_{slot:02d}.webp"
+    new_asset = _assets_rel(out_root) / new_name
+    if not asset.exists():
+        return {"ok": False, "error": f"{file} missing on disk — ledger says "
+                                      f"attached but the bytes are gone"}
+    old_pages = _ledger_page_map(out_root)
+    asset.rename(new_asset)                    # 1. move bytes
+    changed = _update_image_lists(out_root, q_id, side, option_letter, file,
+                                  remove=True)
+    changed += _update_image_lists(out_root, to_qid, side, option_letter,
+                                   new_name, add=True)
+    new_pages = dict(old_pages)
+    new_pages[new_name] = old_pages.get(file)
+    new_pages.pop(file, None)
+    _rebuild_manifest(out_root, subject, chap, new_pages)
+    # provenance chain continues: machine ledger learns the human's rename
+    _append_jsonl(out_root / "data" / "image_ownership.jsonl", {
+        "subject": subject, "chapter_id": chap,
+        "page": old_pages.get(file), "file": file, "owner": to_qid,
+        "slot": side, "method": "human_edit",
+        "evidence": (f"human moved from {q_id}: {reason or 'review edit'}"),
+        "confidence": "high", "outcome": "claimed",
+        "ts": _now(), "obj_id": None, "final_file": new_name})
+    _append_jsonl(out_root / "data" / HUMAN_EDIT_LEDGER, {
+        "q_id": q_id, "field": "image", "op": "move", "file": file,
+        "to_qid": to_qid, "new_file": new_name, "side": side,
+        "reason": reason or "", "ts": _now(), "changed_files": changed})
+    return {"ok": True, "new_file": new_name, "changed_files": changed}
+
+
+# ---------------------------------------------------------------------------
+# 6. Final zip gate + builder (contract 6)
+# ---------------------------------------------------------------------------
+
+def gate_final_zip(output_root) -> dict:
+    q = collect_review_queue(output_root)
+    return {
+        "locked": not q["clear"],
+        "open": q["counts"],
+        "why": (None if q["clear"] else
+                f"{q['counts']['blocker']} blocker + {q['counts']['review']} "
+                f"review row(s) still open — final file locked until queue "
+                f"is empty"),
+    }
+
+
+def build_final_zip(output_root, dest=None):
+    """split/ + referenced assets + chapters.json + FORMAT.md + receipt.
+    REFUSES while the queue is open (contract 6). Returns dict with path."""
+    out_root = Path(output_root)
+    gate = gate_final_zip(out_root)
+    if gate["locked"]:
+        return {"ok": False, "locked": True, "why": gate["why"]}
+
+    dest = Path(dest or (out_root / "final_export.zip"))
+    receipts = _load_decisions(out_root)
+    edits = _read_jsonl(out_root / "data" / HUMAN_EDIT_LEDGER)
+
+    referenced = set()
+    manifest_files = []
+    split_root = out_root / "split"
+    subjects = set()
+    if split_root.exists():
+        for mf in sorted(split_root.glob("*/*/image_manifest.jsonl")):
+            manifest_files.append(mf)
+            subjects.add(mf.parts[-3])
+            for row in _read_jsonl(mf):
+                if row.get("file"):
+                    referenced.add(row["file"])
+
+    receipt = {
+        "built_at": _now(), "output_root": out_root.name,
+        "chapters": len(manifest_files), "subjects": sorted(subjects),
+        "images_shipped": len(referenced),
+        "review_decisions": len(receipts),
+        "human_edits": len(edits),
+        "gate": "queue clear — built only after every flag was resolved",
+    }
+
+    fm = Path(__file__).with_name("FORMAT.md")
+    # slim whitelist (contract: delivery package, not the workshop)
+    SPLIT_KEEP = {"questions.jsonl", "answers.jsonl", "solutions.jsonl",
+                  "image_manifest.jsonl", "chapter_completeness.json"}
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("REVIEW_RECEIPT.json",
+                   json.dumps(receipt, indent=2, ensure_ascii=False))
+        if fm.exists():
+            z.write(fm, "FORMAT.md")
+        if split_root.exists():
+            for p in sorted(split_root.rglob("*")):
+                if p.is_file() and p.name in SPLIT_KEEP:
+                    z.write(p, str(p.relative_to(out_root)))
+        for cj in sorted((out_root / "subjects").glob("*/chapters.json")) \
+                if (out_root / "subjects").exists() else []:
+            z.write(cj, str(cj.relative_to(out_root)))
+        aroot = out_root / "assets" / "questions"
+        for rel in sorted(referenced):
+            p = aroot / rel
+            if p.exists():
+                z.write(p, str(Path("assets") / "questions" / rel))
+    return {"ok": True, "path": str(dest), "receipt": receipt,
+            "images_shipped": len(referenced)}
