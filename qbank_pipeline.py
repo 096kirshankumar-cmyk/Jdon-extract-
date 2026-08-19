@@ -5526,7 +5526,7 @@ def _image_positions_raw(pdf_path, file_page):
         if not streams:
             return {}
         import zlib
-        state = {"draw_idx": 0, "visited_forms": set()}
+        state = {"draw_idx": 0, "visited_forms": set(), "draw_counts": {}}
 
         def _decompress(data):
             try:
@@ -5564,8 +5564,31 @@ def _image_positions_raw(pdf_path, file_page):
                         if sub == "/Image":
                             oid = getattr(names[name], "idnum", None)
                             key = oid if oid is not None else name
-                            positions[key] = (ctm[5], ctm[4], state["draw_idx"],
-                                              ctm[0], ctm[3])
+                            # AUDIT-FIX (user report, OBGYN p54/p63 class):
+                            # the SAME image object can be drawn MULTIPLE times
+                            # on one page -- e.g. a figure printed a second
+                            # time inside the next solution. The old
+                            # positions[key] = ... line simply OVERWROTE the
+                            # entry, so only the last draw survived: one copy
+                            # existed, one position existed, and the figure
+                            # could belong to only one block; the usage whose
+                            # heading sat elsewhere silently vanished.
+                            # Audit note: the FIRST draw keeps the plain key;
+                            # every subsequent draw of the same object on the
+                            # page lands at "<key>@d<N>" so the claimer can
+                            # see each printed usage and attach the same
+                            # content to every PROVEN owner.
+                            if key in positions:
+                                n_draws = state["draw_counts"].get(key, 1)
+                                state["draw_counts"][key] = n_draws + 1
+                                positions[f"{key}@d{n_draws}"] = (
+                                    ctm[5], ctm[4], state["draw_idx"],
+                                    ctm[0], ctm[3])
+                            else:
+                                state["draw_counts"][key] = 1
+                                positions[key] = (ctm[5], ctm[4],
+                                                  state["draw_idx"],
+                                                  ctm[0], ctm[3])
                             state["draw_idx"] += 1
                         elif sub == "/Form":
                             # recurse with the Form's OWN resources; the form
@@ -5608,6 +5631,17 @@ def _image_positions_raw(pdf_path, file_page):
         return positions
     except Exception:
         return {}
+
+
+def _extra_draw_keys(pos, oid):
+    """The '<oid>@d<N>' alias keys of an image object, in draw order.
+    Emitted by _image_positions_raw when the same object is drawn multiple
+    times on one page (second printings of the same figure inside a later
+    block, e.g. OBGYN p54/p63)."""
+    base = str(oid)
+    out = [k for k in pos
+           if isinstance(k, str) and k.startswith(base + "@d")]
+    return sorted(out, key=lambda k: pos[k][2])
 
 
 def image_positions_on_page(pdf_path, file_page):
@@ -6019,6 +6053,52 @@ def claim_block_images(imgs, pdf_path, file_page, subject, chapter_no,
                 print(f"  [IMG] page {file_page}: {src} -> {rel} -> {qid} option {opt_letter}")
             else:
                 print(f"  [IMG] page {file_page}: {src} -> {rel} -> {qid} ({kind})")
+
+            # AUDIT-FIX (user report, OBGYN ed8 ch.2 p54 / ch.3 p63 class):
+            # the SAME image object can be drawn twice on one page (the upper
+            # copy belongs to the block still open from the previous page;
+            # the lower sits under the next printed heading). Extraction
+            # rightly saves ONE file -- but ownership must see BOTH usages.
+            # _image_positions_raw keeps each draw as "<oid>@d<N>" aliases;
+            # for every ALIAS draw whose own printed anchor proves a
+            # different block, we attach the SAME final file to that owner
+            # too (no second copy, no second Gemini call). Without this the
+            # upper copy silently vanished and only the lower one existed.
+            for _exo_key in _extra_draw_keys(pos, oid):
+                _ey, _ex, _di, _ew, _eh = pos[_exo_key]
+                _ey = min(_ey, _ey + _eh) if _eh else _ey
+                _exo = next(((k2, q2) for k2, q2, y_hdr in reversed(headers)
+                             if y_hdr > _ey), None)
+                if _exo is None:
+                    _exo = active_block   # same carry contract as primary
+                if _exo is None:
+                    continue
+                _ekind, _eqn = _exo
+                if (_ekind, _eqn) == (kind, qn) or _eqn not in chapter_records:
+                    continue
+                _e_entry = image_files_by_q.setdefault(
+                    _eqn, {"question": [], "solution": []})
+                _e_entry.setdefault("option", {})
+                if new_rel in _e_entry.get(_ekind, []):
+                    continue
+                _cap = image_cap_for(subject, chapter_no, _eqn, _ekind)
+                if len(_e_entry.get(_ekind, [])) >= _cap:
+                    print(f"  [IMG] multi-draw share: {rel} also drawn in "
+                          f"({_ekind} q{_eqn})'s block on page {file_page} but "
+                          f"that side is at cap {_cap} -- noted for review")
+                    continue
+                _e_entry[_ekind].append(new_rel)
+                print(f"  [IMG] multi-draw share: {new_rel} also belongs to "
+                      f"({_ekind} q{_eqn}) -- same image object drawn twice on "
+                      f"page {file_page}")
+                _record_image_ownership(
+                    subject, f"{subject}-{chapter_no:03d}", file_page, rel,
+                    f"{subject}-{chapter_no:03d}-{_eqn:03d}", _ekind,
+                    "multi_draw_geometry",
+                    f"same object also drawn under ({_ekind} q{_eqn}) on "
+                    f"page {file_page} (alias {_exo_key}); shared reference",
+                    confidence="high", outcome="shared",
+                    obj_id=oid, final_file=new_rel)
         else:
             leftover.append(rel)
     return leftover
