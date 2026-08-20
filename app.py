@@ -1420,7 +1420,34 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
     </div>
     {% endif %}
     {% if v.orphan %}
-    <div class="border border-amber-300 bg-amber-50 rounded p-2 text-[11px] whitespace-pre-wrap">{{ v.orphan.text }}</div>
+    <div class="border border-amber-300 bg-amber-50 rounded p-2 text-[11px]">
+      <b>📦 Unclaimed fragment (pipeline ne kisi ko diya nahi):</b>
+      <div class="whitespace-pre-wrap mt-1">{{ v.orphan.text }}</div>
+      {% if v.owner_qid %}
+      <div class="mt-2 border-t border-amber-300 pt-1">
+        <b>🤔 System ka best guess: {{ v.owner_qid }}</b> — compare karo:
+        <div class="mt-1 bg-white border rounded p-1">
+          <b>Us question ki CURRENT solution (actual output):</b>
+          <div class="whitespace-pre-wrap">{{ v.owner_sol or '(abhi bilkul khaali hai — shayad yehi fragment asli solution hai!)' }}</div>
+          {% for im in (v.owner_imgs or []) %}<img class="thumb" loading="lazy" src="/review/img?f={{ im }}">{% endfor %}
+        </div>
+        {% if v.already_inside %}
+        <div class="mt-1 text-red-700 font-semibold">⚠️ Ye text uski solution me ALREADY maujood lagta hai (extra copy). Merge MAT karo — bas Ignore.</div>
+        {% else %}
+        <form method="POST" action="/review/attach-orphan" class="mt-1 flex flex-wrap gap-1 items-center">
+          <input type="hidden" name="chapter_id" value="{{ r.chapter_id }}">
+          <input type="hidden" name="frag_key" value="{{ v.frag_key }}">
+          <input type="hidden" name="flag_key" value="{{ r.flag_key }}">
+          <input name="to_qid" value="{{ v.owner_qid }}" class="border rounded px-1 py-0.5 font-mono w-32">
+          <input name="reason" placeholder="why merge" class="border rounded px-1 py-0.5 flex-1">
+          <button class="bg-emerald-700 text-white px-2 py-0.5 rounded">➕ Merge into this question (append + verify)</button>
+        </form>
+        {% endif %}
+      </div>
+      {% else %}
+      <div class="mt-1 text-gray-600">(koi owner guess nahi hai — approve = 'dekh liya', ignore = chhodo; merge chahiye toh machine guess nahi mila isliye manual: mujhe batao)</div>
+      {% endif %}
+    </div>
     {% endif %}
     {% if v.expand %}
     <div class="text-[11px] bg-red-50 border border-red-200 rounded p-1">
@@ -1436,6 +1463,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
       <button name="action" value="approved" class="bg-emerald-600 text-white text-xs px-2 py-1 rounded">✔ Approve</button>
       <button name="action" value="ignored" class="bg-gray-500 text-white text-xs px-2 py-1 rounded">Skip/ignore</button>
     </form>
+    <p class="text-[10px] text-gray-500">Approve/Skip sirf ye flag band karte hain — content me koi change NAHI hota. Content badalna ho toh ✏️ Edit ya ➕ Merge use karo.</p>
 
     {% if r.q_id and masters.get(r.q_id) %}
     {% set m = masters[r.q_id] %}
@@ -1759,6 +1787,30 @@ def review_apply_text():
                "error": "disk read-back verify FAILED — screen me 'saved' "
                         "dikhana galat hoga; files check karo"}
     return _review_redirect(res, "saved + verified on disk")
+
+
+@app.route("/review/attach-orphan", methods=["POST"])
+def review_attach_orphan():
+    if state.get("status") == "processing":
+        return _review_redirect({"ok": False, "error": "extraction chal rahi "
+                                 "hai — run khatam hone ke baad merge karo"})
+    res = review_queue.apply_orphan_merge(
+        Path(pipeline.OUTPUT_ROOT),
+        request.form.get("chapter_id") or "",
+        request.form.get("frag_key") or "",
+        request.form.get("to_qid") or "",
+        reason=request.form.get("reason") or "")
+    if res.get("ok"):
+        # merged -> the orphan flag is genuinely handled now
+        review_queue.record_decision(Path(pipeline.OUTPUT_ROOT),
+                                     request.form.get("flag_key") or "",
+                                     "resolved",
+                                     reason="orphan merged into "
+                                            + (request.form.get("to_qid") or ""),
+                                     q_id=request.form.get("to_qid") or None)
+    return _review_redirect(res,
+                            f"orphan merged (tables: {res.get('tables', 0)}) + "
+                            "verified on disk — flag resolved")
 
 
 @app.route("/review/apply-image", methods=["POST"])
