@@ -151,3 +151,34 @@ class TestTemplateReadability(Routes):
         self.assertEqual(ok.status_code, 200)
         self.assertEqual(self.client.get("/review/img?f=../../etc/passwd").status_code, 400)
         self.assertEqual(self.client.get(f"/review/img?f={SUB}/nope.webp").status_code, 404)
+
+
+class TestLookupFullView(Routes):
+    """Lookup page = full app-style view: complete stem/options/solution,
+    rendered tables, all images -- never a 240-char preview."""
+
+    def seed_long(self):
+        imgdir = self.tmp / "assets" / "questions" / SUB
+        imgdir.mkdir(parents=True, exist_ok=True)
+        (imgdir / f"{CH}-p50-128.webp").write_bytes(b"\xff" * 3000)
+        long_sol = "Long solution. " * 60       # way past any preview cap
+        rows = [_row(1)]
+        rows[0]["solution"]["text"] = long_sol
+        (self.tmp / "data" / "questions.jsonl").write_text(
+            "\n".join(json.dumps(r) for r in rows) + "\n")
+
+    def test_full_view_and_attach_link(self):
+        self.seed_long()
+        r = self.client.get("/review/lookup?q=1&chapter=" + CH)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("Long solution. ".encode() * 50, r.data)   # NOT truncated
+        self.assertIn((f"{CH}-001").encode(), r.data)
+
+    def test_file_status_and_auto_chapter(self):
+        self.seed_long()
+        r = self.client.get(f"/review/lookup?q=1&f={SUB}/{CH}-p50-128.webp")
+        self.assertIn(b"File status", r.data)
+        self.assertIn(b"KISI KO NAHI", r.data)       # honestly shows unlinked
+        # page 50 IS in fixture chapter range -> note shows only when detected
+        auto = b"auto-detected" in r.data
+        self.assertTrue(auto)

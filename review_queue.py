@@ -184,10 +184,35 @@ def flag_extra(output_root, flag):
 
     if flag.get("kind") in ("orphan_unresolved", "orphans") and \
             flag.get("source") in ("orphans.jsonl", "split orphans.jsonl"):
-        for r in _read_jsonl(out / "data" / "orphans.jsonl"):
-            if r.get("chapter_id") == flag.get("chapter_id"):
-                extra["orphan"] = orphan_readable(r)
-                break
+        cands = [r for r in _read_jsonl(out / "data" / "orphans.jsonl")
+                 if r.get("chapter_id") == flag.get("chapter_id")]
+        # a chapter can hold several orphan rows -- match by the pages the
+        # flag detail carries; fall back to first
+        dpages = re.search(r"pdf_pages[^0-9]*\[([\d,\s]+)\]", detail)
+        want = dpages.group(1).replace(" ", "") if dpages else None
+        cands.sort(key=lambda r: 0 if (want and str(
+            ",".join(map(str, r.get("pdf_pages") or [])).replace(" ", "")) == want)
+                   else 1)
+        for r in cands:
+            extra["orphan"] = orphan_readable(r)
+            extra["frag_key"] = orphan_key(r)
+            oqid = orphan_owner_qid(r)
+            extra["owner_qid"] = oqid
+            if oqid:
+                trow = _find_master_row(out, oqid)
+                if trow:
+                    extra["owner_sol"] = str((trow.get("solution") or {})
+                                             .get("text") or "")[:900]
+                    extra["owner_imgs"] = [i.get("file") for i in
+                                           ((trow.get("solution") or {})
+                                            .get("images") or [])
+                                           if isinstance(i, dict)]
+                    frag_text, _ = _frac(r.get("item"))
+                    if frag_text:
+                        norm = lambda s: " ".join(s.lower().split())
+                        extra["already_inside"] = norm(frag_text)[:120] \
+                            in norm(extra["owner_sol"])
+            break
     return extra
 
 
@@ -209,6 +234,69 @@ def unclaimed_images(output_root, subject):
         return []
     return sorted(f"{subject}/{p.name}" for p in base.glob("*.webp")
                   if f"{subject}/{p.name}" not in used)
+
+
+def chapter_for_page(output_root, subject, page):
+    """Which chapter of <subject> contains file-page <page>? chapters.json
+    ranges when present, else the split rows' source_pages min/max. Used so
+    the human types only the question NUMBER, never the chapter id."""
+    out = Path(output_root)
+    cj = out / "subjects" / subject / "chapters.json"
+    if cj.exists():
+        try:
+            for c in json.loads(cj.read_text()):
+                a, b = c.get("file_start"), c.get("file_end")
+                if a and b and int(a) <= page <= int(b):
+                    return c.get("chapter_id")
+        except Exception:
+            pass
+    for chd in sorted((out / "split" / subject).glob("*")):
+        pages = []
+        for r in _read_jsonl(chd / "questions.jsonl"):
+            pages += [p for p in (r.get("source_pages") or [])
+                      if isinstance(p, int)]
+        if pages and min(pages) <= page <= max(pages):
+            return chd.name
+    return None
+
+
+def image_status(output_root, file_rel):
+    """Where does this image file stand right now?
+    {exists_on_disk, owners:[q_id...], page (from temp name), attached_seen}
+    -- the lookup answer for 'ye image asal me kahin hui h ki nahi'."""
+    out = Path(output_root)
+    refs = _image_refs(out, file_rel)
+    m = re.search(r"/[\w-]+-p(\d+)-", file_rel)
+    return {
+        "file": file_rel,
+        "exists_on_disk": (out / "assets" / "questions" / file_rel).exists(),
+        "owners": refs,
+        "page": int(m.group(1)) if m else None,
+    }
+
+
+def lookup_questions(output_root, term, chapter_id=None):
+    """Find master rows by q_id fragment or q_no (+optional chapter).
+    Accepts: 'OBG-003-009', '003-009', '9' + chapter, 'q9' + chapter.
+    Returns list of rows (never raises)."""
+    out = Path(output_root)
+    term = (term or "").strip()
+    rows = _read_jsonl(out / "data" / "questions.jsonl")
+    if not term:
+        return []
+    hit = [r for r in rows if term.lower() in str(r.get("id", "")).lower()]
+    if hit:
+        return hit
+    m = re.match(r"^(?:q\s*)?(\d{1,3})$", term, re.I)
+    if m and chapter_id:
+        qn = int(m.group(1))
+        want = f"{chapter_id}-{qn:03d}"
+        return [r for r in rows if r.get("id") == want]
+    m2 = re.match(r"^(\d{1,3})-(\d{1,3})$", term)   # '3-9' = chapter 3 q 9
+    if m2 and not chapter_id:
+        cid = None
+        return hit
+    return hit
 
 
 _RE_FLAGS_KNOWN_FILE = re.compile(r"\.jsonl$")
@@ -980,6 +1068,121 @@ def _rebuild_manifest(output_root, subject, chap, keep_pages):
     _write_jsonl_atomic(ch_dir / "image_manifest.jsonl", rows)
 
 
+def orphan_owner_qid(row):
+    """The pipeline's best-guess owner for this orphan fragment, as a q_id."""
+    qn = row.get("inferred_owner")
+    cid = row.get("chapter_id")
+    if qn in (None, "None") or not cid:
+        return None
+    try:
+        return f"{cid}-{int(qn):03d}"
+    except (TypeError, ValueError):
+        return None
+
+
+def orphan_key(row):
+    """Stable identity for one orphan fragment row."""
+    pages = row.get("new_pages") or row.get("pdf_pages") or []
+    item = row.get("item")
+    raw = json.dumps(item, sort_keys=True, default=str) if item else ""
+    return hashlib.sha1((str(row.get("chapter_id")) + "|" + raw + "|"
+                         + ",".join(map(str, pages))).encode()).hexdigest()[:16]
+
+
+def _frac(item):
+    """Normalized (solution_text, tables) out of an orphan's Gemini item."""
+    if isinstance(item, str):
+        try:
+            item = json.loads(item.replace("'", '"'))
+        except Exception:
+            item = None
+    if not isinstance(item, dict):
+        return "", []
+    return str(item.get("solution_text") or "").strip(), (item.get("tables") or [])
+
+
+def _retag_last_table(out, q_id, ttype):
+    """Set the type of the most recently added solution table everywhere
+    (keeps the fragment's own type instead of the generic 'human_added')."""
+    _, _, files = _copies(out, q_id)
+    if not files.get("master"):
+        return
+    for p in (files.get("master"), files.get("subjects"),
+              files.get("chapter_file"), files.get("split_s")):
+        if not p or not p.exists():
+            continue
+        rows = _read_jsonl(p)
+        hit = False
+        for r in rows:
+            if r.get("id") != q_id and r.get("q_id") != q_id:
+                continue
+            tabs = ((r.get("solution") or {}).get("tables")
+                    if "solution" in r else r.get("tables")) or []
+            if tabs:
+                tabs[-1]["type"] = ttype
+                hit = True
+        if hit:
+            _write_jsonl_atomic(p, rows)
+
+
+def apply_orphan_merge(output_root, chapter_id, frag_key, to_q_id,
+                       reason="", by="human"):
+    """Merge an orphan fragment INTO a question's solution (append, verified,
+    ledgered). Detects the 'extra copy' case BEFORE writing: if the fragment
+    text is already inside the target's solution, refuses with a clear
+    message (approve/ignore never writes data; merge is the ONLY op that does)."""
+    out = Path(output_root)
+    target = _find_master_row(out, to_q_id)
+    if target is None:
+        return {"ok": False, "error": f"{to_q_id} not found in master"}
+    hit = None
+    for r in _read_jsonl(out / "data" / "orphans.jsonl"):
+        if r.get("chapter_id") == chapter_id and orphan_key(r) == frag_key:
+            hit = r
+            break
+    if hit is None:
+        return {"ok": False, "error": "orphan fragment not found (already "
+                "handled? refresh the queue)"}
+    frag_text, frag_tables = _frac(hit.get("item"))
+    if not frag_text and not frag_tables:
+        return {"ok": False, "error": "fragment has no solution text or tables "
+                "to merge -- nothing to adopt"}
+    cur = str((target.get("solution") or {}).get("text") or "")
+    if frag_text:
+        norm = lambda s: " ".join(s.lower().split())
+        if norm(frag_text)[:120] in norm(cur):
+            return {"ok": False, "error": "ye text ALREADY is question ki "
+                    "solution me maujood hai (extra copy) -- merge refused; "
+                    "bas Ignore kar do"}
+    new_text = (cur + "\n\n" + frag_text).strip() if frag_text else cur
+    res = apply_edit(out, to_q_id, "solution_text", new_text,
+                     reason=reason or f"adopt orphan fragment pages "
+                     f"{hit.get('new_pages') or hit.get('pdf_pages')}")
+    if not res.get("ok"):
+        return res
+    adopted_tabs = 0
+    for t in frag_tables:
+        md = str(t.get("markdown") or "")
+        if not md.strip():
+            continue
+        cur_tabs = ((_find_master_row(out, to_q_id).get("solution") or {})
+                    .get("tables") or [])
+        r2 = apply_edit(out, to_q_id, "table", md,
+                        table_index=len(cur_tabs),
+                        reason="adopted orphan table")
+        if r2.get("ok"):
+            _retag_last_table(out, to_q_id, t.get("type") or "human_added")
+            adopted_tabs += 1
+    _append_jsonl(out / "data" / HUMAN_EDIT_LEDGER, {
+        "q_id": to_q_id, "field": "orphan_merge", "frag_key": frag_key,
+        "old_len": len(cur), "fragment_pages": hit.get("new_pages")
+        or hit.get("pdf_pages"), "tables_adopted": adopted_tabs,
+        "reason": reason or "", "by": by, "ts": _now(),
+        "changed_files": res.get("changed_files", [])})
+    return {"ok": True, "verified": res.get("verified"), "tables": adopted_tabs,
+            "changed_files": res.get("changed_files", [])}
+
+
 def apply_image_op(output_root, q_id: str, op: str, file: str,
                    side: str = "solution", option_letter: str = None,
                    to_qid: str = None, reason: str = "") -> dict:
@@ -1016,15 +1219,36 @@ def apply_image_op(output_root, q_id: str, op: str, file: str,
             return {"ok": False, "error": f"{file} not under assets/questions/"}
         if q_id in refs:
             return {"ok": False, "error": f"{file} already attached to {q_id}"}
+        # an UNREFERENCED crop-style file takes the owner's slot name on
+        # attach (locked naming in exports); shared files are never renamed
+        eff = file
+        if re.search(r"-p\d+-", file) and not refs:
+            kind = _KIND_FOR[side]
+            letter = f"{kind}_{option_letter.upper()}" if side == "option" else kind
+            slot = _next_slot(out_root, subject, q_id, letter)
+            new_name = f"{subject}/{q_id}_{letter}_{slot:02d}.webp"
+            new_asset = _assets_rel(out_root) / new_name
+            asset.rename(new_asset)
+            pm = re.search(r"-p(\d+)-", file)
+            _append_jsonl(out_root / "data" / "image_ownership.jsonl", {
+                "subject": subject, "chapter_id": chap,
+                "page": int(pm.group(1)) if pm else None,
+                "file": file, "owner": q_id, "slot": side,
+                "method": "human_edit",
+                "evidence": f"human attached crop {file} (review queue)",
+                "confidence": "high", "outcome": "claimed",
+                "ts": _now(), "obj_id": None, "final_file": new_name})
+            eff = new_name
         changed = _update_image_lists(out_root, q_id, side, option_letter,
-                                      file, add=True)
+                                      eff, add=True)
         _rebuild_manifest(out_root, subject, chap, _ledger_page_map(out_root))
         _append_jsonl(out_root / "data" / HUMAN_EDIT_LEDGER, {
             "q_id": q_id, "field": "image", "op": "attach", "file": file,
-            "side": side, "reason": reason or "", "ts": _now(),
+            "final_file": eff, "side": side, "reason": reason or "",
+            "ts": _now(),
             "note": ("shared with " + ",".join(refs)) if refs else "fresh attach",
             "changed_files": changed})
-        return {"ok": True, "changed_files": changed,
+        return {"ok": True, "changed_files": changed, "new_file": eff,
                 "shared_with": [r for r in refs if r != q_id]}
 
     # ---- move ---------------------------------------------------------------

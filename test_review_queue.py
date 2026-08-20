@@ -442,3 +442,94 @@ class TestTableDelete(QEnv):
         res2 = rq.apply_edit(self.root, f"{CH}-003", "table_delete", "",
                              table_index=5)
         self.assertFalse(res2["ok"])
+
+
+class TestOrphanMerge(QEnv):
+    """orphan suspect flow: compare panel data + merge op + dup guard."""
+
+    def _seed_orphan(self, frag_text):
+        (self.root / "data" / "orphans.jsonl").write_text(json.dumps({
+            "chapter_id": CH, "batch_start": "53",
+            "pdf_pages": [53, 54], "new_pages": [53, 54],
+            "inferred_owner": 2, "pass": "S",
+            "item": {"q_no": None, "solution_text": frag_text,
+                     "tables": [{"type": "sizes", "markdown": "| s |\n|---|\n| 9 |"}]},
+            "blocked_reason": "owner solution already complete"}) + "\n")
+
+    def test_merge_appends_fragment_and_table_with_verify(self):
+        self._seed_orphan("Recovered tail of the real answer.")
+        frag_key = None
+        for r in rq._read_jsonl(self.root / "data" / "orphans.jsonl"):
+            frag_key = rq.orphan_key(r)
+        res = rq.apply_orphan_merge(self.root, CH, frag_key, f"{CH}-002")
+        self.assertTrue(res["ok"] and res["verified"], res)
+        self.assertEqual(res["tables"], 1)
+        m = rq._find_master_row(self.root, f"{CH}-002")
+        self.assertIn("Recovered tail", m["solution"]["text"])
+        self.assertEqual(m["solution"]["tables"][-1]["type"], "sizes")  # appended
+
+    def test_extra_copy_refused_loudly(self):
+        m = self.masters[1]
+        m["solution"]["text"] = "Precise existing solution sentence here."
+        self._write_masters(self.masters); self._write_split()
+        self._seed_orphan("Precise existing solution sentence here.")
+        fk = rq.orphan_key(rq._read_jsonl(self.root / "data" / "orphans.jsonl")[0])
+        res = rq.apply_orphan_merge(self.root, CH, fk, f"{CH}-002")
+        self.assertFalse(res["ok"])
+        self.assertIn("extra copy", res["error"])
+
+    def test_missing_fragment_refused(self):
+        self._seed_orphan("Whatever.")
+        res = rq.apply_orphan_merge(self.root, CH, "deadbeefdeadbeef", f"{CH}-002")
+        self.assertFalse(res["ok"])
+
+    def test_compare_panel_data_comes_from_flag_extra(self):
+        self.masters[1]["solution"]["text"] = "Owner current solution text."
+        self._write_masters(self.masters); self._write_split()
+        self._seed_orphan("Owner current solution text.")   # duplicate!
+        row = rq._read_jsonl(self.root / "data" / "orphans.jsonl")[0]
+        flag = {"kind": "orphan_unresolved", "source": "orphans.jsonl",
+                "chapter_id": CH, "detail": json.dumps(row, default=str)[:300]}
+        ex = rq.flag_extra(self.root, flag)
+        self.assertEqual(ex["owner_qid"], f"{CH}-002")
+        self.assertTrue(ex["already_inside"])        # screen will say: just Ignore
+        self.assertIn("Owner current", ex["owner_sol"])
+
+
+class TestLookup(QEnv):
+    def test_lookup_by_full_and_bare(self):
+        rows = rq.lookup_questions(self.root, f"{CH}-002")
+        self.assertEqual(len(rows), 1)
+        rows = rq.lookup_questions(self.root, "2", chapter_id=CH)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], f"{CH}-002")
+
+    def test_image_status_answers_ownership(self):
+        (self.root / "assets" / "questions" / SUB).mkdir(parents=True,
+                                                         exist_ok=True)
+        f = f"{SUB}/{CH}-p47-128.webp"
+        (self.root / "assets" / "questions" / f).write_bytes(b"\xff" * 3000)
+        st = rq.image_status(self.root, f)
+        self.assertTrue(st["exists_on_disk"])
+        self.assertEqual(st["owners"], [])
+        self.assertEqual(st["page"], 47)
+        # attach it, then status must name the owner
+        r = rq.apply_image_op(self.root, f"{CH}-001", "attach", f,
+                              side="solution")
+        self.assertTrue(r["ok"], r)
+        st = rq.image_status(self.root, f"{SUB}/{CH}-001_SOL_01.webp")
+        self.assertEqual(st["owners"], [f"{CH}-001"])
+
+
+class TestChapterForPage(QEnv):
+    def test_chapter_from_split_pages(self):
+        # fixture split rows carry source_pages [50] -> page 50 maps to CH
+        self.assertEqual(rq.chapter_for_page(self.root, SUB, 50), CH)
+        self.assertIsNone(rq.chapter_for_page(self.root, SUB, 999))
+
+    def test_chapter_from_chapters_json_ranges(self):
+        cjd = self.root / "subjects" / SUB
+        cjd.mkdir(parents=True, exist_ok=True)
+        cjd.joinpath("chapters.json").write_text(json.dumps(
+            [{"chapter_id": CH, "file_start": 48, "file_end": 65}]))
+        self.assertEqual(rq.chapter_for_page(self.root, SUB, 61), CH)
