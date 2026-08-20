@@ -48,6 +48,7 @@ FLAG_SOURCES = {
     "still_incomplete_after_retry.jsonl": "rows: gaps retry could not close",
     "stem_conflicts.jsonl": "rows: stem text conflicts",
     "unmatched_images.jsonl": "rows: extracted images with no owner",
+    "unresolved_images.jsonl": "rows: figures unresolved after all levels",
 }
 
 # data/ jsonl files that are NOT flags (core state; expected)
@@ -68,6 +69,147 @@ BLOCKER_KINDS = {
 
 HUMAN_EDIT_LEDGER = "human_edit_ledger.jsonl"
 REVIEW_DECISIONS = "review_decisions.jsonl"
+
+
+# ---------------------------------------------------------------------------
+# 5.5. Review-screen helpers -- readable content, page context, HTML tables.
+# Pure functions; the screen renders what THIS returns, never raw internals.
+# ---------------------------------------------------------------------------
+
+_IMG_NAME_ANY = re.compile(
+    r"([A-Za-z0-9]+/[A-Za-z0-9]+(?:-\d{3})?-p\d+[-A-Za-z0-9@.]*\.webp"  # temp/crop names
+    r"|[A-Za-z0-9]+/[A-Za-z0-9]+-\d{3}-\d{3}_[A-Z0-9_]+_\d{2}\.webp)")   # final slots
+
+
+def md_to_html(md):
+    """Pipe-markdown -> escaped HTML table for the review screen. Returns ''
+    if it doesn't look like one table. Display-only; the stored text is never
+    modified."""
+    import html as _html
+    lines = [l.strip() for l in str(md or "").splitlines()
+             if l.strip().startswith("|")]
+    if len(lines) < 2:
+        return ""
+    def cells(l):
+        return [c.strip() for c in l.strip().strip("|").split("|")]
+    head = cells(lines[0])
+    body = [cells(l) for l in lines[2:]]   # line 2 = separator
+    out = ['<table style="border-collapse:collapse;font-size:11px;'
+           'background:#fff">']
+    out.append("<tr>" + "".join(
+        f'<th style="border:1px solid #cbd5e1;padding:2px 6px;text-align:left">'
+        f"{_html.escape(c)}</th>" for c in head) + "</tr>")
+    for r in body:
+        out.append("<tr>" + "".join(
+            f'<td style="border:1px solid #e2e8f0;padding:2px 6px">'
+            f"{_html.escape(c)}</td>" for c in r) + "</tr>")
+    out.append("</table>")
+    return "".join(out)
+
+
+def orphan_readable(row):
+    """Make a data/orphans.jsonl row readable: parse the embedded Gemini item
+    and say WHAT it is (solution fragment / question shell / table) + pages."""
+    item = row.get("item")
+    if isinstance(item, str):
+        try:
+            item = json.loads(item.replace("'", '"'))
+        except Exception:
+            item = None
+    parts = []
+    pages = row.get("new_pages") or row.get("pdf_pages") or []
+    if isinstance(item, dict):
+        if item.get("solution_text"):
+            parts.append("SOLUTION fragment: " + str(item["solution_text"]))
+        if item.get("question_text"):
+            parts.append("STEM fragment: " + str(item["question_text"]))
+        if item.get("tables"):
+            parts.append(f"{len(item['tables'])} table(s): "
+                         + ", ".join(str(t.get("type", "?")) for t in item["tables"]))
+        if item.get("options"):
+            parts.append("options: " + str(item["options"]))
+    why = row.get("blocked_reason") or row.get("drop_reason")
+    if why:
+        parts.append(f"kyun hold hua: {why}")
+    if row.get("inferred_owner"):
+        parts.append(f"system ka best guess: q{row['inferred_owner']} "
+                     f"({str(row.get('inferred_reason'))[:80]})")
+    return {"pages": pages, "text": "\n".join(parts)[:1200]}
+
+
+def flag_extra(output_root, flag):
+    """Everything the screen needs to UNDERSTAND one flag:
+      pages   = book pages to open (source_pages / referenced pages)
+      images  = files named in the flag detail that exist under assets
+      expand  = for chapter-level 'incomplete_records': which exact q_ids and
+                which of Q/A/S is incomplete (so the human never has to guess)
+      orphan  = readable text for orphan rows (parsed, not raw JSON)
+    """
+    out = Path(output_root)
+    extra = {"pages": [], "images": [], "expand": [], "orphan": None}
+    detail = str(flag.get("detail") or "")
+
+    # images named inside the detail text (unresolved/unmatched/wrong-owner)
+    for rel in sorted(set(_IMG_NAME_ANY.findall(detail))):
+        if (out / "assets" / "questions" / rel).exists():
+            extra["images"].append(rel)
+        pages_from_name = re.search(r"/[\w-]+-p(\d+)-", rel)
+        if pages_from_name:
+            extra["pages"].append(int(pages_from_name.group(1)))
+
+    if flag.get("q_id"):
+        row = _find_master_row(out, flag["q_id"])
+        if row:
+            extra["pages"] += [int(p) for p in (row.get("source_pages") or [])
+                               if isinstance(p, int)]
+        extra["pages"] = sorted(set(extra["pages"]))
+
+    m = re.search(r"pages?\s*\[([\d,\s]+)\]", detail)
+    if m:
+        extra["pages"] = sorted(set(extra["pages"] + [int(x) for x in
+                                m.group(1).split(",") if x.strip().isdigit()]))
+
+    if flag.get("kind") == "incomplete_records" and flag.get("chapter_id"):
+        ch = flag["chapter_id"]
+        subj = ch.split("-")[0]
+        chd = out / "split" / subj / ch
+        for fname, side in (("questions.jsonl", "stem/options"),
+                            ("answers.jsonl", "answer"),
+                            ("solutions.jsonl", "solution")):
+            for r in _read_jsonl(chd / fname):
+                if r.get("extraction_status") == "INCOMPLETE":
+                    miss = ", ".join(r.get("missing_fields") or [side])
+                    extra["expand"].append(
+                        {"q_id": r.get("q_id"), "missing": miss})
+
+    if flag.get("kind") in ("orphan_unresolved", "orphans") and \
+            flag.get("source") in ("orphans.jsonl", "split orphans.jsonl"):
+        for r in _read_jsonl(out / "data" / "orphans.jsonl"):
+            if r.get("chapter_id") == flag.get("chapter_id"):
+                extra["orphan"] = orphan_readable(r)
+                break
+    return extra
+
+
+def unclaimed_images(output_root, subject):
+    """On-disk image files nobody references -- the 'attach' candidates."""
+    out = Path(output_root)
+    used = set()
+    for r in _read_jsonl(out / "data" / "questions.jsonl"):
+        if r.get("subject") != subject:
+            continue
+        for side in ("question", "solution"):
+            for im in ((r.get(side) or {}).get("images") or []):
+                used.add(im.get("file"))
+        for o in (r.get("options") or []):
+            for im in (o.get("images") or []):
+                used.add(im.get("file"))
+    base = out / "assets" / "questions" / subject
+    if not base.exists():
+        return []
+    return sorted(f"{subject}/{p.name}" for p in base.glob("*.webp")
+                  if f"{subject}/{p.name}" not in used)
+
 
 _RE_FLAGS_KNOWN_FILE = re.compile(r"\.jsonl$")
 
@@ -456,7 +598,11 @@ def apply_edit(output_root, q_id: str, field: str, value, reason: str = "",
                option_letter: str = None, table_index: int = None) -> dict:
     """Update ONE logical field in EVERY file copy, atomically, then read
     back and verify. Returns {ok, verified, changed_files} — the screen must
-    show ok only after verified=True."""
+    show ok only after verified=True.
+    field 'table_delete'/'table_q_delete' REMOVES the table at table_index
+    (reviewer asked: duplicate/garbage tables must be removable)."""
+    DELETE = field in ("table_delete", "table_q_delete")
+    base_field = field.replace("_delete", "") if DELETE else field
     out_root = Path(output_root)
     subject, chap, files = _copies(out_root, q_id)
     if not chap:
@@ -480,9 +626,10 @@ def apply_edit(output_root, q_id: str, field: str, value, reason: str = "",
     # ---- PRE-FLIGHT for table edits: never a half-written edit --------------
     # apply_to_* may raise inside the write loop; every copy must therefore
     # be checked BEFORE the first file is touched, and all copies must agree
-    # on the table count (append slot == len for ALL, or index < len for ALL).
-    if field in ("table", "table_q"):
-        side_key = "question" if field == "table_q" else "solution"
+    # on the table count (append slot == len for ALL, or index < len for ALL,
+    # delete strictly index < len).
+    if base_field in ("table", "table_q"):
+        side_key = "question" if base_field == "table_q" else "solution"
         lens = []
         row0 = _find_master_row(out_root, q_id)
         if row0 is not None:
@@ -493,7 +640,7 @@ def apply_edit(output_root, q_id: str, field: str, value, reason: str = "",
                 for r in _read_jsonl(p):
                     if r.get("id") == q_id:
                         lens.append(len((r.get(side_key) or {}).get("tables") or []))
-        sp = files["split_s" if field == "table" else "split_q"]
+        sp = files["split_s" if base_field == "table" else "split_q"]
         if sp.exists():
             for r in _read_jsonl(sp):
                 if r.get("q_id") == q_id:
@@ -506,7 +653,11 @@ def apply_edit(output_root, q_id: str, field: str, value, reason: str = "",
             return {"ok": False, "error": f"copies diverge on table count "
                     f"({lens}) -- manual check, refusing partial write"}
         have = lens[0]
-        if not (0 <= int(table_index) <= have):
+        if DELETE:
+            if not (0 <= int(table_index) < have):
+                return {"ok": False, "error": f"table index {table_index} out of "
+                        f"range (have {have})"}
+        elif not (0 <= int(table_index) <= have):
             return {"ok": False, "error": f"table index out of range (have "
                     f"{have}, next append slot is {have})"}
 
@@ -522,11 +673,14 @@ def apply_edit(output_root, q_id: str, field: str, value, reason: str = "",
             for o in row.get("options") or []:
                 if o.get("id") == option_letter:
                     o["text"] = value
-        elif field in ("table", "table_q"):
-            err = _table_write(_table_target(row, field), table_index, value,
-                               create=True)
-            if err:
-                raise ValueError(err)
+        elif base_field in ("table", "table_q"):
+            tabs = _table_target(row, base_field)
+            if DELETE:
+                del tabs[int(table_index)]
+            else:
+                err = _table_write(tabs, table_index, value, create=True)
+                if err:
+                    raise ValueError(err)
         row["qa_human_edit"] = True
 
     def apply_to_split(rows, split_kind):
@@ -541,16 +695,22 @@ def apply_edit(output_root, q_id: str, field: str, value, reason: str = "",
                         o["text"] = value
             elif split_kind == "split_s" and field == "solution_text":
                 r["solution_text"] = value
-            elif split_kind == "split_s" and field == "table":
-                err = _table_write(r.setdefault("tables", []), table_index,
-                                   value, create=True)
-                if err:
-                    raise ValueError(err)
-            elif split_kind == "split_q" and field == "table_q":
-                err = _table_write(r.setdefault("tables", []), table_index,
-                                   value, create=True)
-                if err:
-                    raise ValueError(err)
+            elif split_kind == "split_s" and base_field == "table":
+                tabs = r.setdefault("tables", [])
+                if DELETE:
+                    del tabs[int(table_index)]
+                else:
+                    err = _table_write(tabs, table_index, value, create=True)
+                    if err:
+                        raise ValueError(err)
+            elif split_kind == "split_q" and base_field == "table_q":
+                tabs = r.setdefault("tables", [])
+                if DELETE:
+                    del tabs[int(table_index)]
+                else:
+                    err = _table_write(tabs, table_index, value, create=True)
+                    if err:
+                        raise ValueError(err)
             elif split_kind == "split_a" and field == "correct_option":
                 r["correct_option"] = value
         return rows
@@ -560,9 +720,9 @@ def apply_edit(output_root, q_id: str, field: str, value, reason: str = "",
         split_kind = {"question_text": "split_q", "solution_text": "split_s",
                       "correct_option": "split_a"}.get(field, "split_q")
         targets.append(split_kind)
-    elif field == "table":
+    elif base_field == "table":
         targets.append("split_s")
-    elif field == "table_q":
+    elif base_field == "table_q":
         targets.append("split_q")
 
     # ---- load, modify, write, per file ---------------------------------------
@@ -593,7 +753,8 @@ def apply_edit(output_root, q_id: str, field: str, value, reason: str = "",
 
     # ---- READ-BACK VERIFY (contract 5) ----------------------------------------
     verified = _verify_edit(out_root, q_id, field, value, option_letter,
-                            table_index)
+                            table_index,
+                            expect_len=(lens[0] - 1) if DELETE else None)
     _append_jsonl(out_root / "data" / HUMAN_EDIT_LEDGER, {
         "q_id": q_id, "field": field, "option_letter": option_letter,
         "table_index": table_index,
@@ -605,7 +766,7 @@ def apply_edit(output_root, q_id: str, field: str, value, reason: str = "",
 
 
 def _verify_edit(out_root, q_id, field, value, option_letter=None,
-                 table_index=None):
+                 table_index=None, expect_len=None):
     """Read-back from BOTH the master bundle AND the delivery split file —
     'saved' is only true when the copy the converter will read says so."""
     row = _find_master_row(out_root, q_id)
@@ -639,22 +800,27 @@ def _verify_edit(out_root, q_id, field, value, option_letter=None,
         s = any(o.get("id") == letter and o.get("text") == value
                 for o in (srow.get("options") or []))
         return m and s
-    if field == "table":
-        tabs = (row.get("solution") or {}).get("tables") or []
+    if field == "table" or field == "table_q":
+        side = "solution" if field == "table" else "question"
+        tabs = (row.get(side) or {}).get("tables") or []
         m = (isinstance(table_index, int) and 0 <= table_index < len(tabs)
              and tabs[table_index].get("markdown") == value)
-        stabs = (split_row("split_s") or {}).get("tables") or []
+        stabs = (split_row("split_s" if field == "table" else "split_q")
+                 or {}).get("tables") or []
         s = (isinstance(table_index, int) and 0 <= table_index < len(stabs)
              and stabs[table_index].get("markdown") == value)
         return m and s
-    if field == "table_q":
-        tabs = (row.get("question") or {}).get("tables") or []
-        m = (isinstance(table_index, int) and 0 <= table_index < len(tabs)
-             and tabs[table_index].get("markdown") == value)
-        stabs = (split_row("split_q") or {}).get("tables") or []
-        s = (isinstance(table_index, int) and 0 <= table_index < len(stabs)
-             and stabs[table_index].get("markdown") == value)
-        return m and s
+    if field in ("table_delete", "table_q_delete"):
+        side = "solution" if field == "table_delete" else "question"
+        sfile = "split_s" if field == "table_delete" else "split_q"
+        m = (row.get(side) or {}).get("tables") or []
+        s = (split_row(sfile) or {}).get("tables") or []
+        identical = hashlib.sha1(json.dumps(m, sort_keys=True).encode()) \
+            .hexdigest() == hashlib.sha1(json.dumps(s, sort_keys=True)
+                                         .encode()).hexdigest()
+        if expect_len is not None:
+            return identical and len(m) == expect_len   # prove the delete happened
+        return identical
     return False
 
 

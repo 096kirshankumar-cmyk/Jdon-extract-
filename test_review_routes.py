@@ -112,3 +112,42 @@ class Routes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTemplateReadability(Routes):
+    """The screen must render CONTENT readably: inline images, HTML tables,
+    page-context links, filters -- never raw markdown only."""
+
+    def seed_with_image_and_table(self):
+        imgdir = self.tmp / "assets" / "questions" / SUB
+        imgdir.mkdir(parents=True, exist_ok=True)
+        (imgdir / f"{CH}-001_SOL_01.webp").write_bytes(b"\xff" * 3000)
+        rows = [_row(1)]
+        rows[0]["solution"]["images"] = [{"file": f"{SUB}/{CH}-001_SOL_01.webp"}]
+        rows[0]["solution"]["tables"] = [{"type": "cmp",
+                                          "markdown": "| a | b |\n|---|---|\n| 1 | 2 |"}]
+        (self.tmp / "data" / "questions.jsonl").write_text(
+            "\n".join(json.dumps(r) for r in rows) + "\n")
+
+    def test_renders_readable_content(self):
+        self.seed_with_image_and_table()
+        r = self.client.get("/review")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b"/review/img?f=", r.data)      # inline image
+        self.assertIn(b"<table", r.data)              # table rendered as HTML
+        self.assertIn(b"all chapters", r.data)        # filter bar
+        self.assertIn(b"delete table", r.data.lower())
+        self.assertIn(b"/review/page?subject=", r.data)  # book-page context links
+
+    def test_filters(self):
+        r = self.client.get("/review?kind=review_needed")
+        self.assertEqual(r.status_code, 200)
+        r2 = self.client.get("/review?kind=nonsense")
+        self.assertIn(b"0 row(s) shown", r2.data)
+
+    def test_img_endpoint_guards(self):
+        self.seed_with_image_and_table()
+        ok = self.client.get(f"/review/img?f={SUB}/{CH}-001_SOL_01.webp")
+        self.assertEqual(ok.status_code, 200)
+        self.assertEqual(self.client.get("/review/img?f=../../etc/passwd").status_code, 400)
+        self.assertEqual(self.client.get(f"/review/img?f={SUB}/nope.webp").status_code, 404)
