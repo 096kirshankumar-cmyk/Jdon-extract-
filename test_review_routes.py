@@ -137,7 +137,9 @@ class TestTemplateReadability(Routes):
         self.assertIn(b"<table", r.data)              # table rendered as HTML
         self.assertIn(b"all chapters", r.data)        # filter bar
         self.assertIn(b"delete table", r.data.lower())
-        self.assertIn(b"/review/page?subject=", r.data)  # book-page context links
+        # plain page NUMBER text now (no render fetch) — user compares in own PDF
+        self.assertIn(b"source page(s):", r.data)
+        self.assertNotIn(b"/review/page?subject=", r.data)
 
     def test_filters(self):
         r = self.client.get("/review?kind=review_needed")

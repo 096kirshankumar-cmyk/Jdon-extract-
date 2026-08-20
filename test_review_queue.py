@@ -626,3 +626,34 @@ class TestFalseFigureFlags(QEnv):
         note = rq._auto_prove_no_figure(self.root, flag, bd)
         self.assertIsNotNone(note)
         self.assertIn("PROVABLY false", note)
+
+
+class TestQueueCacheAndPdfReader(QEnv):
+    """Reload drag fix: identical disk state -> queue served from cache in
+    microseconds; ANY write bumps the signature -> fresh rebuild."""
+
+    def test_second_call_is_cached_identical(self):
+        rq._QCACHE.clear()
+        a = rq.collect_review_queue(self.root)
+        b = rq.collect_review_queue(self.root)
+        self.assertIs(a, b)                     # same cached object
+
+    def test_any_write_invalidates_cache(self):
+        import json as _j
+        (self.root / "data" / "unmatched_images.jsonl").write_text(
+            _j.dumps({"chapter_id": CH, "q_no": 1,
+                      "detail": "img unclaimed demo"}) + "\n")
+        rq._QCACHE.clear()
+        a = rq.collect_review_queue(self.root)
+        real = [r["flag_key"] for r in a["rows"] if r["flag_key"]][0]
+        rq.record_decision(self.root, real, "approved")   # disk write
+        b = rq.collect_review_queue(self.root)
+        self.assertIsNot(a, b)                                 # rebuilt
+        self.assertEqual(b["counts"]["resolved"], 1)           # new decision visible
+
+    def test_pdf_reader_reused_per_book(self):
+        rq._PDF_READERS.clear()
+        rq._pdf_reader("/home/user/book2/book.pdf")
+        r1 = rq._PDF_READERS["/home/user/book2/book.pdf"]
+        rq._pdf_reader("/home/user/book2/book.pdf")
+        self.assertIs(rq._PDF_READERS["/home/user/book2/book.pdf"], r1)
