@@ -297,3 +297,52 @@ class TestLookupFullEdit(Routes):
         self.assertIn(b'value="question_text"', r.data)
         self.assertIn(b"Save answer", r.data)
         self.assertIn(b'name="back" value="/review/lookup', r.data)
+
+
+class TestManualUpload(Routes):
+    """User ask: figure never extracted -> human uploads the file, it lands
+    under the locked slot name and attaches through the verified path."""
+
+    def test_manual_upload_end_to_end(self):
+        import io
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new("RGB", (220, 160), (200, 30, 30)).save(buf, "PNG")
+        buf.seek(0)
+        r = self.client.post("/review/upload-image", content_type="multipart/form-data",
+            data={"q_id": f"{CH}-001", "side": "solution", "reason": "manual fig",
+                  "image": (buf, "fig.png")})
+        self.assertEqual(r.status_code, 302)
+        m = rq._find_master_row(self.tmp, f"{CH}-001")
+        self.assertEqual(m["solution"]["images"][0]["file"], f"{SUB}/{CH}-001_SOL_01.webp")
+        self.assertTrue((self.tmp / "assets" / "questions" / SUB /
+                         f"{CH}-001_SOL_01.webp").exists())
+        # junk upload refuses without leaving dust
+        self.assertEqual(self.client.post("/review/upload-image",
+            content_type="multipart/form-data",
+            data={"q_id": f"{CH}-001", "side": "solution"}).status_code, 302)
+
+    def test_lookup_and_queue_both_show_upload(self):
+        r = self.client.get("/review/lookup?q=1&chapter=" + CH)
+        self.assertIn(b"upload-image", r.data)
+        r2 = self.client.get("/review")
+        self.assertIn(b"upload-image", r2.data)
+
+
+class TestUploadProvenance(Routes):
+    def test_upload_writes_ownership_claim(self):
+        import io
+        import review_queue as rq
+        from PIL import Image as _Img
+        buf = io.BytesIO()
+        _Img.new("RGB", (200, 300), (90, 140, 200)).save(buf, "PNG")
+        r = self.client.post("/review/upload-image", data={
+            "q_id": f"{CH}-001", "side": "solution", "reason": "book scan",
+            "image": (io.BytesIO(buf.getvalue()), "crop.png")},
+            content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 302)
+        led = rq._read_jsonl(self.tmp / "data" / "image_ownership.jsonl")
+        self.assertTrue(led and led[-1]["method"] == "human_upload")
+        self.assertEqual(led[-1]["owner"], f"{CH}-001")
+        self.assertEqual(led[-1]["outcome"], "claimed")
+        self.assertEqual(led[-1]["confidence"], "high")

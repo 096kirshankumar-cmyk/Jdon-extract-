@@ -1640,6 +1640,14 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
               <button class="bg-emerald-600 text-white px-2 py-0.5 rounded">Attach</button>
             </div>
           </form>
+          <form method="POST" action="/review/upload-image" enctype="multipart/form-data" class="flex flex-wrap gap-1 items-center text-[11px]">
+            <input type="hidden" name="q_id" value="{{ r.q_id }}">
+            <span class="font-semibold">📤 ya manually upload karo (figure extract hi nahi hui toh):</span>
+            <input type="file" name="image" accept="image/*" class="border rounded px-1 py-0.5 flex-1 min-w-32">
+            <select name="side" class="border rounded px-1 py-0.5"><option value="solution">solution</option><option value="question">question</option></select>
+            <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 w-20">
+            <button class="bg-purple-600 text-white px-2 py-0.5 rounded">Upload</button>
+          </form>
         </div>
       </div>
     </details>
@@ -2026,6 +2034,15 @@ def _edit_forms_html(q_id, row, unclaimed_by_subject, out, back=""):
     <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 w-24">
     <button class="bg-emerald-600 text-white px-2 py-0.5 rounded">Attach</button>
   </form>""")
+    parts.append(f"""
+  <form method="POST" action="/review/upload-image" enctype="multipart/form-data" class="flex flex-wrap gap-1 items-center border-t border-dashed pt-1">
+    <input type="hidden" name="q_id" value="{q_id}">{b[0]}
+    <span class="font-semibold">📤 manual upload (pipeline ne nikali hi nahi ho toh):</span>
+    <input type="file" name="image" accept="image/*" class="border rounded px-1 py-0.5 flex-1 min-w-40">
+    <select name="side" class="border rounded px-1 py-0.5"><option value="solution">solution</option><option value="question">question</option></select>
+    <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 w-24">
+    <button class="bg-purple-600 text-white px-2 py-0.5 rounded">Upload + attach</button>
+  </form>""")
     parts.append("</div>")
     return "".join(parts)
 
@@ -2187,6 +2204,73 @@ document.querySelectorAll('button[data-imop]').forEach(function(b){
 </body></html>
 """, f=f, term=term, chapter=chapter or "", auto_chapter=auto_chapter,
     fstat=fstat, cards=cards)
+
+
+@app.route("/review/upload-image", methods=["POST"])
+def review_upload_image():
+    """Manual figure upload for pages the pipeline never extracted (chapter-end
+    figures, image-only pages). The bytes are converted to webp and stored
+    under the LOCKED q_id-locked slot name, then attached through the same
+    verified path (all copies + manifest + ledger) as every other claim."""
+    if state.get("status") == "processing":
+        return _review_redirect({"ok": False, "error": "extraction chal rahi "
+                                 "hai — run khatam hone ke baad upload karo"})
+    q_id = (request.form.get("q_id") or "").strip()
+    side = (request.form.get("side") or "solution").lower()
+    reason = request.form.get("reason") or ""
+    f = request.files.get("image")
+    if f is None or not (f.filename or "").strip():
+        return _review_redirect({"ok": False, "error": "koi image file nahi mili (upload karo)"})
+    row = review_queue._find_master_row(pipeline.OUTPUT_ROOT, q_id)
+    if row is None:
+        return _review_redirect({"ok": False, "error": f"{q_id} exist nahi karta"})
+    blob = f.read()
+    if len(blob) > 8 * 1024 * 1024:
+        return _review_redirect({"ok": False, "error": "8MB se bada file refused"})
+    try:
+        from PIL import Image
+        import io as _io
+        im = Image.open(_io.BytesIO(blob)).convert("RGB")
+        if im.size[0] < 80 or im.size[1] < 80:
+            return _review_redirect({"ok": False, "error": "bahut chhota image "
+                                    f"({im.size}) -- ye figure nahi lagta"})
+        buf = _io.BytesIO()
+        im.save(buf, "WEBP", quality=95)
+        blob = buf.getvalue()
+    except Exception as e:
+        return _review_redirect({"ok": False, "error": f"image read nahi hui: {e}"})
+    subject = q_id.split("-")[0]
+    kind = {"question": "Q", "solution": "SOL"}.get(side)
+    if not kind:
+        return _review_redirect({"ok": False, "error": "side question/solution hona chahiye"})
+    out_root = Path(pipeline.OUTPUT_ROOT)
+    qdir = out_root / "assets" / "questions" / subject
+    qdir.mkdir(parents=True, exist_ok=True)
+    slot = review_queue._next_slot(out_root, subject, q_id, kind)
+    rel = f"{subject}/{q_id}_{kind}_{slot:02d}.webp"
+    (qdir / Path(rel).name).write_bytes(blob)     # final name from the start
+    res = review_queue.apply_image_op(out_root, q_id, "attach", rel,
+                                      side=side, reason=reason or "manual upload")
+    if not res.get("ok"):
+        try:
+            (qdir / Path(rel).name).unlink()       # don't leave dust on failure
+        except Exception:
+            pass
+        return _review_redirect(res)
+    # provenance chain: the ownership ledger must know this claim too --
+    # every other claim path writes here, a human upload must not skip it.
+    review_queue._append_jsonl(Path(pipeline.OUTPUT_ROOT) / "data"
+                               / "image_ownership.jsonl", {
+        "subject": subject, "chapter_id": f"{subject}-{q_id.split('-')[1]}",
+        "page": None, "file": rel, "owner": q_id, "slot": side,
+        "method": "human_upload",
+        "evidence": f"human uploaded '{f.filename}' via review (no extraction "
+                    f"was possible for this figure)",
+        "confidence": "high", "outcome": "claimed",
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "obj_id": None, "final_file": rel})
+    log(f"🖼️ manual upload {rel} -> {q_id} ({side}); {len(blob)} bytes")
+    return _review_redirect(res, f"uploaded + attached as {rel}")
 
 
 @app.route("/download-final")
