@@ -1599,19 +1599,31 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
           </div>
           {% endfor %}
           {% endfor %}
-          <form method="POST" action="/review/apply-image" class="flex flex-wrap gap-1 items-center text-[11px]">
+          <form method="POST" action="/review/apply-image" class="text-[11px] space-y-1">
             <input type="hidden" name="q_id" value="{{ r.q_id }}">
             <input type="hidden" name="op" value="attach">
-            <span>Attach:</span>
-            <select name="file" class="border rounded px-1 py-0.5 font-mono max-w-56">
-              {% for u in unclaimed.get(m.subject, []) %}<option value="{{ u }}">{{ u }}</option>{% endfor %}
-            </select>
-            <select name="side" class="border rounded px-1 py-0.5">
-              <option value="solution">solution</option>
-              <option value="question">question</option>
-            </select>
-            <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 w-20">
-            <button class="bg-emerald-600 text-white px-2 py-0.5 rounded">Attach</button>
+            <input type="hidden" name="file" class="att-file" value="">
+            <div class="font-semibold">📎 Attach unclaimed image — tap thumbnail to pick:</div>
+            <div class="flex gap-2 overflow-x-auto py-1 border rounded bg-gray-50">
+              {% for u in unclaimed.get(m.subject, []) %}
+              <label class="att-pick shrink-0 border-2 border-transparent rounded p-1 text-center cursor-pointer hover:border-emerald-500" data-f="{{ u.f }}">
+                <img src="/review/img?f={{ u.f }}" loading="lazy" style="max-height:90px" class="rounded">
+                <span class="font-mono block">{{ u.f.split('/')[-1] }}</span>
+                {% if u.page %}<a class="text-sky-700 underline" target="_blank" href="/review/page?subject={{ m.subject }}&p={{ u.page }}">book p{{ u.page }}</a>{% endif %}
+              </label>
+              {% else %}
+              <span class="text-gray-400 p-1">(is subject ka koi unclaimed image nahi)</span>
+              {% endfor %}
+            </div>
+            <div class="flex flex-wrap gap-1 items-center">
+              <span>picked: <b class="att-show font-mono text-emerald-700">—</b></span>
+              <select name="side" class="border rounded px-1 py-0.5">
+                <option value="solution">solution</option>
+                <option value="question">question</option>
+              </select>
+              <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 flex-1">
+              <button class="bg-emerald-600 text-white px-2 py-0.5 rounded">Attach</button>
+            </div>
           </form>
         </div>
       </div>
@@ -1634,12 +1646,38 @@ document.querySelectorAll('button[data-op]').forEach(function(b){
     form.submit();
   });
 });
+// attach gallery: tap thumbnail -> fills the hidden file field of its form
+document.querySelectorAll('.att-pick').forEach(function(l){
+  l.addEventListener('click', function(ev){
+    var form = ev.target.closest('form');
+    form.querySelector('.att-file').value = l.dataset.f;
+    form.querySelector('.att-show').textContent = l.dataset.f.split('/').pop();
+    form.querySelectorAll('.att-pick').forEach(function(x){x.style.borderColor='transparent';});
+    l.style.borderColor = '#059669';
+    ev.preventDefault();
+  });
+});
+// attach with no thumbnail picked -> block before the server round-trip
+document.querySelectorAll('input.att-file').forEach(function(h){
+  h.closest('form').addEventListener('submit', function(ev){
+    if (!h.value) { alert('pehle thumbnail tap karke image choose karo'); ev.preventDefault(); }
+  });
+});
 </script>
 </body>
 </html>
 """
 
 
+
+
+def _unclaimed_panel(out, subject):
+    """[{f, page}] for the attach gallery (thumb + name + book-page chip)."""
+    out_l = []
+    for u in review_queue.unclaimed_images(out, subject)[:60]:
+        m = _re.search(r"-p(\d+)-", u.split("/")[-1])
+        out_l.append({"f": u, "page": m.group(1) if m else ""})
+    return out_l
 
 
 def _review_context(msg=None, ok=True):
@@ -1661,7 +1699,7 @@ def _review_context(msg=None, ok=True):
                 masters[qid] = row
                 subj = row.get("subject")
                 if subj and subj not in unclaimed:
-                    unclaimed[subj] = review_queue.unclaimed_images(out, subj)[:60]
+                    unclaimed[subj] = _unclaimed_panel(out, subj)
     # expand incomplete-records per-qid expansion lists onto masters too
     for r in q["rows"]:
         for e in (views.get(r["flag_key"]) or {}).get("expand") or []:

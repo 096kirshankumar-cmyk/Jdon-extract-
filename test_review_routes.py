@@ -182,3 +182,15 @@ class TestLookupFullView(Routes):
         # page 50 IS in fixture chapter range -> note shows only when detected
         auto = b"auto-detected" in r.data
         self.assertTrue(auto)
+
+
+class TestAttachGallery(Routes):
+    def test_thumbnails_replace_name_only_select(self):
+        imgdir = self.tmp / "assets" / "questions" / SUB
+        imgdir.mkdir(parents=True, exist_ok=True)
+        (imgdir / f"{SUB}-p158-388.webp").write_bytes(b"\xff" * 3000)
+        r = self.client.get("/review")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b"att-pick", r.data)                # thumbnail picker
+        self.assertIn(f"/review/img?f={SUB}/{SUB}-p158-388.webp".encode(), r.data)
+        self.assertIn(b"book p158", r.data)               # page chip on thumb
