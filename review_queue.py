@@ -540,7 +540,84 @@ def _qn_from_qid(q_id):
         return None
 
 
-def collect_review_queue(output_root) -> dict:
+_PAGE_NO_IMG_KINDS = ("declared_figure_missing", "missing_declared_figure")
+
+
+_WM_ID_CACHE = {}
+
+
+def _page_watermark_ids(pdf_path):
+    """The pipeline's own three-gate watermark detector (cached). A page that
+    carries ONLY the watermark image has NO printed figure -- without this
+    exclusion every page would 'have an image' (the stamp IS an image)."""
+    key = str(pdf_path)
+    if key not in _WM_ID_CACHE:
+        try:
+            import qbank_pipeline as _qp
+            _WM_ID_CACHE[key] = set(_qp.find_watermark_object_ids(pdf_path))
+        except Exception:
+            _WM_ID_CACHE[key] = frozenset()   # unknown -> conservative flow
+    return _WM_ID_CACHE[key]
+
+
+def _page_has_raster_image(pdf_path, page):
+    """True iff this file page carries at least one NON-watermark raster image
+    (Marrows scan books embed figures as raster objects). Zero objects on the
+    page => no figure was printed there => a 'missing figure' flag on content
+    from this page is provably false. Phoenix check -- zero tokens."""
+    try:
+        from pypdf import PdfReader
+        r = PdfReader(str(pdf_path))
+        pg = r.pages[page - 1]
+        xo = (pg.get("/Resources") or {}).get("/XObject") or {}
+        wm = _page_watermark_ids(pdf_path)
+        for name, ref in xo.items():
+            try:
+                obj_id = getattr(ref, "idnum", None)
+                if obj_id is not None and obj_id in wm:
+                    continue            # the stamp itself, not content
+                o = ref.get_object()
+                if o.get("/Subtype") != "/Image":
+                    continue
+                w, h = int(o.get("/Width", 0)), int(o.get("/Height", 0))
+                if w * h > 30000:        # anything figure-sized
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return True      # proof impossible -> stay conservative (keep flag)
+    return False
+
+
+def _auto_prove_no_figure(output_root, flag, books_dir):
+    """declared_figure_missing* flags where every implicated page has NO
+    raster image -> return a note string (auto-resolve), else None."""
+    kind = str(flag.get("kind") or "")
+    if not any(s in kind for s in _PAGE_NO_IMG_KINDS):
+        return None
+    pages = []
+    m = re.search(r"pages?\s*\[([\d,\s]+)\]", str(flag.get("detail") or ""))
+    if m:
+        pages = [int(x) for x in m.group(1).split(",") if x.strip().isdigit()]
+    if not pages and flag.get("q_id"):
+        row = _find_master_row(output_root, flag["q_id"])
+        if row:
+            pages = [p for p in (row.get("source_pages") or [])
+                     if isinstance(p, int)]
+    if not pages:
+        return None
+    subj = (flag.get("subject") or (flag.get("q_id") or "").split("-")[0])
+    pdf = Path(books_dir) / f"{subj}.pdf"
+    if not pdf.exists():
+        return None
+    if all(not _page_has_raster_image(pdf, p) for p in pages):
+        return (f"PROVABLY false: source page(s) {pages} contain no raster "
+                f"image object at all -- the model saw a TABLE and called it "
+                f"a figure. Nothing exists to attach.")
+    return None
+
+
+def collect_review_queue(output_root, books_dir=None) -> dict:
     """Read EVERYTHING and return the normalized queue. See contract 2/3."""
     out_root = Path(output_root)
     data = out_root / "data"
@@ -670,6 +747,19 @@ def collect_review_queue(output_root) -> dict:
     open_rows, done = [], 0
     auto_resolved = []
     for r in rows:
+        # PROVABLY-FALSE figure-missing flags (user asked: 'actually no image
+        # exists on the page at all'): if every implicated source page carries
+        # NO raster image object, the model merely mistook a TABLE for a
+        # figure. Nothing exists to attach -> auto-resolved, note logged.
+        if r["flag_key"] not in latest:
+            note = _auto_prove_no_figure(out_root, r,
+                                         books_dir or "/data/input_pdfs")
+            if note:
+                r["state"] = "auto_resolved"
+                r["auto_note"] = note
+                auto_resolved.append(r)
+                done += 1
+                continue
         # SELF-VERIFYING flags: a flag that names an image file must stand
         # DOWN when that file is no longer in the flagged state. "Image
         # unclaimed"-class flags become false the moment the human attaches

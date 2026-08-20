@@ -346,3 +346,34 @@ class TestUploadProvenance(Routes):
         self.assertEqual(led[-1]["owner"], f"{CH}-001")
         self.assertEqual(led[-1]["outcome"], "claimed")
         self.assertEqual(led[-1]["confidence"], "high")
+
+class TestBulkAndBack(Routes):
+    def test_bulk_ignore_kind_filter_keeps_others_open(self):
+        d = self.tmp / "data"
+        for i in range(3):
+            (d / f"unmatched_face_{i}.jsonl")  # unknown watchdog files...
+        (d / "unmatched_images.jsonl").write_text("".join(
+            json.dumps({"chapter_id": CH, "q_no": n, "detail": f"img {n} unclaimed\nMORE"})
+            + "\n" for n in (1, 2, 3)))
+        import review_queue as rq
+        base_rows = len(rq.collect_review_queue(self.tmp)["rows"])
+        r = self.client.post("/review/decide-bulk", data={
+            "action": "ignored", "kind": "unmatched_images",
+            "reason": "false alarms", "back": "/review?kind=unmatched_images"})
+        self.assertEqual(r.status_code, 302)
+        self.assertIn("/review?kind=unmatched_images", r.headers.get("Location", ""))
+        q = rq.collect_review_queue(self.tmp)
+        self.assertFalse(any(x["kind"] == "unmatched_images" for x in q["rows"]))
+        self.assertEqual(len(q["rows"]), base_rows - 3)
+
+    def test_decide_returns_to_same_filtered_view(self):
+        d = self.tmp / "data"
+        (d / "unmatched_images.jsonl").write_text(json.dumps(
+            {"chapter_id": CH, "q_no": 1, "detail": "img unclaimed"}) + "\n")
+        import review_queue as rq
+        q = rq.collect_review_queue(self.tmp)
+        keys = [x["flag_key"] for x in q["rows"] if x["kind"] == "unmatched_images"]
+        r = self.client.post("/review-decide", data={
+            "flag_keys": json.dumps(keys), "action": "ignored",
+            "back": "/review?kind=unmatched_images&sev=REVIEW"})
+        self.assertIn("kind=unmatched_images", r.headers["Location"])
