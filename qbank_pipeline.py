@@ -4768,11 +4768,13 @@ def recover_orphans(orphans, chapter_records, subject, chapter_no, stats,
             rec["correct_option"] = str(item["correct_option"]).strip().upper()
             rec["_prov"]["correct_option"] = orph_prov
         if item.get("tables"):
-            have = {t.get("markdown") for t in rec["tables"]}
-            for t in item["tables"]:
-                if t.get("markdown") not in have:
-                    rec["tables"].append(t)
-                    have.add(t.get("markdown"))
+            # AUDIT-FIX (user report, OBG-012-017): used to dedupe by EXACT
+            # markdown string only, so the same table re-arriving from another
+            # pass with spacing drift ("at4 cmof" vs "at 4 cm of") survived as
+            # a duplicate. _dedupe_tables compares whitespace-insensitively
+            # and keeps the FULLER (usually the cleaner-spaced) capture.
+            rec["tables"] = _dedupe_tables(list(rec.get("tables") or [])
+                                           + list(item["tables"] or []))
         qid = f"{subject}-{chapter_no:03d}-{owner:03d}"
         merged_something = bool(
             item.get("options") or item.get("question_text") or item.get("correct_option")
