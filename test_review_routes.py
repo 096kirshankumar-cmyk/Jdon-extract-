@@ -143,7 +143,7 @@ class TestTemplateReadability(Routes):
         r = self.client.get("/review?kind=review_needed")
         self.assertEqual(r.status_code, 200)
         r2 = self.client.get("/review?kind=nonsense")
-        self.assertIn(b"0 row(s) shown", r2.data)
+        self.assertIn(b"0 issue(s)", r2.data)
 
     def test_img_endpoint_guards(self):
         self.seed_with_image_and_table()
@@ -182,3 +182,59 @@ class TestLookupFullView(Routes):
         # page 50 IS in fixture chapter range -> note shows only when detected
         auto = b"auto-detected" in r.data
         self.assertTrue(auto)
+
+
+class TestAttachGallery(Routes):
+    def test_thumbnails_replace_name_only_select(self):
+        imgdir = self.tmp / "assets" / "questions" / SUB
+        imgdir.mkdir(parents=True, exist_ok=True)
+        (imgdir / f"{SUB}-p158-388.webp").write_bytes(b"\xff" * 3000)
+        r = self.client.get("/review")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b"att-pick", r.data)                # thumbnail picker
+        self.assertIn(f"/review/img?f={SUB}/{SUB}-p158-388.webp".encode(), r.data)
+        self.assertIn(b"book p158", r.data)               # page chip on thumb
+
+
+class TestGroupedCards(Routes):
+    """Same question flagged by the gate AND validator AND qa_status for one
+    underlying problem => ONE card, ONE decision closes every flag."""
+
+    def _multi_flag_q1(self):
+        d = self.tmp / "data"
+        (d / "export_gate.jsonl").write_text(json.dumps(
+            {"kind": "missing_declared_figure_question", "chapter_id": CH,
+             "q_no": 1, "detail": "declared but absent"}) + "\n")
+        (d / "integrity_flags.jsonl").write_text(json.dumps(
+            {"kind": "answer_key_disagrees", "chapter_id": CH,
+             "rows": [{"q_no": 1, "record": "A", "key": "C"}]}) + "\n")
+
+    def test_two_flags_one_card_one_click(self):
+        self._multi_flag_q1()
+        import review_queue as rq
+        q = rq.collect_review_queue(self.tmp)
+        cards = rq.group_review_rows(self.tmp, q["rows"], {
+            r["flag_key"]: rq.flag_extra(self.tmp, r) for r in q["rows"]})
+        q1_cards = [c for c in cards if c.get("q_id") == f"{CH}-001"]
+        self.assertEqual(len(q1_cards), 1)
+        self.assertEqual(len(q1_cards[0]["flag_keys"]), 3)   # qa row + gate + integrity
+        self.assertIn("answer_key_disagrees", q1_cards[0]["kinds"])
+        self.assertIn("missing_declared_figure_question", q1_cards[0]["kinds"])
+        # one decision click closes all three
+        keys = json.loads(q1_cards[0]["flag_keys_json"])
+        for k in keys:
+            rq.record_decision(self.tmp, k, "approved")
+        q2 = rq.collect_review_queue(self.tmp)
+        self.assertFalse(any(r.get("q_id") == f"{CH}-001" for r in q2["rows"]))
+
+    def test_route_groups_and_decides_all(self):
+        self._multi_flag_q1()
+        import review_queue as rq
+        q = rq.collect_review_queue(self.tmp)
+        cards = rq.group_review_rows(self.tmp, q["rows"], {})
+        keys = [c["flag_keys_json"] for c in cards if c.get("q_id") == f"{CH}-001"]
+        r = self.client.post("/review-decide", data={
+            "flag_keys": keys[0], "action": "approved", "reason": "group"})
+        self.assertEqual(r.status_code, 302)
+        q2 = rq.collect_review_queue(self.tmp)
+        self.assertFalse(any(x.get("q_id") == f"{CH}-001" for x in q2["rows"]))

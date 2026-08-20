@@ -182,13 +182,16 @@ def flag_extra(output_root, flag):
                     extra["expand"].append(
                         {"q_id": r.get("q_id"), "missing": miss})
 
-    if flag.get("kind") in ("orphan_unresolved", "orphans") and \
-            flag.get("source") in ("orphans.jsonl", "split orphans.jsonl"):
+    if flag.get("kind") in ("orphan_unresolved", "orphans"):
+        # EVERY orphan-flavoured flag (orphans.jsonl AND the gate/validator/
+        # completeness views of the SAME fragment) must resolve to the same
+        # physical fragment -- otherwise one real orphan shows as 4 cards.
         cands = [r for r in _read_jsonl(out / "data" / "orphans.jsonl")
                  if r.get("chapter_id") == flag.get("chapter_id")]
         # a chapter can hold several orphan rows -- match by the pages the
-        # flag detail carries; fall back to first
-        dpages = re.search(r"pdf_pages[^0-9]*\[([\d,\s]+)\]", detail)
+        # flag detail carries ("pages [53, 54]" / "pdf_pages: [53, 54]" / raw)
+        dpages = re.search(r"(?:pdf_pages|new_pages|pages)[^0-9]*\[([\d,\s]+)\]",
+                           detail)
         want = dpages.group(1).replace(" ", "") if dpages else None
         cands.sort(key=lambda r: 0 if (want and str(
             ",".join(map(str, r.get("pdf_pages") or [])).replace(" ", "")) == want)
@@ -234,6 +237,94 @@ def unclaimed_images(output_root, subject):
         return []
     return sorted(f"{subject}/{p.name}" for p in base.glob("*.webp")
                   if f"{subject}/{p.name}" not in used)
+
+
+def group_review_rows(output_root, rows, views):
+    """One CARD per real issue. The same question can be flagged by the gate,
+    the validator, and qa_status for the SAME underlying problem -- four cards
+    would mean four decisions for one issue. Group by entity:
+      - rows with a q_id -> one card per q_id
+      - orphan/unclaimed fragments crossing files (orphans.jsonl, export_gate,
+        validator, completeness) -> one card per PHYSICAL fragment (frag_key)
+      - anything else -> (chapter, kind, detail) card
+    Returns cards: [{q_id, chapter_id, subject, severity(worst), flag_keys,
+    kinds[], sources[], details[], pages[], images[], orphan(list of view
+    dicts), expand[]}]. Deciding ONE card closes ALL its flags."""
+    cards = {}
+    for r in rows:
+        v = views.get(r["flag_key"], {})
+        if r.get("q_id"):
+            key = ("qid", r["q_id"])
+        elif r.get("kind") in ("orphan_unresolved", "orphans") and v.get("frag_key"):
+            key = ("frag", r.get("chapter_id"), v["frag_key"])
+        else:
+            key = ("other", r.get("chapter_id"), r.get("kind"),
+                   str(r.get("detail", ""))[:80])
+        c = cards.get(key)
+        if c is None:
+            sev_rank = {"BLOCKER": 0, "REVIEW": 1}
+            c = {"q_id": r.get("q_id"), "chapter_id": r.get("chapter_id"),
+                 "subject": r.get("subject")
+                            or (r.get("q_id") or "").split("-")[0]
+                            or None,
+                 "severity": r["severity"], "flag_keys": [], "kinds": [],
+                 "sources": [], "details": [], "pages": [], "images": [],
+                 "orphan": [], "expand": [], "stale_notes": [],
+                 "_rank": sev_rank.get(r["severity"], 2)}
+            cards[key] = c
+        if r.get("stale_note") and r["stale_note"] not in c["stale_notes"]:
+            c["stale_notes"].append(r["stale_note"])
+        c["flag_keys"].append(r["flag_key"])
+        if r["kind"] not in c["kinds"]:
+            c["kinds"].append(r["kind"])
+        if r.get("source") not in c["sources"]:
+            c["sources"].append(r.get("source"))
+        d = str(r.get("detail") or "")
+        if d not in [x["detail"] for x in c["details"]]:
+            c["details"].append({"kind": r["kind"], "source": r.get("source"),
+                                 "detail": d})
+        for p in v.get("pages") or []:
+            if p not in c["pages"]:
+                c["pages"].append(p)
+        for im in v.get("images") or []:
+            if im not in c["images"]:
+                c["images"].append(im)
+        if v.get("orphan"):
+            c["orphan"].append(v)
+        c["expand"].extend(v.get("expand") or [])
+        if sev_rank.get(r["severity"], 2) < c["_rank"]:
+            c["_rank"] = sev_rank[r["severity"]]
+            c["severity"] = r["severity"]
+    out = list(cards.values())
+    for c in out:
+        c["pages"].sort()
+        c["expand"] = [dict(t) for t in {json.dumps(e, sort_keys=True): e
+                                         for e in c["expand"]}.values()]
+        c["flag_keys_json"] = json.dumps(c["flag_keys"])
+    out.sort(key=lambda c: (c["_rank"], str(c.get("chapter_id") or ""),
+                            c.get("q_id") or ""))
+    return out
+    """Which chapter of <subject> contains file-page <page>? chapters.json
+    ranges when present, else the split rows' source_pages min/max. Used so
+    the human types only the question NUMBER, never the chapter id."""
+    out = Path(output_root)
+    cj = out / "subjects" / subject / "chapters.json"
+    if cj.exists():
+        try:
+            for c in json.loads(cj.read_text()):
+                a, b = c.get("file_start"), c.get("file_end")
+                if a and b and int(a) <= page <= int(b):
+                    return c.get("chapter_id")
+        except Exception:
+            pass
+    for chd in sorted((out / "split" / subject).glob("*")):
+        pages = []
+        for r in _read_jsonl(chd / "questions.jsonl"):
+            pages += [p for p in (r.get("source_pages") or [])
+                      if isinstance(p, int)]
+        if pages and min(pages) <= page <= max(pages):
+            return chd.name
+    return None
 
 
 def chapter_for_page(output_root, subject, page):
@@ -411,19 +502,27 @@ def collect_review_queue(output_root) -> dict:
     for fname, _desc in FLAG_SOURCES.items():
         path = data / fname
         for frow in _read_jsonl(path):
-            kind = frow.get("kind") or fname.replace(".jsonl", "")
-            qn = frow.get("q_no")
-            cid = frow.get("chapter_id")
-            q_id = f"{cid}-{int(qn):03d}" if (cid and isinstance(qn, int)) else frow.get("q_id")
-            sev = "BLOCKER" if kind in BLOCKER_KINDS else "REVIEW"
-            detail = frow.get("detail") or json.dumps(
-                {k: v for k, v in frow.items()
-                 if k not in ("kind", "q_no", "chapter_id", "ts")},
-                ensure_ascii=False, default=str)
-            rows.append(_mk_flag(
-                kind, sev, detail, fname, chapter_id=cid, q_id=q_id,
-                q_no=qn if isinstance(qn, int) else _qn_from_qid(q_id or ""),
-                subject=(q_id or "").split("-")[0] if q_id else None))
+            # a flag row may carry multiple targets under "rows" (e.g.
+            # integrity_flags.jsonl: answer_key_disagrees with rows[])
+            targets = frow.get("rows") if isinstance(frow.get("rows"), list) \
+                and frow["rows"] else [frow]
+            for tgt in targets:
+                if not isinstance(tgt, dict):
+                    continue
+                kind = frow.get("kind") or fname.replace(".jsonl", "")
+                qn = tgt.get("q_no", frow.get("q_no"))
+                cid = tgt.get("chapter_id", frow.get("chapter_id"))
+                q_id = f"{cid}-{int(qn):03d}" if (cid and isinstance(qn, int)) \
+                    else tgt.get("q_id") or frow.get("q_id")
+                sev = "BLOCKER" if kind in BLOCKER_KINDS else "REVIEW"
+                detail = tgt.get("detail") or json.dumps(
+                    {k: v for k, v in tgt.items()
+                     if k not in ("kind", "q_no", "chapter_id", "ts")},
+                    ensure_ascii=False, default=str)
+                rows.append(_mk_flag(
+                    kind, sev, detail, fname, chapter_id=cid, q_id=q_id,
+                    q_no=qn if isinstance(qn, int) else _qn_from_qid(q_id or ""),
+                    subject=(q_id or "").split("-")[0] if q_id else None))
 
     # -- C. per-chapter split-layer completeness / unresolved ------------------
     split_root = out_root / "split"
