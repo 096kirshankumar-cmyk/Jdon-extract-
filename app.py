@@ -1336,29 +1336,31 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
   <div class="rounded p-3 text-sm font-semibold {{ 'bg-emerald-100 text-emerald-900' if ok else 'bg-red-100 text-red-900' }}">{{ msg }}</div>
   {% endif %}
 
+  <div class="sticky top-0 z-20 bg-gray-100 pb-2 -mx-3 px-3 pt-1 shadow-sm">
   <div class="bg-white rounded shadow p-3 text-sm flex gap-4 flex-wrap">
+    <span>🏷️ <b>{{ rows|length }}</b> issues <span class="text-gray-400">({{ n_raw_flags }} flags)</span></span>
     <span>🔴 <b>{{ counts.blocker }}</b> blocker</span>
     <span>🟡 <b>{{ counts.review }}</b> review</span>
     <span>✅ <b>{{ counts.resolved }}</b> resolved</span>
   </div>
 
   {% for w in warnings %}
-  <div class="bg-red-600 text-white rounded p-3 text-xs">⚠️ {{ w }}</div>
+  <div class="bg-red-600 text-white rounded p-3 text-xs mt-2">⚠️ {{ w }}</div>
   {% endfor %}
 
   {% if clear %}
-  <div class="bg-emerald-600 text-white rounded shadow p-4 text-sm font-bold">
+  <div class="bg-emerald-600 text-white rounded shadow p-4 text-sm font-bold mt-2">
     ✅ Queue CLEAR — every flag decided. Final zip unlocked:
     <a href="/download-final" class="underline">🚀 Build &amp; download final zip</a>
   </div>
   {% else %}
-  <div class="bg-rose-600 text-white rounded shadow p-3 text-xs">
+  <div class="bg-rose-600 text-white rounded shadow p-3 text-xs mt-2">
     🔒 Final zip locked — {{ counts.blocker + counts.review }} row(s) still open.
     Sab decide karne ke baad final milega.
   </div>
   {% endif %}
 
-  <form method="GET" action="/review" class="bg-white rounded shadow p-2 flex flex-wrap gap-2 text-xs items-center">
+  <form method="GET" action="/review" class="bg-white rounded shadow p-2 flex flex-wrap gap-2 text-xs items-center mt-2">
     <b>Filter:</b>
     <select name="chapter" class="border rounded px-1 py-1">
       <option value="">all chapters</option>
@@ -1374,9 +1376,11 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
       <option value="REVIEW" {{ 'selected' if sel_sev=='REVIEW' }}>only review</option>
     </select>
     <button class="bg-slate-700 text-white px-3 py-1 rounded">Apply</button>
-    <span class="text-gray-500">{{ rows|length }} row(s) shown</span>
-    <a class="bg-indigo-600 text-white px-3 py-1 rounded" href="/review/lookup">🔎 lookup (image/question status)</a>
+    <span class="text-gray-500">{{ rows|length }} issue(s)</span>
+    <a class="bg-indigo-600 text-white px-3 py-1 rounded" href="/review/lookup">🔎 lookup</a>
+    <span class="text-gray-400">(bar upar chipki rahegi — kahin se bhi search)</span>
   </form>
+  </div>
 
   {% set last_ch = [None] %}
   {% for r in rows %}
@@ -1387,25 +1391,29 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
     <div class="flex flex-wrap items-center gap-2 text-xs">
       <span class="font-bold {{ 'text-red-700' if r.severity == 'BLOCKER' else 'text-amber-700' }}">{{ r.severity }}</span>
       <span class="font-mono font-bold">{{ r.q_id or r.chapter_id or '—' }}</span>
-      <span class="bg-gray-200 rounded px-1">{{ r.kind }}</span>
-      <span class="text-gray-500">src: {{ r.source }}</span>
+      {% for k in r.kinds %}<span class="bg-gray-200 rounded px-1">{{ k }}</span>{% endfor %}
+      <span class="text-gray-500">src: {{ r.sources|join(', ') }}</span>
+      {% if r.flag_keys|length > 1 %}<span class="bg-indigo-100 text-indigo-800 rounded px-1" title="same issue flagged by many tools — ek decision se sab band">{{ r.flag_keys|length }} flags → 1 decision</span>{% endif %}
     </div>
-    <p class="text-xs text-gray-700 whitespace-pre-wrap">{{ r.detail }}</p>
-    {% if r.stale_note %}<p class="text-xs text-orange-600 font-semibold">♻️ {{ r.stale_note }}</p>{% endif %}
-
-    {# ---------- context: pages + named images + readable orphan ---------- #}
-    {% set v = views[r.flag_key] %}
-    {% if v.pages %}
-    <div class="text-[11px]">📄 book page(s):
-    {% for p in v.pages %}<a class="text-sky-700 underline font-mono" target="_blank" href="/review/page?subject={{ (r.subject or (r.chapter_id or 'X').split('-')[0]) }}&p={{ p }}">{{ p }}</a>{{ ' ' if not loop.last }}{% endfor %}
-    <span class="text-gray-400">(book page kholo aur compare karo)</span></div>
+    {% for d in r.details %}{% if loop.first %}<p class="text-xs text-gray-700 whitespace-pre-wrap">{{ d.detail }}</p>{% endif %}{% endfor %}
+    {% if r.details|length > 1 %}
+    <details class="text-[11px]"><summary class="cursor-pointer text-gray-500">🔁 same issue, {{ r.details|length }} sources — sab reports:</summary>
+      {% for d in r.details %}<p class="text-gray-600 whitespace-pre-wrap border-t pt-1 mt-1">[{{ d.kind }} · {{ d.source }}] {{ d.detail }}</p>{% endfor %}
+    </details>
     {% endif %}
-    {% if v.images %}
+    {% for sn in r.stale_notes %}<p class="text-xs text-orange-600 font-semibold">♻️ {{ sn }}</p>{% endfor %}
+
+    <div class="text-[11px]">📄 book page(s):
+    {% for p in r.pages %}<a class="text-sky-700 underline font-mono" target="_blank" href="/review/page?subject={{ r.subject }}&p={{ p }}">{{ p }}</a>{{ ' ' }}{% endfor %}
+    <span class="text-gray-400">(book page kholo aur compare karo)</span></div>
+
+    {% set v = views.get(r.flag_keys[0], {}) %}
+    {% if r.images %}
     <div class="space-y-1">
-      {% for im in v.images %}
+      {% for im in r.images %}
       <div class="border rounded p-1 bg-gray-50">
         <img class="thumb" loading="lazy" src="/review/img?f={{ im }}">
-        <div class="text-[10px] font-mono break-all text-gray-500">{{ im }}</div>
+        <div class="text-[10px] font-mono break-all text-gray-500">{{ im }} — <a class="text-sky-700 underline" href="/review/lookup?f={{ im }}">🔎 lookup</a></div>
         <form method="POST" action="/review/apply-image" class="flex flex-wrap gap-1 items-center mt-1">
           <input type="hidden" name="op" value="attach">
           <input type="hidden" name="file" value="{{ im }}">
@@ -1420,49 +1428,49 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
       {% endfor %}
     </div>
     {% endif %}
-    {% if v.orphan %}
+    {% for ov in r.orphan %}
     <div class="border border-amber-300 bg-amber-50 rounded p-2 text-[11px]">
-      <b>📦 Unclaimed fragment (pipeline ne kisi ko diya nahi):</b>
-      <div class="whitespace-pre-wrap mt-1">{{ v.orphan.text }}</div>
-      {% if v.owner_qid %}
+      <b>📦 Unclaimed fragment (pipeline ne kisi ko diYA NAHI — sab tools ne isi ko flag kiya):</b>
+      <div class="whitespace-pre-wrap mt-1">{{ ov.orphan.text }}</div>
+      {% if ov.owner_qid %}
       <div class="mt-2 border-t border-amber-300 pt-1">
-        <b>🤔 System ka best guess: {{ v.owner_qid }}</b> — compare karo:
+        <b>🤔 System ka best guess: {{ ov.owner_qid }}</b> — compare karo:
         <div class="mt-1 bg-white border rounded p-1">
           <b>Us question ki CURRENT solution (actual output):</b>
-          <div class="whitespace-pre-wrap">{{ v.owner_sol or '(abhi bilkul khaali hai — shayad yehi fragment asli solution hai!)' }}</div>
-          {% for im in (v.owner_imgs or []) %}<img class="thumb" loading="lazy" src="/review/img?f={{ im }}">{% endfor %}
+          <div class="whitespace-pre-wrap">{{ ov.owner_sol or '(abhi bilkul khaali hai — shayad yehi fragment asli solution hai!)' }}</div>
+          {% for im in (ov.owner_imgs or []) %}<img class="thumb" loading="lazy" src="/review/img?f={{ im }}">{% endfor %}
         </div>
-        {% if v.already_inside %}
+        {% if ov.already_inside %}
         <div class="mt-1 text-red-700 font-semibold">⚠️ Ye text uski solution me ALREADY maujood lagta hai (extra copy). Merge MAT karo — bas Ignore.</div>
         {% else %}
         <form method="POST" action="/review/attach-orphan" class="mt-1 flex flex-wrap gap-1 items-center">
           <input type="hidden" name="chapter_id" value="{{ r.chapter_id }}">
-          <input type="hidden" name="frag_key" value="{{ v.frag_key }}">
-          <input type="hidden" name="flag_key" value="{{ r.flag_key }}">
-          <input name="to_qid" value="{{ v.owner_qid }}" class="border rounded px-1 py-0.5 font-mono w-32">
+          <input type="hidden" name="frag_key" value="{{ ov.frag_key }}">
+          <input type="hidden" name="flag_key" value="{{ r.flag_keys[0] }}">
+          <input name="to_qid" value="{{ ov.owner_qid }}" class="border rounded px-1 py-0.5 font-mono w-32">
           <input name="reason" placeholder="why merge" class="border rounded px-1 py-0.5 flex-1">
           <button class="bg-emerald-700 text-white px-2 py-0.5 rounded">➕ Merge into this question (append + verify)</button>
         </form>
         {% endif %}
       </div>
       {% else %}
-      <div class="mt-1 text-gray-600">(koi owner guess nahi hai — approve = 'dekh liya', ignore = chhodo; merge chahiye toh machine guess nahi mila isliye manual: mujhe batao)</div>
+      <div class="mt-1 text-gray-600">(machine ka owner guess nahi mila — approve = 'dekh liya samajh gaya', ignore = 'faltu hai'. Merge manually nahi ho sakta yahan; agar content missing lagta hai toh mujhe q_id bata do.)</div>
       {% endif %}
     </div>
-    {% endif %}
-    {% if v.expand %}
+    {% endfor %}
+    {% if r.expand %}
     <div class="text-[11px] bg-red-50 border border-red-200 rounded p-1">
       <b>Exactly ye rows INCOMPLETE:</b>
-      {% for e in v.expand %}<div>• <span class="font-mono font-bold">{{ e.q_id }}</span> — missing: {{ e.missing }}</div>{% endfor %}
+      {% for e in r.expand %}<div>• <span class="font-mono font-bold">{{ e.q_id }}</span> — missing: {{ e.missing }}</div>{% endfor %}
     </div>
     {% endif %}
 
     <form method="POST" action="/review-decide" class="flex flex-wrap gap-2 items-center">
-      <input type="hidden" name="flag_key" value="{{ r.flag_key }}">
+      <input type="hidden" name="flag_keys" value='{{ r.flag_keys_json }}'>
       <input type="hidden" name="q_id" value="{{ r.q_id or '' }}">
       <input name="reason" placeholder="reason (optional)" class="text-xs border rounded px-2 py-1 flex-1">
-      <button name="action" value="approved" class="bg-emerald-600 text-white text-xs px-2 py-1 rounded">✔ Approve</button>
-      <button name="action" value="ignored" class="bg-gray-500 text-white text-xs px-2 py-1 rounded">Skip/ignore</button>
+      <button name="action" value="approved" class="bg-emerald-600 text-white text-xs px-2 py-1 rounded">✔ Approve{% if r.flag_keys|length > 1 %} (sab {{ r.flag_keys|length }}){% endif %}</button>
+      <button name="action" value="ignored" class="bg-gray-500 text-white text-xs px-2 py-1 rounded">Skip{% if r.flag_keys|length > 1 %} (sab {{ r.flag_keys|length }}){% endif %}</button>
     </form>
     <p class="text-[10px] text-gray-500">Approve/Skip sirf ye flag band karte hain — content me koi change NAHI hota. Content badalna ho toh ✏️ Edit ya ➕ Merge use karo.</p>
 
@@ -1473,6 +1481,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
       <div><b>Options:</b> {% for o in m.options %}<span class="font-mono">{{ o.id }}.</span> {{ o.text }}{{ ' | ' if not loop.last }}{% endfor %}</div>
       <div><b>Answer: {{ (m.correct_options or ['?'])[0] }}</b>{% if m.tags %} · tags: {{ m.tags }}{% endif %}</div>
       {% if m.question.images %}<div>{% for im in m.question.images %}<img class="thumb" loading="lazy" src="/review/img?f={{ im.file }}">{% endfor %}</div>{% endif %}
+      {% if m.solution.images %}<div>{% for im in m.solution.images %}<img class="thumb" loading="lazy" src="/review/img?f={{ im.file }}">{% endfor %}</div>{% endif %}
     </div>
 
     <details class="text-xs bg-gray-50 rounded p-2">
@@ -1507,11 +1516,9 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
             {% endfor %}
           </select>
           <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 flex-1">
-          <input name="reason2" class="hidden">
           <button class="bg-sky-600 text-white px-2 py-0.5 rounded">Save answer</button>
         </form>
 
-        {# ---- TABLES: rendered (readable) + edit + delete + add ---- #}
         {% for t in m.solution.tables %}
         <div class="border rounded p-1">
           <div class="rtd overflow-x-auto">{{ t.markdown | mdtable | safe }}</div>
@@ -1553,22 +1560,17 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
           </form>
         </div>
         {% endfor %}
+        {% for side_field, side_label, side_tabs in [('table', 'solution', (m.solution.tables or [])), ('table_q', 'question', (m.question.tables or []))] %}
         <form method="POST" action="/review/apply-text" class="border-t pt-1">
           <input type="hidden" name="q_id" value="{{ r.q_id }}">
-          <input type="hidden" name="field" value="table">
-          <input type="hidden" name="table_index" value="{{ (m.solution.tables or [])|length }}">
-          <label class="font-semibold">➕ Add solution table</label>
+          <input type="hidden" name="field" value="{{ side_field }}">
+          <input type="hidden" name="table_index" value="{{ side_tabs|length }}">
+          <label class="font-semibold text-[11px]">➕ Add new {{ side_label }} table (slot {{ side_tabs|length }}; uneven columns refused)</label>
           <textarea name="value" placeholder="| col | col |&#10;|---|---|&#10;| 1 | 2 |" class="w-full font-mono border rounded p-1" rows="3"></textarea>
-          <button class="bg-emerald-600 text-white px-2 py-1 rounded mt-1">Add</button>
+          <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 w-full">
+          <button class="bg-emerald-600 text-white px-2 py-1 rounded mt-1">Add {{ side_label }} table</button>
         </form>
-        <form method="POST" action="/review/apply-text">
-          <input type="hidden" name="q_id" value="{{ r.q_id }}">
-          <input type="hidden" name="field" value="table_q">
-          <input type="hidden" name="table_index" value="{{ (m.question.tables or [])|length }}">
-          <label class="font-semibold">➕ Add question table</label>
-          <textarea name="value" placeholder="| col | col |&#10;|---|---|&#10;| 1 | 2 |" class="w-full font-mono border rounded p-1" rows="3"></textarea>
-          <button class="bg-emerald-600 text-white px-2 py-1 rounded mt-1">Add</button>
-        </form>
+        {% endfor %}
 
         <form method="POST" action="/review/apply-text">
           <input type="hidden" name="q_id" value="{{ r.q_id }}">
@@ -1585,12 +1587,13 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
           {% for im in imgs %}
           <div class="border rounded p-1 bg-white">
             <img class="thumb" loading="lazy" src="/review/img?f={{ im.file }}">
+            <div class="text-[10px] font-mono break-all text-gray-500">{{ im.file }} — <a class="text-sky-700 underline" href="/review/lookup?f={{ im.file }}">🔎 lookup</a></div>
             <form method="POST" action="/review/apply-image" class="flex flex-wrap gap-1 items-center text-[11px] mt-1">
               <input type="hidden" name="q_id" value="{{ r.q_id }}">
               <input type="hidden" name="file" value="{{ im.file }}">
               <input type="hidden" name="side" value="{{ side }}">
               <input type="hidden" name="op" value="">
-              <span class="font-mono break-all">[{{ side }}] {{ im.file }}</span>
+              <span class="font-mono break-all">[{{ side }}]</span>
               <button data-op="detach" class="bg-gray-600 text-white px-2 py-0.5 rounded">Detach</button>
               <input name="to_qid" placeholder="{{ (r.q_id).rsplit('-',1)[0] }}-007" class="border rounded px-1 py-0.5 w-32">
               <button data-op="move" class="bg-amber-600 text-white px-2 py-0.5 rounded">Move→</button>
@@ -1734,7 +1737,10 @@ def review_home():
         rows = [r for r in rows if r.get("kind") == sel_kind]
     if sel_sev:
         rows = [r for r in rows if r.get("severity") == sel_sev]
-    return render_template_string(REVIEW_PAGE, rows=rows,
+    groups = review_queue.group_review_rows(pipeline.OUTPUT_ROOT, rows,
+                                            ctx["views"])
+    return render_template_string(REVIEW_PAGE, rows=groups,
+                                  n_raw_flags=len(rows),
                                   sel_chapter=sel_chapter, sel_kind=sel_kind,
                                   sel_sev=sel_sev, **{k: v for k, v in ctx.items()
                                                       if k != "rows"})
@@ -1797,13 +1803,27 @@ def _review_redirect(result, ok_word="done"):
 
 @app.route("/review-decide", methods=["POST"])
 def review_decide():
-    res = review_queue.record_decision(
-        Path(pipeline.OUTPUT_ROOT),
-        request.form.get("flag_key") or "",
-        request.form.get("action") or "",
-        request.form.get("reason") or "",
-        request.form.get("q_id") or None)
-    return _review_redirect(res, "decision saved")
+    """One click can close a whole GROUPED card: flag_keys carries every flag
+    the card covers (same question flagged by 3 sources = 1 decision)."""
+    raw = request.form.get("flag_keys") or request.form.get("flag_key") or ""
+    try:
+        keys = _json.loads(raw)
+        if isinstance(keys, str):
+            keys = [keys]
+    except Exception:
+        keys = [raw]
+    keys = [k for k in keys if k]
+    if not keys:
+        return _review_redirect({"ok": False, "error": "no flag key"})
+    action = request.form.get("action") or ""
+    reason = request.form.get("reason") or ""
+    for k in keys:
+        res = review_queue.record_decision(
+            Path(pipeline.OUTPUT_ROOT), k, action, reason,
+            request.form.get("q_id") or None)
+        if not res.get("ok"):
+            return _review_redirect(res)
+    return _review_redirect(res, f"{len(keys)} flag(s) decided")
 
 
 @app.route("/review/apply-text", methods=["POST"])
