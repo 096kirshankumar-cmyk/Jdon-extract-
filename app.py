@@ -1379,8 +1379,21 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
     <button class="bg-slate-700 text-white px-3 py-1 rounded">Apply</button>
     <span class="text-gray-500">{{ rows|length }} issue(s)</span>
     <a class="bg-indigo-600 text-white px-3 py-1 rounded" href="/review/lookup">🔎 lookup</a>
-    <span class="text-gray-400">(bar upar chipki rahegi — kahin se bhi search)</span>
+    <span class="text-gray-400">(bar upar chipki rahegi)</span>
   </form>
+  {% if rows %}
+  <form method="POST" action="/review/decide-bulk" class="bg-amber-50 border border-amber-300 rounded p-2 text-xs flex flex-wrap gap-2 items-center"
+       onsubmit="return confirm('{{ rows|length }} issue(s) ke saare flags par ye action lagega. Pakka?')">
+    <input type="hidden" name="chapter" value="{{ sel_chapter }}">
+    <input type="hidden" name="kind" value="{{ sel_kind }}">
+    <input type="hidden" name="sev" value="{{ sel_sev }}">
+    <input type="hidden" name="back" value="{{ self_qs }}">
+    <input name="reason" placeholder="reason (bulk ke liye, jaise 'image actually nahi hai page pe')" class="border rounded px-2 py-1 flex-1 bg-white">
+    <button name="action" value="ignored" class="bg-gray-600 text-white px-3 py-1 rounded">⏭️ Bulk Skip — jo abhi filter pe dikh raha hai sab</button>
+    <button name="action" value="approved" class="bg-emerald-700 text-white px-3 py-1 rounded">✔ Bulk Approve — sab is filter par</button>
+    <span class="text-gray-500">({{ rows|length }} issues affected; kind filter laga ke best use hota hai)</span>
+  </form>
+  {% endif %}
   </div>
 
   {% set last_ch = [None] %}
@@ -1480,6 +1493,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
     <form method="POST" action="/review-decide" class="flex flex-wrap gap-2 items-center">
       <input type="hidden" name="flag_keys" value='{{ r.flag_keys_json }}'>
       <input type="hidden" name="q_id" value="{{ r.q_id or '' }}">
+      <input type="hidden" name="back" value="{{ self_qs }}">
       <input name="reason" placeholder="reason (optional)" class="text-xs border rounded px-2 py-1 flex-1">
       <button name="action" value="approved" class="bg-emerald-600 text-white text-xs px-2 py-1 rounded">✔ Approve{% if r.flag_keys|length > 1 %} (sab {{ r.flag_keys|length }}){% endif %}</button>
       <button name="action" value="ignored" class="bg-gray-500 text-white text-xs px-2 py-1 rounded">Skip{% if r.flag_keys|length > 1 %} (sab {{ r.flag_keys|length }}){% endif %}</button>
@@ -1750,6 +1764,7 @@ def review_home():
     sel_chapter = request.args.get("chapter") or ""
     sel_kind = request.args.get("kind") or ""
     sel_sev = request.args.get("sev") or ""
+    ctx["self_qs"] = request.full_path if request.full_path.startswith("/review") else "/review"
     rows = ctx["rows"]
     if sel_chapter:
         rows = [r for r in rows if r.get("chapter_id") == sel_chapter]
@@ -1823,6 +1838,35 @@ def _review_redirect(result, ok_word="done"):
         sep = "&" if "?" in back else "?"
         return redirect(f"{back}{sep}ok={'1' if ok else '0'}&msg={msg}")
     return redirect(url_for("review_home", ok="1" if ok else "0", msg=msg))
+
+
+@app.route("/review/decide-bulk", methods=["POST"])
+def review_decide_bulk():
+    """Decide EVERY currently-shown open flag in one click (the filter narrows
+    the blast radius). Every flag gets its OWN ledger row, same as a manual
+    click -- bulk is a shortcut over identical loops, not a black box."""
+    action = request.form.get("action") or ""
+    if action not in ("approved", "ignored"):
+        return _review_redirect({"ok": False, "error": "bad action"})
+    out = Path(pipeline.OUTPUT_ROOT)
+    q = review_queue.collect_review_queue(out)
+    rows = q["rows"]
+    ch, kd, sv = (request.form.get("chapter") or "",
+                  request.form.get("kind") or "", request.form.get("sev") or "")
+    if ch:
+        rows = [r for r in rows if r.get("chapter_id") == ch]
+    if kd:
+        rows = [r for r in rows if r.get("kind") == kd]
+    if sv:
+        rows = [r for r in rows if r.get("severity") == sv]
+    n = 0
+    for r in rows:
+        res = review_queue.record_decision(
+            out, r["flag_key"], action,
+            request.form.get("reason") or f"bulk {action} via filter view",
+            r.get("q_id") or None)
+        n += bool(res.get("ok"))
+    return _review_redirect({"ok": True}, f"bulk {action}: {n} flag(s) decided")
 
 
 @app.route("/review-decide", methods=["POST"])

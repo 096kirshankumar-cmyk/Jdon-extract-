@@ -11,6 +11,7 @@ import json
 import shutil
 import tempfile
 import unittest
+import os
 import zipfile
 from pathlib import Path
 
@@ -597,3 +598,31 @@ class TestOrphanPartialMerge(QEnv):
         self.assertFalse(res["ok"])
         m = rq._find_master_row(self.root, f"{CH}-001")
         self.assertEqual(m["solution"]["text"].count("Exactly this sentence"), 1)
+
+
+BOOK2 = "/home/user/book2/book.pdf"
+
+class TestFalseFigureFlags(QEnv):
+    """'declared_figure_missing' fires because Gemini said has_figure -- but
+    when the source page carries NO raster image at all (only the watermark
+    stamp), the claim is provably false: nothing exists to attach. These must
+    auto-resolve instead of eating human time (user: 450 flags, most false --
+    'image hai hi nahi actually')."""
+
+    @unittest.skipUnless(os.path.exists(BOOK2), "book2 absent")
+    def test_page_probe_markdownreseals_watermark_only_pages(self):
+        self.assertFalse(rq._page_has_raster_image(BOOK2, 181))  # watermark only
+        self.assertTrue(rq._page_has_raster_image(BOOK2, 188))   # real figure
+
+    @unittest.skipUnless(os.path.exists(BOOK2), "book2 absent")
+    def test_noimage_page_flag_autoresolves_as_false(self):
+        import shutil as _sh
+        bd = self.root / "books"; bd.mkdir(exist_ok=True)
+        _sh.copy(BOOK2, bd / f"{SUB}.pdf")
+        self.masters[0]["source_pages"] = [181]
+        self._write_masters(self.masters)
+        flag = {"kind": "declared_figure_missing_solution", "chapter_id": CH,
+                "q_id": f"{CH}-001", "subject": SUB, "detail": "x"}
+        note = rq._auto_prove_no_figure(self.root, flag, bd)
+        self.assertIsNotNone(note)
+        self.assertIn("PROVABLY false", note)
