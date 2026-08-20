@@ -327,3 +327,22 @@ class TestManualUpload(Routes):
         self.assertIn(b"upload-image", r.data)
         r2 = self.client.get("/review")
         self.assertIn(b"upload-image", r2.data)
+
+
+class TestUploadProvenance(Routes):
+    def test_upload_writes_ownership_claim(self):
+        import io
+        import review_queue as rq
+        from PIL import Image as _Img
+        buf = io.BytesIO()
+        _Img.new("RGB", (200, 300), (90, 140, 200)).save(buf, "PNG")
+        r = self.client.post("/review/upload-image", data={
+            "q_id": f"{CH}-001", "side": "solution", "reason": "book scan",
+            "image": (io.BytesIO(buf.getvalue()), "crop.png")},
+            content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 302)
+        led = rq._read_jsonl(self.tmp / "data" / "image_ownership.jsonl")
+        self.assertTrue(led and led[-1]["method"] == "human_upload")
+        self.assertEqual(led[-1]["owner"], f"{CH}-001")
+        self.assertEqual(led[-1]["outcome"], "claimed")
+        self.assertEqual(led[-1]["confidence"], "high")

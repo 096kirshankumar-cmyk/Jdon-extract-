@@ -2257,6 +2257,18 @@ def review_upload_image():
         except Exception:
             pass
         return _review_redirect(res)
+    # provenance chain: the ownership ledger must know this claim too --
+    # every other claim path writes here, a human upload must not skip it.
+    review_queue._append_jsonl(Path(pipeline.OUTPUT_ROOT) / "data"
+                               / "image_ownership.jsonl", {
+        "subject": subject, "chapter_id": f"{subject}-{q_id.split('-')[1]}",
+        "page": None, "file": rel, "owner": q_id, "slot": side,
+        "method": "human_upload",
+        "evidence": f"human uploaded '{f.filename}' via review (no extraction "
+                    f"was possible for this figure)",
+        "confidence": "high", "outcome": "claimed",
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "obj_id": None, "final_file": rel})
     log(f"🖼️ manual upload {rel} -> {q_id} ({side}); {len(blob)} bytes")
     return _review_redirect(res, f"uploaded + attached as {rel}")
 
