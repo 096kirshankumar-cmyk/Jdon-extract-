@@ -236,6 +236,30 @@ def unclaimed_images(output_root, subject):
                   if f"{subject}/{p.name}" not in used)
 
 
+def chapter_for_page(output_root, subject, page):
+    """Which chapter of <subject> contains file-page <page>? chapters.json
+    ranges when present, else the split rows' source_pages min/max. Used so
+    the human types only the question NUMBER, never the chapter id."""
+    out = Path(output_root)
+    cj = out / "subjects" / subject / "chapters.json"
+    if cj.exists():
+        try:
+            for c in json.loads(cj.read_text()):
+                a, b = c.get("file_start"), c.get("file_end")
+                if a and b and int(a) <= page <= int(b):
+                    return c.get("chapter_id")
+        except Exception:
+            pass
+    for chd in sorted((out / "split" / subject).glob("*")):
+        pages = []
+        for r in _read_jsonl(chd / "questions.jsonl"):
+            pages += [p for p in (r.get("source_pages") or [])
+                      if isinstance(p, int)]
+        if pages and min(pages) <= page <= max(pages):
+            return chd.name
+    return None
+
+
 def image_status(output_root, file_rel):
     """Where does this image file stand right now?
     {exists_on_disk, owners:[q_id...], page (from temp name), attached_seen}

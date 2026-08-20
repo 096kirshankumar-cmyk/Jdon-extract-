@@ -1834,71 +1834,119 @@ def review_apply_image():
 
 @app.route("/review/lookup")
 def review_lookup():
-    """'Ye file kahin hui h ki nahi?' / 'ye question me kya hai?' -- search
-    panel. Never changes data; only reads. Shows owners of a file and the
-    question's current content side by side, with a guarded attach form."""
+    """Full-view lookup: ek q_id/number daalo -> poora question jaise final
+    app me dikhega. Image file daali ho toh uska TRUE status (owner / disk /
+    book page) + chapter is auto-guessed from the crop's page so you only
+    ever type the question NUMBER."""
     out = Path(pipeline.OUTPUT_ROOT)
     f = (request.args.get("f") or "").strip()
     term = (request.args.get("q") or "").strip()
     chapter = (request.args.get("chapter") or "").strip() or None
     fstat = review_queue.image_status(out, f) if f else None
+
+    # minimum typing: bare number without chapter -> try every chapter of the
+    # subject (file name carries subject; chapter from page via chapters.json
+    # ranges or split source_pages)
+    auto_chapter = None
+    if term and not chapter:
+        if fstat and fstat.get("page"):
+            subj = fstat["file"].split("/")[0]
+            chapter = review_queue.chapter_for_page(out, subj,
+                                                    fstat["page"]) or None
+            if chapter:
+                auto_chapter = chapter
     rows = review_queue.lookup_questions(out, term, chapter) if term else []
-    hoisted = []
-    for r in rows:
-        hoisted.append({
-            "id": r.get("id"),
-            "stem": str((r.get("question") or {}).get("text") or "")[:240],
+    if not rows and term and not chapter:
+        # last-resort: q_no across ALL chapters
+        rows = review_queue.lookup_questions(out, term)
+
+    def full_view(r):
+        return {
+            "id": r.get("id"), "subject": r.get("subject"),
+            "chapter_id": r.get("chapter_id"),
+            "stem": str((r.get("question") or {}).get("text") or ""),
+            "options": [{"id": o.get("id"),
+                         "text": str(o.get("text") or ""),
+                         "imgs": [i.get("file") for i in (o.get("images") or [])
+                                  if isinstance(i, dict)]}
+                        for o in (r.get("options") or [])],
             "ans": (r.get("correct_options") or ["?"])[0],
-            "sol": str((r.get("solution") or {}).get("text") or "")[:240],
+            "sol": str((r.get("solution") or {}).get("text") or ""),
             "q_imgs": [i.get("file") for i in ((r.get("question") or {}).get("images") or []) if isinstance(i, dict)],
             "s_imgs": [i.get("file") for i in ((r.get("solution") or {}).get("images") or []) if isinstance(i, dict)],
-            "qa": r.get("qa_status"),
+            "q_tables": (r.get("question") or {}).get("tables") or [],
+            "s_tables": (r.get("solution") or {}).get("tables") or [],
+            "qa": r.get("qa_status"), "qa_reasons": r.get("qa_reasons") or [],
             "pages": r.get("source_pages") or [],
-        })
+        }
+    cards = [full_view(r) for r in rows]
     return render_template_string("""
 <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
-<script src="https://cdn.tailwindcss.com"></script><title>Lookup</title></head>
-<body class="bg-gray-100 p-3"><div class="max-w-2xl mx-auto space-y-3">
-<h1 class="text-lg font-bold">🔎 Review lookup</h1>
+<script src="https://cdn.tailwindcss.com"></script><title>Lookup</title>
+<style>.rtd table{border-collapse:collapse;font-size:12px;background:#fff}
+.rtd th,.rtd td{border:1px solid #cbd5e1;padding:3px 8px;text-align:left}
+img.big{max-width:100%;border:1px solid #94a3b8;border-radius:8px;background:#fff}</style></head>
+<body class="bg-gray-100 p-3"><div class="max-w-3xl mx-auto space-y-3">
+<h1 class="text-lg font-bold">🔎 Full-view lookup</h1>
 <a href="/review" class="text-xs text-sky-700 underline">← queue wapas</a>
-<form method="GET" class="bg-white rounded shadow p-2 text-xs flex flex-wrap gap-2">
-  <input name="q" value="{{ term }}" placeholder="q_id ya q_no (jaise 9)" class="border rounded px-2 py-1 flex-1 font-mono">
-  <input name="chapter" value="{{ chapter or '' }}" placeholder="chapter (OBG-003) optional" class="border rounded px-2 py-1 w-40 font-mono">
-  <input name="f" value="{{ f }}" placeholder="image file (OBG/OBG-...webp) optional" class="border rounded px-2 py-1 w-56 font-mono">
-  <button class="bg-slate-700 text-white px-3 py-1 rounded">Search</button>
+<form method="GET" class="bg-white rounded shadow p-3 text-sm flex flex-wrap gap-2">
+  <input name="q" value="{{ term }}" placeholder="9 ya OBG-003-009 ya 003-009" class="border rounded px-2 py-1 flex-1 font-mono" autofocus>
+  <input name="chapter" value="{{ chapter or '' }}" placeholder="chapter (optional — auto from image page)" class="border rounded px-2 py-1 w-56 font-mono">
+  <input name="f" value="{{ f }}" placeholder="image file (optional)" class="border rounded px-2 py-1 w-64 font-mono">
+  <button class="bg-slate-700 text-white px-4 py-1 rounded">Dikhao</button>
 </form>
+{% if auto_chapter %}<div class="text-[11px] text-emerald-700">ℹ️ chapter auto-detected from the image's page: <b>{{ auto_chapter }}</b> — tumhara sirf number kaafi tha</div>{% endif %}
+
 {% if fstat %}
-<div class="bg-white rounded shadow p-3 text-xs space-y-1">
+<div class="bg-white rounded shadow p-3 text-xs space-y-1 border-l-4 border-indigo-500">
   <b>🖼️ File status:</b> <span class="font-mono">{{ fstat.file }}</span>
   <div>disk pe hai: <b>{{ 'haan' if fstat.exists_on_disk else 'NAHI' }}</b>{% if fstat.page %} · book page: <a class="text-sky-700 underline" target="_blank" href="/review/page?subject={{ fstat.file.split('/')[0] }}&p={{ fstat.page }}">{{ fstat.page }}</a>{% endif %}</div>
-  <div>current owner(s): <b class="font-mono">{{ fstat.owners or 'KISI KO NAHI (unlinked)' }}</b></div>
+  <div class="text-sm">current owner(s): <b class="font-mono">{{ fstat.owners|join(', ') if fstat.owners else '❌ KISI KO NAHI (unlinked)' }}</b></div>
+  <div><img class="big" src="/review/img?f={{ fstat.file }}"></div>
 </div>
 {% endif %}
-{% for r in rows %}
-<div class="bg-white rounded shadow p-3 text-xs space-y-1 border-l-4 border-sky-400">
-  <div class="font-mono font-bold">{{ r.id }}</div>
-  <div><b>Stem:</b> {{ r.stem }}</div>
-  <div><b>Answer: {{ r.ans }}</b> · qa: {{ r.qa }} · pages: {{ r.pages }}</div>
-  <div><b>Solution:</b> {{ r.sol }}</div>
-  {% if r.q_imgs or r.s_imgs %}<div>{% for im in r.q_imgs + r.s_imgs %}<img src="/review/img?f={{ im }}" style="max-height:110px;border:1px solid #94a3b8;border-radius:6px">{% endfor %}</div>{% endif %}
-  {% if fstat and fstat.exists_on_disk %}
-  <form method="POST" action="/review/apply-image" class="flex flex-wrap gap-1 items-center border-t pt-1">
-    <input type="hidden" name="q_id" value="{{ r.id }}">
+
+{% for m in cards %}
+<div class="bg-white rounded shadow p-4 space-y-3 border-l-4 border-sky-500 text-sm">
+  <div class="flex flex-wrap gap-2 items-center">
+    <span class="font-mono font-bold text-base">{{ m.id }}</span>
+    <span class="text-xs bg-gray-200 rounded px-1">qa: {{ m.qa }}</span>
+    <span class="text-xs">pages: {% for p in m.pages %}<a class="text-sky-700 underline" target="_blank" href="/review/page?subject={{ m.subject }}&p={{ p }}">{{ p }}</a> {% endfor %}</span>
+    <a class="text-xs text-sky-700 underline" href="/review?chapter={{ m.chapter_id }}">is chapter ki queue →</a>
+  </div>
+  {% if m.qa_reasons %}<div class="text-[11px] text-amber-700">⚠ {{ m.qa_reasons|join('; ') }}</div>{% endif %}
+  <div><b>Stem:</b><div class="mt-1 whitespace-pre-wrap">{{ m.stem }}</div></div>
+  {% for im in m.q_imgs %}<div><img class="big" src="/review/img?f={{ im }}"><div class="text-[10px] font-mono text-gray-500">{{ im }}</div></div>{% endfor %}
+  {% for t in m.q_tables %}<div class="rtd overflow-x-auto">{{ t.markdown | mdtable | safe }}</div>{% endfor %}
+  <div class="border rounded p-2 bg-slate-50">
+    <b>Options:</b>
+    {% for o in m.options %}
+    <div class="mt-1"><span class="font-mono font-bold">{{ o.id }}.</span> {{ o.text }}
+      {% for im in o.imgs %}<img class="big" src="/review/img?f={{ im }}">{% endfor %}</div>
+    {% endfor %}
+  </div>
+  <div class="font-bold">✅ Answer: {{ m.ans }}</div>
+  <div><b>Solution (full):</b><div class="mt-1 whitespace-pre-wrap">{{ m.sol }}</div></div>
+  {% for im in m.s_imgs %}<div><img class="big" src="/review/img?f={{ im }}"><div class="text-[10px] font-mono text-gray-500">{{ im }}</div></div>{% endfor %}
+  {% for t in m.s_tables %}<div class="rtd overflow-x-auto">{{ t.markdown | mdtable | safe }}</div>{% endfor %}
+  {% if fstat and fstat.exists_on_disk and m.id not in fstat.owners %}
+  <form method="POST" action="/review/apply-image" class="flex flex-wrap gap-1 items-center border-t pt-2 text-xs">
+    <input type="hidden" name="q_id" value="{{ m.id }}">
     <input type="hidden" name="op" value="attach">
     <input type="hidden" name="file" value="{{ fstat.file }}">
-    <span class="font-semibold">{{ fstat.file.split('/')[-1] }} ko yahan attach:</span>
+    <span class="font-semibold">{{ fstat.file.split('/')[-1] }} ko {{ m.id }} me attach:</span>
     <select name="side" class="border rounded px-1 py-0.5"><option value="solution">solution</option><option value="question">question</option></select>
     <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 flex-1">
-    <button class="bg-emerald-600 text-white px-2 py-0.5 rounded">Attach</button>
-    <span class="text-gray-400">already yahin hui hai toh attach refuse ho jayega (safe)</span>
+    <button class="bg-emerald-600 text-white px-3 py-1 rounded font-bold">Attach</button>
   </form>
   {% endif %}
 </div>
 {% else %}
-{% if term %}<div class="text-xs text-gray-600">koi row nahi mili: {{ term }}</div>{% endif %}
+{% if term %}<div class="text-sm text-gray-600 bg-white rounded shadow p-3">koi row nahi mili: <b>{{ term }}</b> — q_id ya bare number try karo</div>{% endif %}
 {% endfor %}
 </div></body></html>
-""", f=f, term=term, chapter=chapter, fstat=fstat, rows=hoisted)
+""", f=f, term=term, chapter=chapter or "", auto_chapter=auto_chapter,
+    fstat=fstat, cards=cards)
 
 
 @app.route("/download-final")

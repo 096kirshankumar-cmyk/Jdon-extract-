@@ -519,3 +519,17 @@ class TestLookup(QEnv):
         self.assertTrue(r["ok"], r)
         st = rq.image_status(self.root, f"{SUB}/{CH}-001_SOL_01.webp")
         self.assertEqual(st["owners"], [f"{CH}-001"])
+
+
+class TestChapterForPage(QEnv):
+    def test_chapter_from_split_pages(self):
+        # fixture split rows carry source_pages [50] -> page 50 maps to CH
+        self.assertEqual(rq.chapter_for_page(self.root, SUB, 50), CH)
+        self.assertIsNone(rq.chapter_for_page(self.root, SUB, 999))
+
+    def test_chapter_from_chapters_json_ranges(self):
+        cjd = self.root / "subjects" / SUB
+        cjd.mkdir(parents=True, exist_ok=True)
+        cjd.joinpath("chapters.json").write_text(json.dumps(
+            [{"chapter_id": CH, "file_start": 48, "file_end": 65}]))
+        self.assertEqual(rq.chapter_for_page(self.root, SUB, 61), CH)
