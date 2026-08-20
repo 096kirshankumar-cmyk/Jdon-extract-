@@ -1375,6 +1375,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
     </select>
     <button class="bg-slate-700 text-white px-3 py-1 rounded">Apply</button>
     <span class="text-gray-500">{{ rows|length }} row(s) shown</span>
+    <a class="bg-indigo-600 text-white px-3 py-1 rounded" href="/review/lookup">🔎 lookup (image/question status)</a>
   </form>
 
   {% set last_ch = [None] %}
@@ -1829,6 +1830,75 @@ def review_apply_image():
         to_qid=request.form.get("to_qid") or None,
         reason=request.form.get("reason") or "")
     return _review_redirect(res, "image op done")
+
+
+@app.route("/review/lookup")
+def review_lookup():
+    """'Ye file kahin hui h ki nahi?' / 'ye question me kya hai?' -- search
+    panel. Never changes data; only reads. Shows owners of a file and the
+    question's current content side by side, with a guarded attach form."""
+    out = Path(pipeline.OUTPUT_ROOT)
+    f = (request.args.get("f") or "").strip()
+    term = (request.args.get("q") or "").strip()
+    chapter = (request.args.get("chapter") or "").strip() or None
+    fstat = review_queue.image_status(out, f) if f else None
+    rows = review_queue.lookup_questions(out, term, chapter) if term else []
+    hoisted = []
+    for r in rows:
+        hoisted.append({
+            "id": r.get("id"),
+            "stem": str((r.get("question") or {}).get("text") or "")[:240],
+            "ans": (r.get("correct_options") or ["?"])[0],
+            "sol": str((r.get("solution") or {}).get("text") or "")[:240],
+            "q_imgs": [i.get("file") for i in ((r.get("question") or {}).get("images") or []) if isinstance(i, dict)],
+            "s_imgs": [i.get("file") for i in ((r.get("solution") or {}).get("images") or []) if isinstance(i, dict)],
+            "qa": r.get("qa_status"),
+            "pages": r.get("source_pages") or [],
+        })
+    return render_template_string("""
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.tailwindcss.com"></script><title>Lookup</title></head>
+<body class="bg-gray-100 p-3"><div class="max-w-2xl mx-auto space-y-3">
+<h1 class="text-lg font-bold">🔎 Review lookup</h1>
+<a href="/review" class="text-xs text-sky-700 underline">← queue wapas</a>
+<form method="GET" class="bg-white rounded shadow p-2 text-xs flex flex-wrap gap-2">
+  <input name="q" value="{{ term }}" placeholder="q_id ya q_no (jaise 9)" class="border rounded px-2 py-1 flex-1 font-mono">
+  <input name="chapter" value="{{ chapter or '' }}" placeholder="chapter (OBG-003) optional" class="border rounded px-2 py-1 w-40 font-mono">
+  <input name="f" value="{{ f }}" placeholder="image file (OBG/OBG-...webp) optional" class="border rounded px-2 py-1 w-56 font-mono">
+  <button class="bg-slate-700 text-white px-3 py-1 rounded">Search</button>
+</form>
+{% if fstat %}
+<div class="bg-white rounded shadow p-3 text-xs space-y-1">
+  <b>🖼️ File status:</b> <span class="font-mono">{{ fstat.file }}</span>
+  <div>disk pe hai: <b>{{ 'haan' if fstat.exists_on_disk else 'NAHI' }}</b>{% if fstat.page %} · book page: <a class="text-sky-700 underline" target="_blank" href="/review/page?subject={{ fstat.file.split('/')[0] }}&p={{ fstat.page }}">{{ fstat.page }}</a>{% endif %}</div>
+  <div>current owner(s): <b class="font-mono">{{ fstat.owners or 'KISI KO NAHI (unlinked)' }}</b></div>
+</div>
+{% endif %}
+{% for r in rows %}
+<div class="bg-white rounded shadow p-3 text-xs space-y-1 border-l-4 border-sky-400">
+  <div class="font-mono font-bold">{{ r.id }}</div>
+  <div><b>Stem:</b> {{ r.stem }}</div>
+  <div><b>Answer: {{ r.ans }}</b> · qa: {{ r.qa }} · pages: {{ r.pages }}</div>
+  <div><b>Solution:</b> {{ r.sol }}</div>
+  {% if r.q_imgs or r.s_imgs %}<div>{% for im in r.q_imgs + r.s_imgs %}<img src="/review/img?f={{ im }}" style="max-height:110px;border:1px solid #94a3b8;border-radius:6px">{% endfor %}</div>{% endif %}
+  {% if fstat and fstat.exists_on_disk %}
+  <form method="POST" action="/review/apply-image" class="flex flex-wrap gap-1 items-center border-t pt-1">
+    <input type="hidden" name="q_id" value="{{ r.id }}">
+    <input type="hidden" name="op" value="attach">
+    <input type="hidden" name="file" value="{{ fstat.file }}">
+    <span class="font-semibold">{{ fstat.file.split('/')[-1] }} ko yahan attach:</span>
+    <select name="side" class="border rounded px-1 py-0.5"><option value="solution">solution</option><option value="question">question</option></select>
+    <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 flex-1">
+    <button class="bg-emerald-600 text-white px-2 py-0.5 rounded">Attach</button>
+    <span class="text-gray-400">already yahin hui hai toh attach refuse ho jayega (safe)</span>
+  </form>
+  {% endif %}
+</div>
+{% else %}
+{% if term %}<div class="text-xs text-gray-600">koi row nahi mili: {{ term }}</div>{% endif %}
+{% endfor %}
+</div></body></html>
+""", f=f, term=term, chapter=chapter, fstat=fstat, rows=hoisted)
 
 
 @app.route("/download-final")

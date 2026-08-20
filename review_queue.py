@@ -236,6 +236,45 @@ def unclaimed_images(output_root, subject):
                   if f"{subject}/{p.name}" not in used)
 
 
+def image_status(output_root, file_rel):
+    """Where does this image file stand right now?
+    {exists_on_disk, owners:[q_id...], page (from temp name), attached_seen}
+    -- the lookup answer for 'ye image asal me kahin hui h ki nahi'."""
+    out = Path(output_root)
+    refs = _image_refs(out, file_rel)
+    m = re.search(r"/[\w-]+-p(\d+)-", file_rel)
+    return {
+        "file": file_rel,
+        "exists_on_disk": (out / "assets" / "questions" / file_rel).exists(),
+        "owners": refs,
+        "page": int(m.group(1)) if m else None,
+    }
+
+
+def lookup_questions(output_root, term, chapter_id=None):
+    """Find master rows by q_id fragment or q_no (+optional chapter).
+    Accepts: 'OBG-003-009', '003-009', '9' + chapter, 'q9' + chapter.
+    Returns list of rows (never raises)."""
+    out = Path(output_root)
+    term = (term or "").strip()
+    rows = _read_jsonl(out / "data" / "questions.jsonl")
+    if not term:
+        return []
+    hit = [r for r in rows if term.lower() in str(r.get("id", "")).lower()]
+    if hit:
+        return hit
+    m = re.match(r"^(?:q\s*)?(\d{1,3})$", term, re.I)
+    if m and chapter_id:
+        qn = int(m.group(1))
+        want = f"{chapter_id}-{qn:03d}"
+        return [r for r in rows if r.get("id") == want]
+    m2 = re.match(r"^(\d{1,3})-(\d{1,3})$", term)   # '3-9' = chapter 3 q 9
+    if m2 and not chapter_id:
+        cid = None
+        return hit
+    return hit
+
+
 _RE_FLAGS_KNOWN_FILE = re.compile(r"\.jsonl$")
 
 
@@ -1156,15 +1195,36 @@ def apply_image_op(output_root, q_id: str, op: str, file: str,
             return {"ok": False, "error": f"{file} not under assets/questions/"}
         if q_id in refs:
             return {"ok": False, "error": f"{file} already attached to {q_id}"}
+        # an UNREFERENCED crop-style file takes the owner's slot name on
+        # attach (locked naming in exports); shared files are never renamed
+        eff = file
+        if re.search(r"-p\d+-", file) and not refs:
+            kind = _KIND_FOR[side]
+            letter = f"{kind}_{option_letter.upper()}" if side == "option" else kind
+            slot = _next_slot(out_root, subject, q_id, letter)
+            new_name = f"{subject}/{q_id}_{letter}_{slot:02d}.webp"
+            new_asset = _assets_rel(out_root) / new_name
+            asset.rename(new_asset)
+            pm = re.search(r"-p(\d+)-", file)
+            _append_jsonl(out_root / "data" / "image_ownership.jsonl", {
+                "subject": subject, "chapter_id": chap,
+                "page": int(pm.group(1)) if pm else None,
+                "file": file, "owner": q_id, "slot": side,
+                "method": "human_edit",
+                "evidence": f"human attached crop {file} (review queue)",
+                "confidence": "high", "outcome": "claimed",
+                "ts": _now(), "obj_id": None, "final_file": new_name})
+            eff = new_name
         changed = _update_image_lists(out_root, q_id, side, option_letter,
-                                      file, add=True)
+                                      eff, add=True)
         _rebuild_manifest(out_root, subject, chap, _ledger_page_map(out_root))
         _append_jsonl(out_root / "data" / HUMAN_EDIT_LEDGER, {
             "q_id": q_id, "field": "image", "op": "attach", "file": file,
-            "side": side, "reason": reason or "", "ts": _now(),
+            "final_file": eff, "side": side, "reason": reason or "",
+            "ts": _now(),
             "note": ("shared with " + ",".join(refs)) if refs else "fresh attach",
             "changed_files": changed})
-        return {"ok": True, "changed_files": changed,
+        return {"ok": True, "changed_files": changed, "new_file": eff,
                 "shared_with": [r for r in refs if r != q_id]}
 
     # ---- move ---------------------------------------------------------------

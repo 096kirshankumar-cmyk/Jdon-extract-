@@ -494,3 +494,28 @@ class TestOrphanMerge(QEnv):
         self.assertEqual(ex["owner_qid"], f"{CH}-002")
         self.assertTrue(ex["already_inside"])        # screen will say: just Ignore
         self.assertIn("Owner current", ex["owner_sol"])
+
+
+class TestLookup(QEnv):
+    def test_lookup_by_full_and_bare(self):
+        rows = rq.lookup_questions(self.root, f"{CH}-002")
+        self.assertEqual(len(rows), 1)
+        rows = rq.lookup_questions(self.root, "2", chapter_id=CH)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], f"{CH}-002")
+
+    def test_image_status_answers_ownership(self):
+        (self.root / "assets" / "questions" / SUB).mkdir(parents=True,
+                                                         exist_ok=True)
+        f = f"{SUB}/{CH}-p47-128.webp"
+        (self.root / "assets" / "questions" / f).write_bytes(b"\xff" * 3000)
+        st = rq.image_status(self.root, f)
+        self.assertTrue(st["exists_on_disk"])
+        self.assertEqual(st["owners"], [])
+        self.assertEqual(st["page"], 47)
+        # attach it, then status must name the owner
+        r = rq.apply_image_op(self.root, f"{CH}-001", "attach", f,
+                              side="solution")
+        self.assertTrue(r["ok"], r)
+        st = rq.image_status(self.root, f"{SUB}/{CH}-001_SOL_01.webp")
+        self.assertEqual(st["owners"], [f"{CH}-001"])
