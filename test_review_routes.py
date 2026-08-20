@@ -238,3 +238,52 @@ class TestGroupedCards(Routes):
         self.assertEqual(r.status_code, 302)
         q2 = rq.collect_review_queue(self.tmp)
         self.assertFalse(any(x.get("q_id") == f"{CH}-001" for x in q2["rows"]))
+
+
+class TestSelfVerifyingAndGuides(Routes):
+    """attach the image ONCE -> its flag auto-closes on next queue rebuild
+    (user pain: 'approval ke baad bhi flag khada tha'). Same file flagged by
+    3 sources -> one card (group by file)."""
+
+    def _seed_unclaimed_flag(self):
+        d = self.tmp / "data"
+        (self.tmp / "assets" / "questions" / SUB).mkdir(parents=True, exist_ok=True)
+        f = f"{SUB}/{CH}-p31-83.webp"
+        (self.tmp / "assets" / "questions" / f).write_bytes(b"\xff" * 3000)
+        (d / "unmatched_images.jsonl").write_text(json.dumps(
+            {"subject": SUB, "page": 31, " files": [f], "detail": f"not owned: ['{f}']"})+"\n")
+        (d / "unresolved_images.jsonl").write_text(json.dumps(
+            {"subject": SUB, "page": 31, "file": f,
+             "reason": "no owner after all levels"})+"\n")
+
+    def test_same_file_one_card(self):
+        self._seed_unclaimed_flag()
+        import review_queue as rq
+        q = rq.collect_review_queue(self.tmp)
+        views = {}
+        for row in q["rows"]:
+            views[row["flag_key"]] = rq.flag_extra(self.tmp, row)
+        cards = rq.group_review_rows(self.tmp, q["rows"], views)
+        img_cards = [c for c in cards if c["kinds"] and any(
+            t in k for k in c["kinds"] for t in ("image", "unresolved", "unmatched"))]
+        self.assertEqual(len(img_cards), 1)
+        self.assertGreaterEqual(len(img_cards[0]["flag_keys"]), 2)
+        self.assertIn("Attach", img_cards[0]["guide"] + "")
+
+    def test_attach_autocloses_its_flags(self):
+        self._seed_unclaimed_flag()
+        import review_queue as rq
+        f = f"{SUB}/{CH}-p31-83.webp"
+        r1 = rq.collect_review_queue(self.tmp)
+        open0 = len(r1["rows"])
+        self.assertGreaterEqual(open0, 2)                      # image flags exist
+        rq.apply_image_op(self.tmp, f"{CH}-001", "attach", f, side="solution")
+        r2 = rq.collect_review_queue(self.tmp)
+        # every image-naming flag auto-resolved; ONLY the unrelated qa row
+        # is still open -- it was never about this image
+        self.assertFalse(any("p31-83" in str(x.get("detail")) for x in r2["rows"]))
+        leftover = [x["kind"] for x in r2["rows"]]
+        self.assertEqual(leftover, ["review_needed"],
+                         "only the unrelated qa_status flag should remain")
+        self.assertGreaterEqual(r2["counts"].get("auto_resolved", 0), 1)
+        self.assertIn("now owned", r2["auto_resolved_rows"][0]["auto_note"])

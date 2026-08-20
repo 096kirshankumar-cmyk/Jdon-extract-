@@ -239,6 +239,56 @@ def unclaimed_images(output_root, subject):
                   if f"{subject}/{p.name}" not in used)
 
 
+def card_guide(card):
+    """One-line Hinglish action guide per card kind -- answers 'isko dekh ke
+    main kya karun?' so a human never faces a bare Approve/Skip."""
+    kinds = card.get("kinds") or []
+    kset = set(kinds)
+    if kset & {"answer_key_disagrees"}:
+        return ("🔴 ANSWER KEY se alag: book page kholo → key table dekho → "
+                "key sahi toh Answer edit karo (dropdown), book hi galat "
+                "hai toh reason likh ke Approve.")
+    if kset & {"incomplete", "incomplete_records"}:
+        return ("🔴 koi field KHAALI hai (stem/options/answer/solution) -- "
+                "Edit panel me poora karke Save karo; expand list dekh "
+                "kaunsa field missing hai.")
+    if kset & {"orphan_unresolved", "orphans"}:
+        return ("📦 Ye content kisi question ko attach NAHI hua. Fragment "
+                "padho → best-guess question ki CURRENT solution ke saamne "
+                "tulna karo → missing piece hai toh ➕ Merge, extra copy/"
+                "noise hai toh Skip.")
+    if any(k in k for k in kset for k in
+           ("image", "unresolved", "unmatched", "unclaimed")):
+        return ("🖼️ Image kisi ko attach nahi hui: crop dekho → book page "
+                "kholo → sahi question mile toh Attach (Gallery/Lookup), "
+                "sach me decorative/watermark hai toh Skip. Pehle se attached "
+                "ho gayi ho toh ye flag apne aap auto-resolved ho jata hai.")
+    if kset & {"foreign_option_head", "foreign_solution_segment",
+               "foreign_option_head_review", "retry_foreign_fragment_blocked"}:
+        return ("⚠️ Iske andar DOOSRE question ka text ghusa lagta hai -- "
+                "stem/options/solution padhke foreign hissa hatao "
+                "(✏️ Edit se trim), phir Approve.")
+    if any(k.startswith("contaminated") for k in kset):
+        return ("⚠️ contamination suspect -- question ke andar solution-type "
+                "text aa gaya ho sakta hai. Edit me stem/solution theek karo.")
+    if any(k.startswith("declared_figure_missing") for k in kset):
+        return ("🖼️ Model ne bola 'figure hai' par koi image judi nahi. Lookup/"
+                "book page se figure dhundho → mili toh Attach, book me sach "
+                "me nahi hai toh Approve.")
+    if "figure_page_mismatch" in kset:
+        return ("🖼️ Image ka page question ke pages se match nahi karta -- "
+                "book page kholo; galat judi hai toh Detach/Move.")
+    if kset & {"review_needed", "qa_review_needed"}:
+        return ("ℹ️ Neeche diya reason padho -- zyadatar kuch bada nahi hota. "
+                "Content dekho + book page compare karo, sahi toh Approve.")
+    if "watchdog" in " ".join(kset):
+        return ("🛡️ Nayi flag-file mili jo queue register me NAHI hai -- mujhe "
+                "report karo (register kar dunga). Skip mat karo bina dekhe.")
+    return ("Reason detail padho → book page links se asli page compare karo "
+            "→ sahi hai toh Approve, theek karna hai toh ✏️ Edit, faltu "
+            "hai toh Skip.")
+
+
 def group_review_rows(output_root, rows, views):
     """One CARD per real issue. The same question can be flagged by the gate,
     the validator, and qa_status for the SAME underlying problem -- four cards
@@ -253,10 +303,20 @@ def group_review_rows(output_root, rows, views):
     cards = {}
     for r in rows:
         v = views.get(r["flag_key"], {})
+        img_files = re.findall(
+            r"[\w-]+/[\w-]+(?:-\d{3})?-p\d+-[\w@.]+\.webp",
+            str(r.get("detail") or ""))
         if r.get("q_id"):
             key = ("qid", r["q_id"])
-        elif r.get("kind") in ("orphan_unresolved", "orphans") and v.get("frag_key"):
+        elif r.get("kind") in ("orphan_unresolved", "orphans") \
+                and v.get("frag_key"):
             key = ("frag", r.get("chapter_id"), v["frag_key"])
+        elif img_files and any(t in r.get("kind", "") for t in
+                               ("image", "unresolved", "unmatched",
+                                "unclaimed")):
+            # the SAME image flagged by unmatched_images, unresolved_images
+            # and the validator is ONE issue: group by the file itself
+            key = ("img", img_files[0])
         else:
             key = ("other", r.get("chapter_id"), r.get("kind"),
                    str(r.get("detail", ""))[:80])
@@ -301,6 +361,7 @@ def group_review_rows(output_root, rows, views):
         c["expand"] = [dict(t) for t in {json.dumps(e, sort_keys=True): e
                                          for e in c["expand"]}.values()]
         c["flag_keys_json"] = json.dumps(c["flag_keys"])
+        c["guide"] = card_guide(c)
     out.sort(key=lambda c: (c["_rank"], str(c.get("chapter_id") or ""),
                             c.get("q_id") or ""))
     return out
@@ -598,7 +659,42 @@ def collect_review_queue(output_root) -> dict:
     for d in decisions:
         latest[d["flag_key"]] = d            # append-only log; last wins
     open_rows, done = [], 0
+    auto_resolved = []
     for r in rows:
+        # SELF-VERIFYING flags: a flag that names an image file must stand
+        # DOWN when that file is no longer in the flagged state. "Image
+        # unclaimed"-class flags become false the moment the human attaches
+        # the file anywhere -- re-showing them would force a second decision
+        # on an issue that is already fixed (user report, 2026-08-20).
+        fx = re.findall(r"[\w-]+/[\w-]+-\d{3}-p\d+-[\w@.]+\.webp|"
+                        r"[\w-]+/[\w-]+-p\d+-[\w@.]+\.webp", str(r.get("detail") or ""))
+        if any(k in r.get("kind", "") for k in
+               ("image", "unresolved", "unclaimed", "unmatched")) and fx:
+            owned_now = []
+            missing_now = []
+            owner_names = []
+            for fr in fx:
+                st = image_status(out_root, fr)
+                owners = st["owners"]
+                if not owners:
+                    # the file may have been RENAMED by a human attach/move:
+                    # follow the ownership-ledger alias chain
+                    for lr in _read_jsonl(out_root / "data"
+                                          / "image_ownership.jsonl"):
+                        if lr.get("file") == fr and lr.get("final_file"):
+                            o2 = image_status(out_root, lr["final_file"])["owners"]
+                            owners = owners or o2
+                if owners:
+                    owned_now.append(fr)
+                    owner_names.append(owners[0])
+                else:
+                    missing_now.append(fr)
+            if owned_now and not missing_now:
+                r["state"] = "auto_resolved"
+                r["auto_note"] = "file(s) now owned by " + ", ".join(owner_names)
+                auto_resolved.append(r)
+                done += 1
+                continue
         d = latest.get(r["flag_key"])
         if not d:
             r["state"] = "open"
@@ -624,7 +720,9 @@ def collect_review_queue(output_root) -> dict:
             "blocker": sum(1 for r in open_rows if r["severity"] == "BLOCKER"),
             "review": sum(1 for r in open_rows if r["severity"] == "REVIEW"),
             "resolved": done,
+            "auto_resolved": len(auto_resolved),
         },
+        "auto_resolved_rows": auto_resolved,
         "warnings": warnings,
         "clear": not open_rows,
     }

@@ -1342,6 +1342,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
     <span>🔴 <b>{{ counts.blocker }}</b> blocker</span>
     <span>🟡 <b>{{ counts.review }}</b> review</span>
     <span>✅ <b>{{ counts.resolved }}</b> resolved</span>
+    {% if counts.auto_resolved %}<span title="ye flags ab galat nahi hain (jaise image ab attached) -- self-verify hoke band hue">🤖 <b>{{ counts.auto_resolved }}</b> auto-resolved</span>{% endif %}
   </div>
 
   {% for w in warnings %}
@@ -1395,6 +1396,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
       <span class="text-gray-500">src: {{ r.sources|join(', ') }}</span>
       {% if r.flag_keys|length > 1 %}<span class="bg-indigo-100 text-indigo-800 rounded px-1" title="same issue flagged by many tools — ek decision se sab band">{{ r.flag_keys|length }} flags → 1 decision</span>{% endif %}
     </div>
+    <div class="text-[11px] bg-sky-50 border border-sky-200 rounded p-1">💡 {{ r.guide }}</div>
     {% for d in r.details %}{% if loop.first %}<p class="text-xs text-gray-700 whitespace-pre-wrap">{{ d.detail }}</p>{% endif %}{% endfor %}
     {% if r.details|length > 1 %}
     <details class="text-[11px]"><summary class="cursor-pointer text-gray-500">🔁 same issue, {{ r.details|length }} sources — sab reports:</summary>
@@ -1938,6 +1940,22 @@ def review_lookup():
             "pages": r.get("source_pages") or [],
         }
     cards = [full_view(r) for r in rows]
+    miss_hint = None
+    if term and not cards:
+        qn_m = re.search(r"(?:^|-)(\d{1,3})$", term)
+        ch_m = re.match(r"^([A-Za-z]+)-(\d{3})", term)
+        ch = ch_m.group(0) if ch_m else (chapter or None)
+        all_rows = review_queue.lookup_questions(out, "", None)
+        pool = [r for r in all_rows if r.get("chapter_id") == ch] if ch else all_rows
+        if pool:
+            qnos = sorted(int(r["id"].rsplit("-", 1)[1]) for r in pool
+                          if r.get("id"))
+            if qnos:
+                miss_hint = (f"{ch or 'is book'} me total {len(qnos)} questions hain "
+                             f"(available: q{qnos[0]}..q{qnos[-1]}). "
+                             f"'{term}' isme NAHI hai — number check karo.")
+        elif not ch:
+            miss_hint = f"'{term}' kisi bhi chapter me nahi mila."
     return render_template_string("""
 <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
 <script src="https://cdn.tailwindcss.com"></script><title>Lookup</title>
@@ -2000,7 +2018,7 @@ img.big{max-width:100%;border:1px solid #94a3b8;border-radius:8px;background:#ff
   {% endif %}
 </div>
 {% else %}
-{% if term %}<div class="text-sm text-gray-600 bg-white rounded shadow p-3">koi row nahi mili: <b>{{ term }}</b> — q_id ya bare number try karo</div>{% endif %}
+{% if term %}<div class="text-sm text-gray-600 bg-white rounded shadow p-3">koi row nahi mili: <b>{{ term }}</b>{% if miss_hint %}<br>💡 {{ miss_hint }}{% endif %}</div>{% endif %}
 {% endfor %}
 </div></body></html>
 """, f=f, term=term, chapter=chapter or "", auto_chapter=auto_chapter,
