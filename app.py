@@ -1800,6 +1800,10 @@ def _review_redirect(result, ok_word="done"):
     ok = bool(result.get("ok"))
     msg = (result.get("msg") or ok_word) if ok else \
         ("FAILED: " + str(result.get("error") or "unknown"))
+    back = request.form.get("back") or ""
+    if back.startswith("/review"):
+        sep = "&" if "?" in back else "?"
+        return redirect(f"{back}{sep}ok={'1' if ok else '0'}&msg={msg}")
     return redirect(url_for("review_home", ok="1" if ok else "0", msg=msg))
 
 
@@ -1892,6 +1896,129 @@ def review_apply_image():
     return _review_redirect(res, "image op done")
 
 
+def _esc(v):
+    import html as _html
+    return _html.escape(str(v or ""), quote=False)
+
+
+def _edit_forms_html(q_id, row, unclaimed_by_subject, out, back=""):
+    """The SAME edit surface the queue card has (stem/options/answer/solution/
+    tables/images), built for the lookup page so even READY/unflagged rows are
+    editable. Manual escaping everywhere -- this HTML is injected with |safe."""
+    q_ = (row or {}).get("question") or {}
+    s_ = (row or {}).get("solution") or {}
+    subj = (row or {}).get("subject")
+    sel_opts = "".join(f"<option value='{L}'"
+                       f"{' selected' if (row.get('correct_options') or [''])[0] == L else ''}>{L}</option>"
+                       for L in "ABCD")
+    b = [f'<input type="hidden" name="back" value="{_esc(back)}">']
+    parts = [f"""
+<div class="space-y-2 text-xs border-t border-sky-200 pt-2">
+  <div class="font-bold text-slate-600">✏️ Edit (bina flag bhi chalega)</div>
+  <form method="POST" action="/review/apply-text">
+    <input type="hidden" name="q_id" value="{q_id}">{b[0]}
+    <input type="hidden" name="field" value="question_text">
+    <label class="font-semibold">Stem</label>
+    <textarea name="value" class="w-full border rounded p-1" rows="2">{_esc(q_.get("text"))}</textarea>
+    <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 w-full">
+    <button class="bg-sky-600 text-white px-2 py-1 rounded mt-1">Save stem</button>
+  </form>"""]
+    for o in row.get("options") or []:
+        parts.append(f"""
+  <form method="POST" action="/review/apply-text" class="flex gap-1 items-center">
+    <input type="hidden" name="q_id" value="{q_id}">{b[0]}
+    <input type="hidden" name="field" value="option">
+    <input type="hidden" name="option_letter" value="{o.get('id')}">
+    <b>{o.get('id')}.</b>
+    <input name="value" value="{_esc(o.get('text'))}" class="border rounded px-1 py-0.5 flex-1">
+    <button class="bg-sky-600 text-white px-2 py-1 rounded">Save {o.get('id')}</button>
+  </form>""")
+    parts.append(f"""
+  <form method="POST" action="/review/apply-text" class="flex gap-2 items-center">
+    <input type="hidden" name="q_id" value="{q_id}">{b[0]}
+    <input type="hidden" name="field" value="correct_option">
+    <label class="font-semibold">Answer</label>
+    <select name="value" class="border rounded px-1 py-0.5">{sel_opts}</select>
+    <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 flex-1">
+    <button class="bg-sky-600 text-white px-2 py-0.5 rounded">Save answer</button>
+  </form>
+  <form method="POST" action="/review/apply-text">
+    <input type="hidden" name="q_id" value="{q_id}">{b[0]}
+    <input type="hidden" name="field" value="solution_text">
+    <label class="font-semibold">Solution</label>
+    <textarea name="value" class="w-full border rounded p-1" rows="4">{_esc(s_.get("text"))}</textarea>
+    <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 w-full">
+    <button class="bg-sky-600 text-white px-2 py-1 rounded mt-1">Save solution</button>
+  </form>""")
+    for side_field, holder, side_lbl in (("table", s_, "solution"), ("table_q", q_, "question")):
+        for i, t in enumerate(holder.get("tables") or []):
+            parts.append(f"""
+  <div class="border rounded p-1">
+    <div class="rtd overflow-x-auto">{review_queue.md_to_html(t.get("markdown"))}</div>
+    <details><summary class="text-gray-500 cursor-pointer">markdown</summary>
+    <form method="POST" action="/review/apply-text">
+      <input type="hidden" name="q_id" value="{q_id}">{b[0]}
+      <input type="hidden" name="field" value="{side_field}">
+      <input type="hidden" name="table_index" value="{i}">
+      <textarea name="value" class="w-full font-mono border rounded p-1" rows="3">{_esc(t.get("markdown"))}</textarea>
+      <button class="bg-sky-600 text-white px-2 py-1 rounded mt-1">Save {side_lbl} table {i+1}</button>
+    </form></details>
+    <form method="POST" action="/review/apply-text" onsubmit="return confirm('delete {side_lbl} table {i+1}?')">
+      <input type="hidden" name="q_id" value="{q_id}">{b[0]}
+      <input type="hidden" name="field" value="{side_field}_delete">
+      <input type="hidden" name="table_index" value="{i}">
+      <input name="reason" placeholder="why delete" class="border rounded px-1 py-0.5 w-28">
+      <button class="bg-rose-600 text-white px-2 py-0.5 rounded">🗑 delete</button>
+    </form>
+  </div>""")
+        parts.append(f"""
+  <form method="POST" action="/review/apply-text" class="border-t border-dashed pt-1">
+    <input type="hidden" name="q_id" value="{q_id}">{b[0]}
+    <input type="hidden" name="field" value="{side_field}">
+    <input type="hidden" name="table_index" value="{len(holder.get('tables') or [])}">
+    <label class="font-semibold">➕ Add {side_lbl} table</label>
+    <textarea name="value" placeholder="| col | col |&#10;|---|---|&#10;| 1 | 2 |" class="w-full font-mono border rounded p-1" rows="3"></textarea>
+    <button class="bg-emerald-600 text-white px-2 py-1 rounded mt-1">Add</button>
+  </form>""")
+    imgs = [(side, i) for side, holder in (("question", q_), ("solution", s_))
+            for i in (holder.get("images") or [])]
+    if imgs or True:
+        parts.append('<div class="border-t border-dashed pt-1"><b>🖼️ Images</b></div>')
+    for side, im in imgs:
+        f = im.get("file") if isinstance(im, dict) else str(im)
+        parts.append(f"""
+  <div class="border rounded p-1 bg-white">
+    <img loading="lazy" src="/review/img?f={f}" style="max-height:140px" class="rounded">
+    <div class="text-[10px] font-mono break-all text-gray-500">{f}</div>
+    <form method="POST" action="/review/apply-image" class="flex flex-wrap gap-1 items-center mt-1">
+      <input type="hidden" name="q_id" value="{q_id}">{b[0]}
+      <input type="hidden" name="file" value="{f}">
+      <input type="hidden" name="side" value="{side}">
+      <input type="hidden" name="op" value="">
+      <button data-imop="detach" class="bg-gray-600 text-white px-2 py-0.5 rounded">Detach</button>
+      <input name="to_qid" placeholder="{q_id.rsplit('-',1)[0]}-007" class="border rounded px-1 py-0.5 w-28">
+      <button data-imop="move" class="bg-amber-600 text-white px-2 py-0.5 rounded">Move→</button>
+      <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 flex-1">
+    </form>
+  </div>""")
+    pool = unclaimed_by_subject.get(subj, [])
+    if pool:
+        opts = "".join(f"<option value='{_esc(u['f'])}'>{_esc(u['f'].split('/')[-1])} (p{u['page']})</option>"
+                       for u in pool)
+        parts.append(f"""
+  <form method="POST" action="/review/apply-image" class="flex flex-wrap gap-1 items-center">
+    <input type="hidden" name="q_id" value="{q_id}">{b[0]}
+    <input type="hidden" name="op" value="attach">
+    <span>Attach📎:</span>
+    <select name="file" class="border rounded px-1 py-0.5 font-mono max-w-52">{opts}</select>
+    <select name="side" class="border rounded px-1 py-0.5"><option value="solution">solution</option><option value="question">question</option></select>
+    <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 w-24">
+    <button class="bg-emerald-600 text-white px-2 py-0.5 rounded">Attach</button>
+  </form>""")
+    parts.append("</div>")
+    return "".join(parts)
+
+
 @app.route("/review/lookup")
 def review_lookup():
     """Full-view lookup: ek q_id/number daalo -> poora question jaise final
@@ -1903,6 +2030,7 @@ def review_lookup():
     term = (request.args.get("q") or "").strip()
     chapter = (request.args.get("chapter") or "").strip() or None
     fstat = review_queue.image_status(out, f) if f else None
+    unclaimed = {}
 
     # minimum typing: bare number without chapter -> try every chapter of the
     # subject (file name carries subject; chapter from page via chapters.json
@@ -1940,6 +2068,14 @@ def review_lookup():
             "pages": r.get("source_pages") or [],
         }
     cards = [full_view(r) for r in rows]
+    back_url = ("/review/lookup?" + "&".join(
+        f"{k}={v}" for k, v in (("q", term), ("chapter", chapter or ""),
+                                ("f", f)) if v))
+    for c, r in zip(cards, rows):
+        if r.get("subject") not in unclaimed:
+            unclaimed[r["subject"]] = _unclaimed_panel(out, r["subject"])
+        c["edit_html"] = _edit_forms_html(c["id"], r, unclaimed, out,
+                                          back=back_url)
     miss_hint = None
     if term and not cards:
         qn_m = re.search(r"(?:^|-)(\d{1,3})$", term)
@@ -2016,11 +2152,28 @@ img.big{max-width:100%;border:1px solid #94a3b8;border-radius:8px;background:#ff
     <button class="bg-emerald-600 text-white px-3 py-1 rounded font-bold">Attach</button>
   </form>
   {% endif %}
+  <details class="text-xs"><summary class="font-bold text-sky-700 cursor-pointer">🛠 Edit karo ye question (flag nahi bhi ho toh)</summary>
+  {{ m.edit_html|safe }}
+  </details>
 </div>
 {% else %}
 {% if term %}<div class="text-sm text-gray-600 bg-white rounded shadow p-3">koi row nahi mili: <b>{{ term }}</b>{% if miss_hint %}<br>💡 {{ miss_hint }}{% endif %}</div>{% endif %}
 {% endfor %}
-</div></body></html>
+</div>
+<script>
+document.querySelectorAll('button[data-imop]').forEach(function(b){
+  b.addEventListener('click', function(ev){
+    ev.preventDefault();
+    var form = ev.target.closest('form');
+    form.querySelector('input[name="op"]').value = ev.target.dataset.imop;
+    if (ev.target.dataset.imop === 'move' && !form.querySelector('input[name="to_qid"]').value.trim()) {
+      alert('move ke liye to_qid chahiye'); return;
+    }
+    form.submit();
+  });
+});
+</script>
+</body></html>
 """, f=f, term=term, chapter=chapter or "", auto_chapter=auto_chapter,
     fstat=fstat, cards=cards)
 

@@ -287,3 +287,13 @@ class TestSelfVerifyingAndGuides(Routes):
                          "only the unrelated qa_status flag should remain")
         self.assertGreaterEqual(r2["counts"].get("auto_resolved", 0), 1)
         self.assertIn("now owned", r2["auto_resolved_rows"][0]["auto_note"])
+
+
+class TestLookupFullEdit(Routes):
+    def test_ready_row_is_editable_from_lookup(self):
+        r = self.client.get("/review/lookup?q=1&chapter=" + CH)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b"Edit karo ye question", r.data)
+        self.assertIn(b'value="question_text"', r.data)
+        self.assertIn(b"Save answer", r.data)
+        self.assertIn(b'name="back" value="/review/lookup', r.data)
