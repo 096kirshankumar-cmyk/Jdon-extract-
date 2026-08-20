@@ -703,3 +703,35 @@ class TestMultiDrawSharing(AuditEnv):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestTableDedupeNearVariants(unittest.TestCase):
+    """User report (production screenshot, OBG-012-017): 3 near-identical
+    tables on one question, 2 with spacing drift ('at4 cmof' vs 'at 4 cm of').
+    Root cause: recover_orphans deduped by EXACT markdown; the same table
+    arriving per-pass with spacing drift survived N times."""
+
+    def test_spacing_variants_collapse_to_one(self):
+        base = ("| WHO modified partograph | WHO Labour Care Guide |\n|---|---|\n"
+                "| Labour progression begins at 4 cm. | Begins at 5 cm. |")
+        drift = base.replace("at 4 cm", "at4 cm").replace("Begins at 5", "Begins at5")
+        out = qp._dedupe_tables([{"type": "t", "markdown": base},
+                                 {"type": "t", "markdown": drift}])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["markdown"], base)   # fuller/cleaner wins
+
+    def test_recover_orphans_table_path_uses_real_dedupe(self):
+        rec = {1: {"q_no": 1, "question_text": "Q?", "options":
+                   {"A": "a", "B": "b", "C": "c", "D": "d"}, "correct_option": "A",
+                   "solution_text": "Full solution.", "tables": [
+                       {"type": "cmp", "markdown": "| A | B |\n|---|---|\n| 1 | 2 |"}]}}
+        drift = "| A | B |\n|---|---|\n| 1|2 |"
+        orph = [{"pdf_pages": [9], "new_pages": [9], "pass": "S",
+                 "item": {"q_no": 1, "solution_text": None, "correct_option": None,
+                          "question_text": None,
+                          "tables": [{"type": "cmp", "markdown": drift}]},
+                 "_prov": "S_PASS"}]
+        before = len(rec[1]["tables"])
+        qp.recover_orphans(orph, rec, "OPH", 1, {})
+        self.assertEqual(len(rec[1]["tables"]), before,
+                         "spacing-drift duplicate must collapse")
