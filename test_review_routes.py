@@ -297,3 +297,33 @@ class TestLookupFullEdit(Routes):
         self.assertIn(b'value="question_text"', r.data)
         self.assertIn(b"Save answer", r.data)
         self.assertIn(b'name="back" value="/review/lookup', r.data)
+
+
+class TestManualUpload(Routes):
+    """User ask: figure never extracted -> human uploads the file, it lands
+    under the locked slot name and attaches through the verified path."""
+
+    def test_manual_upload_end_to_end(self):
+        import io
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new("RGB", (220, 160), (200, 30, 30)).save(buf, "PNG")
+        buf.seek(0)
+        r = self.client.post("/review/upload-image", content_type="multipart/form-data",
+            data={"q_id": f"{CH}-001", "side": "solution", "reason": "manual fig",
+                  "image": (buf, "fig.png")})
+        self.assertEqual(r.status_code, 302)
+        m = rq._find_master_row(self.tmp, f"{CH}-001")
+        self.assertEqual(m["solution"]["images"][0]["file"], f"{SUB}/{CH}-001_SOL_01.webp")
+        self.assertTrue((self.tmp / "assets" / "questions" / SUB /
+                         f"{CH}-001_SOL_01.webp").exists())
+        # junk upload refuses without leaving dust
+        self.assertEqual(self.client.post("/review/upload-image",
+            content_type="multipart/form-data",
+            data={"q_id": f"{CH}-001", "side": "solution"}).status_code, 302)
+
+    def test_lookup_and_queue_both_show_upload(self):
+        r = self.client.get("/review/lookup?q=1&chapter=" + CH)
+        self.assertIn(b"upload-image", r.data)
+        r2 = self.client.get("/review")
+        self.assertIn(b"upload-image", r2.data)
