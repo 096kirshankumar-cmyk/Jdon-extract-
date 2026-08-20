@@ -1437,10 +1437,20 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
       {% if ov.owner_qid %}
       <div class="mt-2 border-t border-amber-300 pt-1">
         <b>🤔 System ka best guess: {{ ov.owner_qid }}</b> — compare karo:
+        {% if ov.already_present_in %}
+        <div class="mt-1 bg-emerald-100 border border-emerald-400 rounded p-1 font-semibold">✅ Ye content ALREADY <span class="font-mono">{{ ov.already_present_in }}</span> ki solution me maujood hai (poore output ke against auto-check karke). Merge MAT karo — is card ko seedha <b>Skip</b> karo, reason: "already inside {{ ov.already_present_in }}".</div>
+        {% endif %}
         <div class="mt-1 bg-white border rounded p-1">
           <b>Us question ki CURRENT solution (actual output):</b>
           <div class="whitespace-pre-wrap">{{ ov.owner_sol or '(abhi bilkul khaali hai — shayad yehi fragment asli solution hai!)' }}</div>
           {% for im in (ov.owner_imgs or []) %}<img class="thumb" loading="lazy" src="/review/img?f={{ im }}">{% endfor %}
+        </div>
+        <div class="mt-1 text-[10px] text-gray-600">guess galat lagta hai? kisi bhi question se compare karo (naya tab):
+          <form method="GET" action="/review/lookup" target="_blank" class="inline">
+            <input name="q" placeholder="q_id (jaise OBG-003-001)" class="border rounded px-1 py-0.5 font-mono w-40">
+            <input type="hidden" name="chapter" value="{{ r.chapter_id }}">
+            <button class="bg-indigo-600 text-white px-2 py-0.5 rounded">🔎 lookup</button>
+          </form>
         </div>
         {% if ov.already_inside %}
         <div class="mt-1 text-red-700 font-semibold">⚠️ Ye text uski solution me ALREADY maujood lagta hai (extra copy). Merge MAT karo — bas Ignore.</div>

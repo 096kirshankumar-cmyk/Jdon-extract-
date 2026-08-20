@@ -201,6 +201,8 @@ def flag_extra(output_root, flag):
             extra["frag_key"] = orphan_key(r)
             oqid = orphan_owner_qid(r)
             extra["owner_qid"] = oqid
+            frag_text, _ = _frac(r.get("item"))
+            norm = lambda s: " ".join(s.lower().split())
             if oqid:
                 trow = _find_master_row(out, oqid)
                 if trow:
@@ -210,11 +212,18 @@ def flag_extra(output_root, flag):
                                            ((trow.get("solution") or {})
                                             .get("images") or [])
                                            if isinstance(i, dict)]
-                    frag_text, _ = _frac(r.get("item"))
                     if frag_text:
-                        norm = lambda s: " ".join(s.lower().split())
                         extra["already_inside"] = norm(frag_text)[:120] \
                             in norm(extra["owner_sol"])
+            # CROSS-CHECK vs EVERY question (user case: merge-guess wrong,
+            # fragment already lives inside ANOTHER row's solution):
+            if frag_text:
+                head = norm(frag_text)[:120]
+                for mr in _read_jsonl(out / "data" / "questions.jsonl"):
+                    sol = norm(str((mr.get("solution") or {}).get("text") or ""))
+                    if head and head in sol:
+                        extra["already_present_in"] = mr.get("id")
+                        break
             break
     return extra
 
