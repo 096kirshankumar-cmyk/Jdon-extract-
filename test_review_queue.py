@@ -359,3 +359,86 @@ class TestFinalZipGate(QEnv):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReviewScreenHelpers(QEnv):
+    def test_md_to_html_renders_and_escapes(self):
+        html = rq.md_to_html("| A | <b>B</b> |\n|---|---|\n| 1 | 2 |")
+        self.assertIn("<table", html)
+        self.assertIn("&lt;b&gt;B&lt;/b&gt;", html)   # cell escaping
+        self.assertIn("<th", html)
+        self.assertEqual(rq.md_to_html("not a table"), "")
+
+    def test_flag_extra_pages_and_images(self):
+        # an image named inside the detail that exists on disk gets surfaced
+        img = self.root / "assets" / "questions" / SUB / f"{CH}-p61-999.webp"
+        img.parent.mkdir(parents=True, exist_ok=True)
+        img.write_bytes(b"\xff" * 3000)
+        flag = {"kind": "image_unresolved", "detail":
+                f"page 61 unresolved: {SUB}/{CH}-p61-999.webp (isolated_crop)",
+                "q_id": None, "chapter_id": CH, "subject": SUB}
+        ex = rq.flag_extra(self.root, flag)
+        self.assertEqual(ex["images"], [f"{SUB}/{CH}-p61-999.webp"])
+        self.assertEqual(ex["pages"], [61])
+
+    def test_flag_extra_expands_incomplete_records(self):
+        # make one split solution INCOMPLETE, then the chapter-level
+        # completeness flag must name the exact q_id + side
+        sp = self.root / "split" / SUB / CH / "solutions.jsonl"
+        rows = rq._read_jsonl(sp)
+        rows[0]["extraction_status"] = "INCOMPLETE"
+        rows[0]["missing_fields"] = ["solution_text"]
+        sp.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        flag = {"kind": "incomplete_records", "chapter_id": CH, "detail": "x",
+                "q_id": None}
+        ex = rq.flag_extra(self.root, flag)
+        ids = [e["q_id"] for e in ex["expand"]]
+        self.assertIn(f"{CH}-001", ids)
+        self.assertIn("solution_text", ex["expand"][0]["missing"])
+
+    def test_orphan_readable_parses_fragment(self):
+        row = {"chapter_id": CH, "new_pages": [53, 54],
+               "item": {"q_no": None, "solution_text": "Pelvis divides...",
+                        "tables": [{"type": "t"}]},
+               "blocked_reason": "owner solution already complete"}
+        r = rq.orphan_readable(row)
+        self.assertEqual(r["pages"], [53, 54])
+        self.assertIn("SOLUTION fragment", r["text"])
+        self.assertIn("owner solution already complete", r["text"])
+
+    def test_unresolved_images_registered_no_watchdog_scream(self):
+        (self.root / "data" / "unresolved_images.jsonl").write_text(
+            json.dumps({"kind": "image_unresolved", "chapter_id": CH,
+                        "detail": "x"}) + "\n")
+        q = rq.collect_review_queue(self.root)
+        self.assertFalse(any("unresolved_images" in w for w in q["warnings"]))
+        kinds = [r["kind"] for r in q["rows"]]
+        self.assertIn("image_unresolved", kinds)
+
+    def test_unclaimed_images_pool(self):
+        img = self.root / "assets" / "questions" / SUB / f"{CH}-p70-5.webp"
+        img.parent.mkdir(parents=True, exist_ok=True)
+        img.write_bytes(b"\xff" * 3000)
+        self.assertIn(f"{SUB}/{CH}-p70-5.webp",
+                      rq.unclaimed_images(self.root, SUB))
+
+
+class TestTableDelete(QEnv):
+    def test_delete_removes_from_all_copies_and_verifies(self):
+        self.masters[2]["solution"]["tables"] = [
+            {"type": "t1", "markdown": "| a |\n|---|\n| 1 |"},
+            {"type": "t2", "markdown": "| b |\n|---|\n| 2 |"}]
+        self._write_masters(self.masters); self._write_split()
+        res = rq.apply_edit(self.root, f"{CH}-003", "table_delete", "",
+                            table_index=0)
+        self.assertTrue(res["ok"] and res["verified"], res)
+        m = rq._find_master_row(self.root, f"{CH}-003")
+        self.assertEqual(len(m["solution"]["tables"]), 1)
+        self.assertEqual(m["solution"]["tables"][0]["type"], "t2")
+        srows = rq._read_jsonl(self.root / "split" / SUB / CH / "solutions.jsonl")
+        self.assertEqual(len([r for r in srows
+                              if r["q_id"] == f"{CH}-003"][0]["tables"]), 1)
+        # second delete of a now-missing index is refused, not half-applied
+        res2 = rq.apply_edit(self.root, f"{CH}-003", "table_delete", "",
+                             table_index=5)
+        self.assertFalse(res2["ok"])
