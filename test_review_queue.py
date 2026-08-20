@@ -468,15 +468,36 @@ class TestOrphanMerge(QEnv):
         self.assertIn("Recovered tail", m["solution"]["text"])
         self.assertEqual(m["solution"]["tables"][-1]["type"], "sizes")  # appended
 
-    def test_extra_copy_refused_loudly(self):
+    def test_extra_copy_text_but_new_table_adopts_table_only(self):
+        """Text fully inside (dup) + fragment carries a table the target
+        lacks -> adopt ONLY the table; the text is NOT re-appended."""
         m = self.masters[1]
         m["solution"]["text"] = "Precise existing solution sentence here."
         self._write_masters(self.masters); self._write_split()
         self._seed_orphan("Precise existing solution sentence here.")
         fk = rq.orphan_key(rq._read_jsonl(self.root / "data" / "orphans.jsonl")[0])
         res = rq.apply_orphan_merge(self.root, CH, fk, f"{CH}-002")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["tables"], 1)          # table adopted
+        back = rq._find_master_row(self.root, f"{CH}-002")
+        self.assertEqual(back["solution"]["text"].count("Precise existing"), 1)
+        self.assertEqual(back["solution"]["tables"][-1]["type"], "sizes")
+
+    def test_fully_identical_fragment_refused(self):
+        body = "Whole fragment here, nothing added.\n\nSecond para too."
+        m = self.masters[1]
+        m["solution"]["text"] = "Given. \n\n" + body
+        self._write_masters(self.masters); self._write_split()
+        (self.root / "data" / "orphans.jsonl").write_text(json.dumps({
+            "chapter_id": CH, "batch_start": "9", "pdf_pages": [9],
+            "new_pages": [9], "inferred_owner": 2, "pass": "S",
+            "item": {"q_no": None, "solution_text": body, "tables": []},
+            "blocked_reason": "x"}) + "\n")
+        fk = rq.orphan_key(rq._read_jsonl(self.root / "data" / "orphans.jsonl")[0])
+        res = rq.apply_orphan_merge(self.root, CH, fk, f"{CH}-002")
         self.assertFalse(res["ok"])
-        self.assertIn("extra copy", res["error"])
+        back = rq._find_master_row(self.root, f"{CH}-002")
+        self.assertEqual(back["solution"]["text"].count("Whole fragment"), 1)
 
     def test_missing_fragment_refused(self):
         self._seed_orphan("Whatever.")
@@ -533,3 +554,46 @@ class TestChapterForPage(QEnv):
         cjd.joinpath("chapters.json").write_text(json.dumps(
             [{"chapter_id": CH, "file_start": 48, "file_end": 65}]))
         self.assertEqual(rq.chapter_for_page(self.root, SUB, 61), CH)
+
+
+class TestOrphanPartialMerge(QEnv):
+    """Fragment partly overlaps the target's solution (head merged earlier,
+    tail missing): merge must append ONLY the missing tail -- not refuse,
+    not double-add. The user's live case."""
+
+    def test_partial_overlap_appends_only_missing_tail(self):
+        head = "The pelvic inlet divides the pelvis into segments."
+        tail = "Option B: McAfee for placenta previa.\n\nOption C: Page and Sher for abruption."
+        # target already has the head (earlier merge)
+        self.masters[0]["solution"]["text"] = "Given answer.\n\n" + head
+        self._write_masters(self.masters); self._write_split()
+        (self.root / "data" / "orphans.jsonl").write_text(json.dumps({
+            "chapter_id": CH, "batch_start": "9", "pdf_pages": [9],
+            "new_pages": [9], "inferred_owner": 1, "pass": "S",
+            "item": {"q_no": None, "solution_text": head + "\n\n" + tail,
+                     "tables": []},
+            "blocked_reason": "owner complete"}) + "\n")
+        fk = rq.orphan_key(rq._read_jsonl(self.root / "data" / "orphans.jsonl")[0])
+        res = rq.apply_orphan_merge(self.root, CH, fk, f"{CH}-001")
+        self.assertTrue(res["ok"], res)
+        self.assertIn("partial merge", res.get("note", ""))
+        m = rq._find_master_row(self.root, f"{CH}-001")
+        sol = m["solution"]["text"]
+        self.assertEqual(sol.count(head), 1)      # head NOT doubled
+        self.assertIn("McAfee", sol)               # tail IN
+        self.assertIn("Page and Sher", sol)
+
+    def test_full_duplicate_still_refused(self):
+        body = "Exactly this sentence is the fragment.\n\nSecond same para."
+        self.masters[0]["solution"]["text"] = "X.\n\n" + body
+        self._write_masters(self.masters); self._write_split()
+        (self.root / "data" / "orphans.jsonl").write_text(json.dumps({
+            "chapter_id": CH, "batch_start": "9", "pdf_pages": [9],
+            "new_pages": [9], "inferred_owner": 1, "pass": "S",
+            "item": {"q_no": None, "solution_text": body, "tables": []},
+            "blocked_reason": "x"}) + "\n")
+        fk = rq.orphan_key(rq._read_jsonl(self.root / "data" / "orphans.jsonl")[0])
+        res = rq.apply_orphan_merge(self.root, CH, fk, f"{CH}-001")
+        self.assertFalse(res["ok"])
+        m = rq._find_master_row(self.root, f"{CH}-001")
+        self.assertEqual(m["solution"]["text"].count("Exactly this sentence"), 1)

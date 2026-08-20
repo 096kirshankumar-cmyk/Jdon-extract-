@@ -1295,6 +1295,23 @@ def orphan_key(row):
                          + ",".join(map(str, pages))).encode()).hexdigest()[:16]
 
 
+def _paragraphs_missing(frag_text, current_text):
+    """Paragraph-wise split: which paragraphs of frag_text are NOT (already
+    whitespace-normalized) inside current_text? Orphan fragments often PARTLY
+    overlap an existing solution (head merged earlier, tail missing) -- the
+    flat 'duplicate => refuse' guard then wrongly blocks adding the tail."""
+    norm = lambda s: " ".join(s.lower().split())
+    cur_n = norm(current_text or "")
+    out = []
+    for para in (frag_text or "").split("\n\n"):
+        p = " ".join(para.split())
+        if not p:
+            continue
+        if norm(p) not in cur_n:
+            out.append(p)
+    return out
+
+
 def _frac(item):
     """Normalized (solution_text, tables) out of an orphan's Gemini item."""
     if isinstance(item, str):
@@ -1354,20 +1371,42 @@ def apply_orphan_merge(output_root, chapter_id, frag_key, to_q_id,
         return {"ok": False, "error": "fragment has no solution text or tables "
                 "to merge -- nothing to adopt"}
     cur = str((target.get("solution") or {}).get("text") or "")
+    norm_md = lambda s: " ".join(str(s or "").split()).lower()
+    have_tables = {norm_md(t.get("markdown"))
+                   for t in ((target.get("solution") or {}).get("tables") or [])}
+    missing_tables = [t for t in frag_tables
+                      if norm_md(t.get("markdown")) not in have_tables]
+    missing_paras = []
     if frag_text:
-        norm = lambda s: " ".join(s.lower().split())
-        if norm(frag_text)[:120] in norm(cur):
+        # Paragraph-wise merge: a fragment can PARTIALLY overlap the target
+        # (earlier merges / recovery already added its head; the tail is new).
+        # Rule: paragraphs already present are skipped, only the truly missing
+        # tail is appended; if NOTHING is new (text fully inside, no tables),
+        # refuse loudly instead of doubling content.
+        missing_paras = _paragraphs_missing(frag_text, cur)
+        total_paras = len([1 for p in frag_text.split("\n\n") if p.strip()])
+        if not missing_paras and not missing_tables:
             return {"ok": False, "error": "ye text ALREADY is question ki "
                     "solution me maujood hai (extra copy) -- merge refused; "
                     "bas Ignore kar do"}
-    new_text = (cur + "\n\n" + frag_text).strip() if frag_text else cur
+        new_text = (cur + "\n\n" + "\n\n".join(missing_paras).strip()).strip() \
+            if missing_paras else cur
+        if not new_text:
+            new_text = cur
+    else:
+        new_text = cur
+    _orphan_total_paras = total_paras if frag_text else 0
     res = apply_edit(out, to_q_id, "solution_text", new_text,
                      reason=reason or f"adopt orphan fragment pages "
                      f"{hit.get('new_pages') or hit.get('pdf_pages')}")
     if not res.get("ok"):
         return res
+    note = None
+    if frag_text and 0 < len(missing_paras) < _orphan_total_paras:
+        note = (f"partial merge: {len(missing_paras)} missing "
+                "paragraph(s) added, overlap skipped")
     adopted_tabs = 0
-    for t in frag_tables:
+    for t in missing_tables:
         md = str(t.get("markdown") or "")
         if not md.strip():
             continue
@@ -1383,9 +1422,10 @@ def apply_orphan_merge(output_root, chapter_id, frag_key, to_q_id,
         "q_id": to_q_id, "field": "orphan_merge", "frag_key": frag_key,
         "old_len": len(cur), "fragment_pages": hit.get("new_pages")
         or hit.get("pdf_pages"), "tables_adopted": adopted_tabs,
-        "reason": reason or "", "by": by, "ts": _now(),
+        "reason": reason or "", "by": by, "ts": _now(), "note": note,
         "changed_files": res.get("changed_files", [])})
     return {"ok": True, "verified": res.get("verified"), "tables": adopted_tabs,
+            "note": note,
             "changed_files": res.get("changed_files", [])}
 
 

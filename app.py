@@ -1884,7 +1884,8 @@ def review_attach_orphan():
                                             + (request.form.get("to_qid") or ""),
                                      q_id=request.form.get("to_qid") or None)
     return _review_redirect(res,
-                            f"orphan merged (tables: {res.get('tables', 0)}) + "
+                            (res.get("note") or "orphan merged") +
+                            f" (tables: {res.get('tables', 0)}) + "
                             "verified on disk — flag resolved")
 
 
