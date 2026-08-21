@@ -421,3 +421,33 @@ class TestAjaxAndPaged(Routes):
         self.assertTrue(a and b)
         self.assertFalse(a & b)                   # pages never repeat cards
         self.assertIn(b"next", r1.data)           # pager visible
+
+
+class TestAjaxErrorsAreJson(Routes):
+    """Crash inside a route must return JSON (500) when ajax=1 -- NEVER the
+    HTML error page that made the user's fetch().json() throw and hid the
+    server failure behind 'network/server error'."""
+
+    def test_route_crash_returns_json_on_ajax(self):
+        import review_queue as rq
+        orig = rq.record_decision
+        def boom(*a, **k):
+            raise RuntimeError("deliberate crash for the test")
+        rq.record_decision = boom
+        try:
+            d = self.tmp / "data"
+            (d / "unmatched_images.jsonl").write_text(json.dumps(
+                {"chapter_id": CH, "q_no": 1, "detail": "img unclaimed"}) + "\n")
+            q = rq.collect_review_queue(self.tmp)
+            key = [x["flag_key"] for x in q["rows"]][0]
+            r = self.client.post("/review-decide",
+                                 data={"flag_keys": json.dumps([key]),
+                                       "action": "approved", "ajax": "1"})
+            self.assertEqual(r.status_code, 500)
+            j = r.get_json()
+            self.assertIsNotNone(j)                        # never HTML again
+            self.assertFalse(j["ok"])
+            self.assertIn("server error", j["msg"])
+            self.assertIn("deliberate crash", j["msg"])
+        finally:
+            rq.record_decision = orig

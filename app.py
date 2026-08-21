@@ -1730,7 +1730,11 @@ document.addEventListener('submit', function(ev){
   var mode=form.getAttribute('data-opt')||'stay';
   if(mode==='hide' && card){card.style.opacity='0.35';card.style.pointerEvents='none';}
   rq_flash(form,'…',false);
-  fetch(form.action,{method:'POST',body:fd}).then(function(r){return r.json()})
+  fetch(form.action,{method:'POST',body:fd}).then(function(resp){
+     if(!resp.ok){ return resp.text().then(function(t){throw new Error('HTTP '+resp.status+': '+(t||'').slice(0,180));}); }
+     var ct=resp.headers.get('content-type')||'';
+     if(ct.indexOf('json')<0){ return resp.text().then(function(t){throw new Error('server ne non-JSON diya: '+(t||'').slice(0,180));}); }
+     return resp.json();})
    .then(function(j){
      if(j.ok){
        if(mode==='hide'&&card){
@@ -1750,7 +1754,9 @@ document.addEventListener('submit', function(ev){
        if(card){card.style.opacity='1';card.style.pointerEvents='auto';}
        rq_flash(form,'❌ '+(j.msg||'failed'),false);
      }
-   }).catch(function(e){if(card){card.style.opacity='1';card.style.pointerEvents='auto';}rq_flash(form,'❌ network/server error',false);});
+   }).catch(function(e){if(card){card.style.opacity='1';card.style.pointerEvents='auto';}
+     rq_flash(form,'❌ '+String((e&&e.message)||'network/server error'),false);
+     if(window.console&&console.error){console.error('review-queue ajax',e);}});
 });
 
 // attach with no thumbnail picked -> block before the server round-trip
@@ -2393,6 +2399,19 @@ def review_upload_image():
         "obj_id": None, "final_file": rel})
     log(f"🖼️ manual upload {rel} -> {q_id} ({side}); {len(blob)} bytes")
     return _review_redirect(res, f"uploaded + attached as {rel}")
+
+
+@app.errorhandler(Exception)
+def _queue_ajax_errors(e):
+    """AJAX actions must NEVER get an HTML error page back -- the optimistic
+    reader does res.json() and an HTML body throws -> 'network/server error'
+    hides the real failure (user's live report). Turn EVERY 500 into JSON."""
+    if request.form.get("ajax") == "1" or \
+            "application/json" in (request.headers.get("Accept") or ""):
+        import traceback as _tb; _tb.print_exc()
+        return jsonify({"ok": False,
+                        "msg": f"server error: {type(e).__name__}: {e}"}), 500
+    return "Internal Server Error", 500
 
 
 @app.route("/review/ai-verify", methods=["POST"])
