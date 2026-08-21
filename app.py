@@ -1722,31 +1722,32 @@ def _review_context(msg=None, ok=True):
     exact split rows for chapter-level flags -- a human should never have to
     guess what a flag is about."""
     out = Path(pipeline.OUTPUT_ROOT)
-    q = review_queue.collect_review_queue(out)
-    masters = {}
-    views = {}
-    unclaimed = {}
-    for r in q["rows"]:
-        views[r["flag_key"]] = review_queue.flag_extra(out, r)
-        qid = r.get("q_id")
-        if qid and qid not in masters:
-            row = review_queue._find_master_row(out, qid)
-            if row is not None:
-                masters[qid] = row
-                subj = row.get("subject")
-                if subj and subj not in unclaimed:
-                    unclaimed[subj] = _unclaimed_panel(out, subj)
-    # expand incomplete-records per-qid expansion lists onto masters too
-    for r in q["rows"]:
-        for e in (views.get(r["flag_key"]) or {}).get("expand") or []:
-            qid = e.get("q_id")
+    with review_queue.batch_cache():
+        q = review_queue.collect_review_queue(out)
+        masters = {}
+        views = {}
+        unclaimed = {}
+        for r in q["rows"]:
+            views[r["flag_key"]] = review_queue.flag_extra(out, r)
+            qid = r.get("q_id")
             if qid and qid not in masters:
                 row = review_queue._find_master_row(out, qid)
                 if row is not None:
                     masters[qid] = row
                     subj = row.get("subject")
                     if subj and subj not in unclaimed:
-                        unclaimed[subj] = review_queue.unclaimed_images(out, subj)[:60]
+                        unclaimed[subj] = _unclaimed_panel(out, subj)
+        # expand incomplete-records per-qid expansion lists onto masters too
+        for r in q["rows"]:
+            for e in (views.get(r["flag_key"]) or {}).get("expand") or []:
+                qid = e.get("q_id")
+                if qid and qid not in masters:
+                    row = review_queue._find_master_row(out, qid)
+                    if row is not None:
+                        masters[qid] = row
+                        subj = row.get("subject")
+                        if subj and subj not in unclaimed:
+                            unclaimed[subj] = _unclaimed_panel(out, subj)
     return {"rows": q["rows"], "counts": q["counts"], "warnings": q["warnings"],
             "clear": q["clear"], "masters": masters, "views": views,
             "unclaimed": unclaimed, "msg": msg, "ok": ok,
