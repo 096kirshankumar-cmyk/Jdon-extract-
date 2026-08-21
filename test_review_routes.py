@@ -478,3 +478,14 @@ class TestSubmitterButtonInAjax(Routes):
         self.assertIn('rq_lastBtn', src)
         self.assertIn('fd.append(rq_lastBtn.name, rq_lastBtn.value)', src)
         self.assertIn('form.contains(rq_lastBtn)', src)   # cross-form guard
+
+
+class Test405PathLogged(Routes):
+    def test_405_names_method_and_path(self):
+        r = self.client.post("/review", data={"ajax": "1"})   # GET-only route
+        self.assertEqual(r.status_code, 405)
+        j = r.get_json()
+        self.assertFalse(j["ok"])
+        self.assertEqual(j["method"], "POST")
+        self.assertEqual(j["path"], "/review")
+        self.assertIn("rejects this method", j["msg"])

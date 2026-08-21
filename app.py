@@ -2429,16 +2429,20 @@ def _queue_ajax_errors(e):
     need_json = request.form.get("ajax") == "1" or \
         "application/json" in (request.headers.get("Accept") or "")
     is_404 = getattr(e, "code", None) == 404
-    if is_404:
-        log(f"❓ 404 asked: {request.method} {request.path} (route not in map)")
-        detail = (f"404: {request.method} {request.path} is not a registered "
-                  f"route on this server")
+    is_405 = getattr(e, "code", None) == 405
+    if is_404 or is_405:
+        log(f"❓ {e.code} asked: {request.method} {request.path} "
+            f"(route {('missing' if is_404 else 'rejects this method')})")
+        detail = (f"{e.code}: {request.method} {request.path} "
+                  f"{'is not a registered route' if is_404 else 'rejects this method'}"
+                  f" on this server")
     else:
         import traceback as _tb; _tb.print_exc()
         detail = f"server error: {type(e).__name__}: {e}"
     if need_json:
-        return jsonify({"ok": False, "msg": detail, "path": request.path}), (404 if is_404 else 500)
-    return (detail, 404) if is_404 else ("Internal Server Error", 500)
+        return jsonify({"ok": False, "msg": detail, "path": request.path,
+                        "method": request.method}), (getattr(e, "code", None) or 500)
+    return (detail, getattr(e, "code", None) or 500)
 
 
 @app.route("/review/ai-verify", methods=["POST"])
