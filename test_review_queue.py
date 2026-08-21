@@ -657,3 +657,41 @@ class TestQueueCacheAndPdfReader(QEnv):
         r1 = rq._PDF_READERS["/home/user/book2/book.pdf"]
         rq._pdf_reader("/home/user/book2/book.pdf")
         self.assertIs(rq._PDF_READERS["/home/user/book2/book.pdf"], r1)
+
+
+class TestNumericDrift(QEnv):
+    """'Point B: 5000 cGy' hallucinated when the book printed 6000 -- a number
+    with a clinical unit that NEVER appears on the row's source pages cannot
+    be verbatim. Zero tokens. Feeds validation_report -> review queue."""
+
+    def test_drift_detected_and_clean_passes(self):
+        import qbank_validator as qv
+        row = {"chapter_id": CH, "q_no": 27, "id": f"{CH}-027",
+               "source_pages": [848, 849],
+               "solution": {"text": "In treatment, the dose at point B is 5000 cGy. Use for 2 weeks."}}
+        pages = {848: "Solution to Question 27: the dose at point B is 6000 cGy.\n",
+                 849: "table: point B 6000 cGy | point A 7000-8000 cGy | give for 2 weeks"}
+        f = qv.numeric_drift_flag(row, pages.get)
+        self.assertIsNotNone(f)
+        self.assertEqual(f["kind"], "numeric_drift_suspect")
+        self.assertIn("5000", f["detail"])
+        # honest: writer's printed 6000 -> no flag
+        row2 = dict(row); row2["solution"] = {"text": "the dose at point B is 6000 cGy. use for 2 weeks."}
+        self.assertIsNone(qv.numeric_drift_flag(row2, pages.get))
+        # no text layer -> nothing provable -> silent-safe None
+        self.assertIsNone(qv.numeric_drift_flag(row, lambda p: ""))
+        # no getter at all -> unchanged legacy behavior
+        self.assertIsNone(qv.numeric_drift_flag(row, None))
+
+    def test_deterministic_stage_wires_provider(self):
+        import qbank_validator as qv
+        import json as _json
+        rows = self._read_master_rows() if hasattr(self, "_read_master_rows") else self.masters
+        rows[0]["solution"]["text"] = ("In treatment, the dose given is 9999 cGy. "
+                                       "Use for 2 weeks. This has substance.")
+        self._write_masters(rows)
+        pages = {49: "the dose is 6000 cGy give for 2 weeks"}   # fixture row's source page
+        prov = lambda r: pages.get
+        flags_by, _ = qv.validate_deterministic(self.root, page_text_provider_of_row=prov)
+        kinds = [f["kind"] for f in flags_by.get(CH, [])]
+        self.assertIn("numeric_drift_suspect", kinds)

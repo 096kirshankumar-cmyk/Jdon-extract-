@@ -229,7 +229,12 @@ def run_validator_and_log():
     """Zero-token deterministic validation; every flag printed to the
     dashboard log box so no terminal is needed. Returns the report dict."""
     import qbank_validator
-    rep = qbank_validator.run_hybrid(pipeline.OUTPUT_ROOT, audit=False)
+    try:
+        provider = qbank_validator.default_page_text_provider(INPUT_META_DIR)
+    except Exception:
+        provider = None
+    rep = qbank_validator.run_hybrid(pipeline.OUTPUT_ROOT, audit=False,
+                                     page_text_provider=provider)
     s = rep["summary"]
     log(f"🧪 Validator: {s['flags_total']} flag(s) across "
         f"{s['flagged_chapters']}/{s['chapters']} chapters ({s['questions']} questions)")
@@ -345,7 +350,12 @@ def run_pipeline_thread(subject_code, pdf_path, page_offset):
         # unmatched-image sidecars) lands in data/validation_report.json.
         try:
             import qbank_validator
-            rep = qbank_validator.run_hybrid(pipeline.OUTPUT_ROOT, audit=False)
+            try:
+                provider = qbank_validator.default_page_text_provider(INPUT_META_DIR)
+            except Exception:
+                provider = None
+            rep = qbank_validator.run_hybrid(pipeline.OUTPUT_ROOT, audit=False,
+                                             page_text_provider=provider)
             log(f"🧪 Validation: {rep['summary']['flags_total']} flag(s) across "
                 f"{rep['summary']['flagged_chapters']}/{rep['summary']['chapters']} chapters → "
                 f"see data/validation_report.json")
