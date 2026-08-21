@@ -2446,6 +2446,26 @@ def review_ai_verify():
                             "dashboard log me dikhega")
 
 
+@app.route("/review/routes")
+def review_routes_probe():
+    """Self-diagnosis for ones chasing 'button kaam nahi karta': exactly which
+    URLs this deployed process actually serves, plus route count. If
+    review-decide is missing here -> the DEPLOY IS STALE/WONG service."""
+    rules = sorted(r.rule for r in app.url_map.iter_rules())
+    rev = [r for r in rules if "review" in r]
+    return jsonify({
+        "total_routes": len(rules),
+        "review_routes": rev,
+        "has_review_decide": "/review-decide" in rules,
+        "has_bulk": "/review/decide-bulk" in rules,
+        "has_ai_verify": "/review/ai-verify" in rules,
+        "has_ai_resolved": "/review/ai-resolved" in rules,
+        "has_unresolve": "/review/unresolve" in rules,
+        "has_upload": "/review/upload-image" in rules,
+        "has_lookup": "/review/lookup" in rules,
+    })
+
+
 @app.route("/review/ai-resolved")
 def review_ai_resolved():
     """✅ Auto-resolved by AI (N) tab -- every one re-restorable."""
