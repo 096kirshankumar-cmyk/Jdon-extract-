@@ -30,7 +30,7 @@ import subprocess
 import time
 from pathlib import Path
 
-VERIFY_MODEL = os.environ.get("GEMINI_VERIFY_MODEL", "gemini-3.1-flash")
+VERIFY_MODEL = os.environ.get("GEMINI_VERIFY_MODEL", "gemini-3.1-flash-lite")
 VERIFY_DAILY_CAP_PER_KEY = 480
 AUDIT_LOG = "ai_auto_resolved.jsonl"
 COUNTER_FILE = "verify_counter.json"
