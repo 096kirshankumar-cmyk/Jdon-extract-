@@ -94,6 +94,47 @@ def _chunk_pages(pages, n):
     return [pages[i:i + n] for i in range(0, len(pages), n)]
 
 
+def _phase_chunks(pages, size=PAGE_CHUNK, overlap=1):
+    """Phase-extraction chunking with a 1-page overlap. A printed header at
+    the BOTTOM of a chunk's last page otherwise loses its body (OPH-001 live:
+    'Solution to Question 15:' sat at the foot of p18 = chunk [12-18]'s edge;
+    chunk [19-23] held the body, which the bleed-anchor rule then refused to
+    attach). With the overlap every header is mid-chunk in at least one call;
+    _merge_phase_items dedupes the shared page's items."""
+    pages = list(pages)
+    if len(pages) <= size:
+        return [pages]
+    step = max(1, size - overlap)
+    chunks = [pages[i:i + size] for i in range(0, len(pages), step)]
+    return [c for c in chunks if c]
+
+
+_Q_NO_ALIASES = ("q_no", "question_number", "question_no", "qno",
+                 "q_number", "number")
+
+
+def _item_qn(it):
+    """q_no arrives under whichever key the model fancied this call
+    (live finding: a re-ask answered 'question_number' and the item was
+    silently discarded). Identity-field aliases only -- content fields stay
+    spec-strict."""
+    if not isinstance(it, dict):
+        return None
+    for k in _Q_NO_ALIASES:
+        if it.get(k) is not None:
+            return _norm_q_no(it.get(k))
+    return None
+
+
+def _item_qno_raw(it):
+    if not isinstance(it, dict):
+        return None
+    for k in _Q_NO_ALIASES:
+        if it.get(k) is not None:
+            return it.get(k)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # THE EXACT PROMPTS FROM THE SPEC (do not paraphrase)
 # ---------------------------------------------------------------------------
@@ -215,6 +256,28 @@ ONLY respond in this JSON format:
   ]
 }}"""
 
+# INLINE-ANSWER micro-phase (spec extension, zero-guessing): ONLY used when
+# neither the model boundary nor the printed probes found an answer-key
+# table -- i.e. books that print 'Ans: B' right under the options. Without
+# it those chapters must NOT lock (every correct_option would be None).
+INLINE_ANSWER_PROMPT = """Tumhe {chapter_name} ke pages {start}–{end} diye jayenge. Is chapter me 
+har question ke options ke neeche/paas answer INLINE printed hai (jaise 
+"Ans: B" ya "Answer - C") — koi alag answer-key table nahi hai.
+
+Task: SIRF wo printed inline answer markers nikaalo — har question ka number 
+aur uske paas printed letter.
+
+STRICT rules:
+- Jo letter page pe physically printed hai, SIRF wahi lo. Content padh kar 
+  khud answer mat nikaalo — printed marker nahi dikhe to us question ko 
+  list me hi mat daalo.
+- "low_confidence: true" jab marker dhundhla/adhoora ho; guess mat thopo.
+
+ONLY respond in this JSON format:
+[
+  {{"q_no": "<as printed>", "correct_option": "A/B/C/D", "low_confidence": true/false}}
+]"""
+
 BLEED_LINE = ("Extra check: kya kisi solution ka text galti se agle question "
               "ke solution me chala gaya hai (bleed)? Agar koi solution "
               "suspiciously short lag raha hai aur agle wale me extra unrelated "
@@ -264,6 +327,24 @@ def _safe_int(v):
         return int(str(v).strip())
     except Exception:
         return None
+
+
+_QNO_NUM_RE = re.compile(r"\d+")
+
+
+def _norm_q_no(v):
+    """Model q_nos arrive as printed ('Question 4:', '4.', 'Q4'). The NUMBER
+    is the identity; the decoration is not."""
+    if v is None:
+        return None
+    m = _QNO_NUM_RE.search(str(v))
+    return _safe_int(m.group(0)) if m else None
+
+
+def _is_continuation_marker(v):
+    """'4 (cont.)' / 'Question 4 (continued)' = the SAME question's spill
+    onto the next page, not a new question."""
+    return bool(re.search(r"\(\s*cont(?:inued|\.|\))", str(v or ""), re.I))
 
 
 def _merge_boundary_chunks(cands):
@@ -341,6 +422,9 @@ class ChapterRunner:
         self.ledger_rows = []          # this chapter's page_ledger rows
         self.orphan_items = []         # phase items with no parseable q_no
         self.watermark_ids = None      # driver computes once per book
+        self._zones = None             # set by run(): {"q":[], "a":[], "s":[]}
+        self._printed_q_hdrs = {}      # page -> {qn}: printed Question headers
+        self._printed_s_hdrs = {}      # page -> {qn}: printed Solution headers
 
     # ------------------------------------------------------------------
     # THE model-call choke point
@@ -375,7 +459,7 @@ class ChapterRunner:
                 return resp.text
             raise
 
-    def _call_pages(self, pages, prompt):
+    def _call_pages(self, pages, prompt, dpi=110):
         """One call with page images attached. Every call leads with the
         FILE-page order in plain text -- without it the model answered
         chunk-local indexes (live-run finding: the boundary detector said
@@ -384,7 +468,7 @@ class ChapterRunner:
                  f"order; these are REAL file-page numbers the model must use in "
                  f"its answer): {pages}"]
         for p in pages:
-            b = _png_bytes(self.pdf, p)
+            b = _png_bytes(self.pdf, p, dpi=dpi)
             if b:
                 files.append({"mime_type": "image/png", "data":
                               base64.b64encode(b).decode()})
@@ -423,17 +507,27 @@ class ChapterRunner:
         return res
 
     # -- Phase extraction helper ---------------------------------------------
-    def _extract_phase(self, pages, prompt_tmpl, label, pass_name):
+    def _extract_phase(self, pages, prompt_tmpl, label, pass_name, dpi=110):
         out = []
-        for chunk in _chunk_pages(pages, PAGE_CHUNK):
+        for chunk in _phase_chunks(pages):
             p = prompt_tmpl.format(chapter_name=self.chapter_id,
                                    start=chunk[0], end=chunk[-1])
-            raw = self._call_pages(chunk, p)
-            items = _parse_json(raw)
+            items = None
+            for reask in range(2):          # one bounded re-ask on bad JSON
+                raw = self._call_pages(chunk, p, dpi=dpi)
+                items = _parse_json(raw)
+                if isinstance(items, list):
+                    break
+                self.notes.append(f"{pass_name} chunk {chunk[0]}-{chunk[-1]}: "
+                                  f"unparsable JSON, re-ask {reask + 1}/1")
             if isinstance(items, list):
                 kept, dropped = [], 0
                 for it in items:
-                    if isinstance(it, dict) and _safe_int(it.get("q_no")) is not None:
+                    qn0 = _item_qn(it)
+                    if isinstance(it, dict) and qn0 is not None:
+                        it["_qn"] = qn0
+                        it["_continuation"] = _is_continuation_marker(
+                            _item_qno_raw(it))
                         kept.append(it)
                     else:
                         dropped += 1
@@ -452,23 +546,66 @@ class ChapterRunner:
                              len(kept),
                              f"{dropped} item(s) w/o q_no -> orphans" if dropped else "")
             else:
-                # STRICT: an unparsable phase chunk is NEVER a silent zero.
+                # STRICT: an unparsable phase chunk is NEVER a silent zero,
+                # even after the one re-ask.
                 self._ledger(pass_name, chunk, qp.PASS_STATUS_UNRESOLVED, 0,
-                             "phase chunk returned no parseable JSON array")
-        return out
+                             "phase chunk returned no parseable JSON array "
+                             "(1 re-ask also failed)")
+        return self._merge_phase_items(out)
+
+    @staticmethod
+    def _merge_phase_items(items):
+        """Duplicate/continuation safety at intake: two chunks (or an honest
+        '4 (cont.)' spill) can name the same q_no. MERGE them fill-only --
+        existing non-empty fields win, options extend, pages union. No value
+        is ever silently overwritten (conflicts go to the verify loop via
+        text_confidence); nothing is dropped."""
+        by_qn = {}
+        order = []
+        for it in items:
+            qn = it.get("_qn")
+            if qn is None:
+                continue
+            if qn not in by_qn:
+                by_qn[qn] = dict(it)
+                order.append(qn)
+                continue
+            base = by_qn[qn]
+            for k, v in it.items():
+                if k in ("_qn", "_continuation"):
+                    continue
+                if k == "options":
+                    merged = dict(base.get("options") or {})
+                    for letter, text in (v or {}).items():
+                        if not merged.get(letter):
+                            merged[letter] = text
+                    base["options"] = merged
+                elif k == "source_page_range":
+                    lo = (base.get("source_page_range") or [None])[0]
+                    hi = (base.get("source_page_range") or [None, None])[-1]
+                    for p in (v or []):
+                        lo = p if lo is None else min(lo, p)
+                        hi = p if hi is None else max(hi, p)
+                    base["source_page_range"] = [x for x in (lo, hi)
+                                                 if x is not None]
+                elif not base.get(k) and v not in (None, "", [], {}):
+                    base[k] = v                     # fill-only
+            if it.get("_continuation"):
+                base["_seen_continuation"] = True
+        return [by_qn[q] for q in order]
 
     # -- Verify helper (Steps 2/4/6 share this) --------------------------------
-    def _verify_phase(self, phase_name, items, pages):
+    def _verify_phase(self, phase_name, items, pages, dpi=110):
         if not pages:
             return items, True
         bleed_line = BLEED_LINE if phase_name == "Solution" else ""
         prompt = VERIFY_PROMPT.format(phase_name=phase_name, bleed_line=bleed_line)
-        payload = json.dumps(items, ensure_ascii=False)
+        payload = json.dumps(items, ensure_ascii=False, default=str)
         last = None
         for attempt in range(MAX_FIX_ATTEMPTS):
             files = [payload]
             for p in pages:
-                b = _png_bytes(self.pdf, p)
+                b = _png_bytes(self.pdf, p, dpi=dpi)
                 if b:
                     files.append({"mime_type": "image/png", "data":
                                   base64.b64encode(b).decode()})
@@ -505,35 +642,70 @@ class ChapterRunner:
         qns = [str(m.get("q_no")) for m in mismatches if m.get("q_no")]
         if not qns:
             return items
-        re_prompt = (f"Sirf in question numbers ko dobara extract karo pages se: "
-                     f"{qns}. Same rules, same JSON format sirf unhi ke liye.")
-        for chunk in _chunk_pages(
-                sorted({i.get("source_page") for i in items
-                        if i.get("source_page")}), PAGE_CHUNK):
+        # keep the ORIGINAL phase rules in view -- a bare 'same rules' re-ask
+        # quietly shape-drifts (live finding: fixed items came back with
+        # different fields when the format imprint was missing)
+        phase_hint = {"Question": QUESTION_PROMPT, "Answer-key": ANSWER_KEY_PROMPT,
+                      "Solution": SOLUTION_PROMPT}.get(phase_name, "")
+        fix_pages = sorted(self._phase_pages_of(phase_name, items))
+        for chunk in _chunk_pages(fix_pages, PAGE_CHUNK):
+            if not chunk:
+                continue
+            rules = phase_hint.split("ONLY respond")[0].format(
+                chapter_name=self.chapter_id, start=chunk[0], end=chunk[-1])
+            re_prompt = (rules
+                         + f"\n\nAb SIRF in question numbers ko dobara extract karo: "
+                           f"{qns}. Same JSON format, sirf unhi ke liye.")
             raw = self._call_pages(chunk, re_prompt)
             items_fixed = _parse_json(raw)
             if isinstance(items_fixed, list):
-                by_no = {str(i.get("q_no")): i for i in items
-                         if i.get("q_no") is not None}
+                by_no = {str(i.get("_qn")): i for i in items}
                 for it in items_fixed:
-                    by_no[str(it.get("q_no"))] = it
+                    if not isinstance(it, dict):
+                        continue
+                    it["_qn"] = _item_qn(it)
+                    if it["_qn"] is None:
+                        continue
+                    by_no[str(it["_qn"])] = it
                 items = [by_no[k] for k in by_no]
-        return items
+        return self._merge_phase_items(items)
 
-    # -- Step 7: chapter cross-check -----------------------------------------
+    def _phase_pages_of(self, phase_name, items):
+        """Which FILE pages a phase's items actually live on (phase-aware:
+        questions carry source_page, solutions carry source_page_range,
+        answer-key rows know neither so they fall back to the A zone)."""
+        pages = set()
+        for i in items:
+            sp = _safe_int(i.get("source_page"))
+            if sp is not None:
+                pages.add(sp)
+            for p in (i.get("source_page_range") or [])[:2]:
+                if _safe_int(p) is not None:
+                    pages.add(_safe_int(p))
+        if pages:
+            return pages
+        return set(self._zones.get("a", [])) if self._zones else set()
+
+    # -- Step 7: chapter cross-check (with one bounded targeted-fix round) ----
     def _cross_check(self, q_items, a_items, s_items, pages):
-        pack = json.dumps({"chapter": self.chapter_id, "questions": q_items,
-                           "answer_key": a_items, "solutions": s_items},
-                          ensure_ascii=False)[:12000]
+        def pack_now():
+            return json.dumps({"chapter": self.chapter_id,
+                               "questions": q_items, "answer_key": a_items,
+                               "solutions": s_items},
+                              ensure_ascii=False, default=str)[:12000]
+        phase_map = {"question": (q_items, "Question"),
+                     "answer_key": (a_items, "Answer-key"),
+                     "solution": (s_items, "Solution"),
+                     "solutions": (s_items, "Solution")}
         halves = [pages[:len(pages) // 2], pages[len(pages) // 2:]] \
             if len(pages) > 12 else [pages]
         for _ in range(MAX_FIX_ATTEMPTS):
             all_locked = True
-            any_issue = False
+            issues_seen = []
             for half in halves:
                 if not half:
                     continue
-                files = [pack]
+                files = [pack_now()]
                 for p in half:
                     b = _png_bytes(self.pdf, p)
                     if b:
@@ -542,23 +714,211 @@ class ChapterRunner:
                 files.append(CHAPTER_FINAL_PROMPT.format(chapter_name=self.chapter_id))
                 raw = self._gen(files)
                 v = _parse_json(raw)
-                if not isinstance(v, dict):
-                    all_locked = False        # parse fail = NEVER locks silently
+                # STRICT: ONLY an explicit "LOCKED" counts. A parse failure,
+                # an empty dict, or any missing/other status are all NO-VOTE
+                # -- a chapter never locks on silence (live finding: the
+                # '{}' empty-response shape silently 'passed' a half).
+                if not isinstance(v, dict) or v.get("status") not in (
+                        "LOCKED", "NEEDS_FIX"):
+                    all_locked = False
                     continue
                 if v.get("status") == "NEEDS_FIX":
                     all_locked = False
-                    any_issue = True
                     for iss in (v.get("issues") or []):
                         if isinstance(iss, dict) and iss.get("issue"):
+                            issues_seen.append(iss)
                             self.notes.append(
                                 f"cross-check q{iss.get('q_no')}: {iss['issue']}")
-                    break
-            if any_issue:
-                continue                       # fix-loop -> re-check
-            if all_locked and not any_issue:
+            if all_locked:
                 return True
-            # some half didn't even parse -> inconclusive, re-ask once more
+            if not issues_seen:
+                continue            # inconclusive parse(s) -> just re-ask
+            # fix-loop: re-ask ONLY the flagged q_nos inside their own phase
+            # (mutation in place so the caller's lists stay the same objects)
+            for iss in issues_seen:
+                pair = phase_map.get(str(iss.get("block") or "").lower())
+                qn = _norm_q_no(iss.get("q_no"))
+                if not pair or qn is None:
+                    continue
+                items, phase_name = pair
+                fixed = self._targeted_fix(phase_name, list(items),
+                                           [{"q_no": str(qn),
+                                             "issue": iss["issue"]}])
+                items[:] = fixed
         return False            # any NEEDS_FIX or repeated inconclusive = NOT locked
+
+    # -- Deterministic zone validation (ZERO tokens, printed evidence) --------
+    # The boundary MODEL zones the chapter, but pages are ground truth. The
+    # OBG ch3 live run: the model read an interleaved chapter as clean blocks
+    # and zoned the answer key 10 pages late (said p62; the grid is on p52).
+    # Rule: when the text layer PRINTS question/solution headers or a key
+    # grid, those PRINTED spans override the model's zones; when the text
+    # layer is empty (scanned book), the model's zones are the only signal
+    # and stand.
+    _QH_TXT = re.compile(r"(?im)^\s*question\s+(\d{1,3})\s*[:\.]")
+    _SH_TXT = re.compile(r"(?im)solution\s+to\s+question\s+(\d{1,3})"
+                         r"|^\s*detailed\s+explanations")
+    _KEYROW_TXT = re.compile(r"(?im)^\s*(\d{1,3})\s*[\.\)\:\-]?\s*"
+                             r"\(?([A-Ea-e])\)?\s*$")
+    _INLINE_ANS_TXT = re.compile(r"(?im)\bans(?:wer)?\b\s*[:\-\.]?\s*"
+                                 r"\(?([A-Ea-e])\)?\b")
+
+    def _printed_zones(self, ch_first, ch_last):
+        q_pages, s_pages, key_cands = set(), set(), []
+        # per-QUESTION printed headers too: page -> {qn}. This is what makes a
+        # model DROPPED block recoverable deterministically (the page PROVES
+        # 'Solution to Question 15' exists even when the model skipped q15).
+        q_hdrs, s_hdrs = {}, {}
+        read_pages = 0
+        for p in range(ch_first, ch_last + 1):
+            try:
+                txt = qp.pdftotext_page(self.pdf, p) or ""
+            except Exception:
+                txt = ""
+            if not txt.strip():
+                continue                      # scanned page: no opinion
+            read_pages += 1
+            qh = {int(m.group(1)) for m in self._QH_TXT.finditer(txt)}
+            sh = {int(m.group(1)) for m in self._SH_TXT.finditer(txt)
+                  if m.group(1)}
+            if qh:
+                q_pages.add(p)
+                q_hdrs[p] = qh
+            if sh or self._SH_TXT.search(txt):
+                s_pages.add(p)
+                if sh:
+                    s_hdrs[p] = sh
+            rows = [(int(m.group(1)), m.group(2).upper())
+                    for m in self._KEYROW_TXT.finditer(txt)]
+            nums = [n for n, _ in rows]
+            # a key grid = MANY sequential rows (a two-item list is not one)
+            if len(rows) >= 6 and len(set(nums)) >= 6 \
+                    and max(nums) - min(nums) <= 3 * len(nums):
+                key_cands.append(p)
+        if read_pages == 0:
+            return None                       # scanned book: no printed signal
+        self._printed_q_hdrs = q_hdrs
+        self._printed_s_hdrs = s_hdrs
+        return {"q": q_pages, "s": s_pages, "keys": key_cands}
+
+    def _printed_header_reask(self, phase_name, items, zone_pages, hdr_attr,
+                              prompt_tmpl, dpi=110):
+        """A phase's model read can silently DROP a question/solution whose
+        header is PRINTED (OPH-001 live: q15's solution exists on the page
+        but never came back, twice). The text-layer header is hard proof of
+        existence, so re-ask EXACTLY those q_nos on EXACTLY those pages once.
+        Zero guessing: this only ever ADDS a block the book provably prints."""
+        hdrs = getattr(self, hdr_attr, None)
+        if not hdrs:
+            return items
+        have = {i.get("_qn") for i in items}
+        missing_pages = {}
+        for p in zone_pages:
+            for qn in (hdrs.get(p) or set()):
+                if qn not in have:
+                    missing_pages.setdefault(qn, p)
+        if not missing_pages:
+            return items
+        qns = sorted(missing_pages)
+        pages = sorted({p for qn in qns
+                        for p in range(missing_pages[qn],
+                                       min(missing_pages[qn] + 1,
+                                           max(zone_pages)) + 1)})
+        self.notes.append(f"{phase_name}: printed headers prove missing "
+                          f"block(s) q{qns} -- targeted re-ask on {pages}")
+        self._ledger(f"REASK_{phase_name[0]}", pages, qp.PASS_STATUS_PARTIAL,
+                     0, f"printed headers prove q{qns} exist; re-asking")
+        for chunk in _chunk_pages(pages, PAGE_CHUNK):
+            rules = prompt_tmpl.split("ONLY respond")[0].format(
+                chapter_name=self.chapter_id, start=chunk[0], end=chunk[-1])
+            re_prompt = (rules + f"\n\nAb SIRF in question numbers ko extract "
+                                 f"karo: {qns}. Same JSON format, sirf unhi ke "
+                                 f"liye. Ye blocks page par PRINTED hain -- "
+                                 f"dhundh kar nikaalo, skip mat karo.")
+            raw = self._call_pages(chunk, re_prompt, dpi=dpi)
+            fixed = _parse_json(raw)
+            if not isinstance(fixed, list):
+                self._ledger(f"REASK_{phase_name[0]}", chunk,
+                             qp.PASS_STATUS_UNRESOLVED, 0,
+                             "re-ask returned no parseable JSON array")
+                continue
+            for it in fixed:
+                qn0 = _item_qn(it)
+                if qn0 is None:
+                    self.orphan_items.append({
+                        "chapter_id": self.chapter_id, "batch_start": chunk[0],
+                        "pdf_pages": list(chunk),
+                        "reason": "reask_item_unparseable_qno (schema drift)",
+                        "pass": f"REASK_{phase_name[0]}", "item": it})
+                    continue
+                it["_qn"] = qn0
+                if qn0 in have:
+                    continue
+                it["_reasked"] = True
+                items = list(items) + [it]
+                have.add(qn0)
+        return self._merge_phase_items(items)
+
+    def _inline_answers_present(self, q_pages):
+        hits = 0
+        for p in q_pages:
+            try:
+                t = qp.pdftotext_page(self.pdf, p) or ""
+            except Exception:
+                t = ""
+            if self._INLINE_ANS_TXT.search(t):
+                hits += 1
+        return hits >= 1 and hits >= max(1, len([p for p in q_pages]) // 3)
+
+    def _resolve_zones(self, bounds, ch_first, ch_last):
+        """-> (q_pages, a_pages, s_pages). STRICT per spec: no question zone
+        or no solution zone at all = abort (the caller writes the blocker)."""
+        qb = bounds.get("question_block") or {}
+        ab = bounds.get("answer_key_block") or {}
+        sb = bounds.get("solution_block") or {}
+        qb_start = _safe_int(qb.get("start_page"))
+        sb_start = _safe_int(sb.get("start_page"))
+        ab_start = _safe_int(ab.get("start_page"))
+        if qb_start is None or sb_start is None:
+            raise RuntimeError(
+                f"{self.chapter_id}: boundary detect incomplete "
+                f"(q_start={qb.get('start_page')}, s_start={sb.get('start_page')}) -- "
+                "no extraction attempted, chapter left for review")
+        q_end = (ab_start or sb_start) - 1
+        if q_end < qb_start:
+            q_end = qb_start
+        m_q = list(range(qb_start, min(q_end, ch_last) + 1))
+        m_a = list(range(ab_start, min(_safe_int(ab.get("end_page"))
+                                       or ab_start, ch_last) + 1)) \
+            if ab_start else []
+        m_s = list(range(sb_start, min(_safe_int(sb.get("end_page"))
+                                       or ch_last, ch_last) + 1))
+
+        printed = None
+        try:
+            printed = self._printed_zones(ch_first, ch_last)
+        except Exception as e:
+            self.notes.append(f"printed-zone probe failed ({e}) -- "
+                              "model zones kept")
+        if not printed:
+            return m_q, m_a, m_s
+        q_pages = m_q
+        if printed["q"]:
+            q_pages = list(range(min(printed["q"]),
+                                 min(max(printed["q"]) + 1, ch_last) + 1))
+        s_pages = m_s
+        if printed["s"]:
+            s_pages = list(range(min(printed["s"]),
+                                 min(max(printed["s"]) + 1, ch_last) + 1))
+        a_pages = m_a
+        if printed["keys"]:
+            a_pages = sorted(set(printed["keys"]))
+        if q_pages != m_q or s_pages != m_s or a_pages != m_a:
+            self.notes.append(
+                f"zones corrected by PRINTED headers (model said "
+                f"Q{m_q[0]}-{m_q[-1]}/A{m_a}/S{m_s[0]}-{m_s[-1]}; printed says "
+                f"Q{q_pages[0]}-{q_pages[-1]}/A{a_pages}/S{s_pages[0]}-{s_pages[-1]})")
+        return q_pages, a_pages, s_pages
 
     # -- Record assembly ------------------------------------------------------
     def _build_records(self, q_items, a_items, s_items):
@@ -569,7 +929,7 @@ class ChapterRunner:
         amap = {}
         a_low = set()
         for a in a_items:
-            qn = _safe_int(a.get("q_no"))
+            qn = a.get("_qn") if a.get("_qn") is not None else _norm_q_no(a.get("q_no"))
             if qn is None:
                 continue
             amap[qn] = (a.get("correct_option") or "").strip().upper() or None
@@ -577,13 +937,13 @@ class ChapterRunner:
                 a_low.add(qn)
         smap = {}
         for s in s_items:
-            qn = _safe_int(s.get("q_no"))
+            qn = s.get("_qn") if s.get("_qn") is not None else _norm_q_no(s.get("q_no"))
             if qn is not None:
                 smap[qn] = s
         records = {}
         qn_source_pages = {}
         for q in q_items:
-            qn = _safe_int(q.get("q_no"))
+            qn = q.get("_qn") if q.get("_qn") is not None else _norm_q_no(q.get("q_no"))
             if qn is None:
                 continue
             srow = smap.get(qn) or {}
@@ -875,36 +1235,13 @@ class ChapterRunner:
         print(f"[BPH] {self.chapter_id}: boundary detect {ch_first}-{ch_last}")
         bounds = self.detect_boundaries(ch_first, ch_last)
         print(f"[BPH] boundaries:", json.dumps(bounds, ensure_ascii=False)[:300])
-        qb = bounds.get("question_block") or {}
-        ab = bounds.get("answer_key_block") or {}
-        sb = bounds.get("solution_block") or {}
-        # STRICT (spec): a missing block boundary means the chapter was never
-        # safely zoned -- do NOT run it half-way; hand it to manual review.
-        if not qb.get("start_page") or not (sb and sb.get("start_page")):
-            raise RuntimeError(
-                f"{self.chapter_id}: boundary detect incomplete "
-                f"(q_start={qb.get('start_page')}, s_start={sb.get('start_page')}) -- "
-                "no extraction attempted, chapter left for review")
-        qb_start = _safe_int(qb.get("start_page"))
-        sb_start = _safe_int(sb.get("start_page"))
-        ab_start = _safe_int(ab.get("start_page"))
-        if qb_start is None or sb_start is None:
-            raise RuntimeError(
-                f"{self.chapter_id}: boundary pages not parseable "
-                f"(q_start={qb.get('start_page')!r}, s_start={sb.get('start_page')!r}) "
-                "-- chapter left for review")
-        q_end = (ab_start or sb_start) - 1
-        if q_end < qb_start:
-            q_end = qb_start
-        q_pages = list(range(qb_start, min(q_end, ch_last) + 1))
-        a_pages = list(range(ab_start, min(_safe_int(ab.get("end_page"))
-                                           or ab_start, ch_last) + 1)) \
-            if ab_start else []           # some books have NO key table
-        s_end = min(_safe_int(sb.get("end_page")) or ch_last, ch_last)
-        s_pages = list(range(sb_start, s_end + 1))
+        # STRICT (spec): a missing question/solution zone means the chapter
+        # was never safely zoned -- do NOT run it half-way.
+        q_pages, a_pages, s_pages = self._resolve_zones(bounds, ch_first, ch_last)
+        self._zones = {"q": q_pages, "a": a_pages, "s": s_pages}
         print(f"[BPH] {self.chapter_id}: Q pages {q_pages[0]}-{q_pages[-1]}"
-              f" | A pages {a_pages[0]}-{a_pages[-1] if a_pages else '-'} "
-              f"({len(a_pages)}) | S pages {s_pages[0]}-{s_pages[-1]}")
+              f" | A pages {a_pages or '-'} "
+              f"| S pages {s_pages[0]}-{s_pages[-1]}")
 
         # Snapshot this chapter's currently-open flags BEFORE we write
         # anything -- these belong to a PREVIOUS extraction and get closed
@@ -917,20 +1254,62 @@ class ChapterRunner:
 
         q_items = self._extract_phase(q_pages, QUESTION_PROMPT, "Question", "Q")
         q_items, q_ok = self._verify_phase("Question", q_items, q_pages)
+        q_items = self._printed_header_reask("Question", q_items, q_pages,
+                                             "_printed_q_hdrs", QUESTION_PROMPT)
         if q_ok is not True:
             self.notes.append(f"question phase unresolved: {q_ok}")
         qp.save_state(self.state)
-        a_items = self._extract_phase(a_pages, ANSWER_KEY_PROMPT, "Answer-key",
-                                      "A") if a_pages else []
-        a_items, a_ok = self._verify_phase("Answer-key", a_items, a_pages) \
-            if a_pages else ([], True)
+        if a_pages:
+            a_items = self._extract_phase(a_pages, ANSWER_KEY_PROMPT,
+                                          "Answer-key", "A", dpi=170)
+            a_items, a_ok = self._verify_phase("Answer-key", a_items, a_pages,
+                                               dpi=170)
+        elif self._inline_answers_present(q_pages):
+            # no key TABLE, but answers print inline next to each question --
+            # dedicated zero-guess micro-phase (spec extension)
+            self.notes.append("no key table; inline answer markers found -- "
+                              "running the inline-answer micro-phase")
+            a_items = self._extract_phase(q_pages, INLINE_ANSWER_PROMPT,
+                                          "Inline-answer", "A")
+            a_items, a_ok = self._verify_phase("Answer-key", a_items, q_pages)
+        else:
+            a_items, a_ok = [], True
+            self.notes.append("no answer-key table and no inline markers -- "
+                              "answers stay empty + flagged (never guessed)")
         if a_ok is not True:
             self.notes.append(f"answer-key phase unresolved: {a_ok}")
         s_items = self._extract_phase(s_pages, SOLUTION_PROMPT, "Solution", "S")
         s_items, s_ok = self._verify_phase("Solution", s_items, s_pages)
+        s_items = self._printed_header_reask("Solution", s_items, s_pages,
+                                             "_printed_s_hdrs", SOLUTION_PROMPT)
         if s_ok is not True:
             self.notes.append(f"solutions phase unresolved: {s_ok}")
         qp.save_state(self.state)
+
+        # BLOCK-FAIL: a zone that EXISTS (per boundary/print) but yielded ZERO
+        # items means the phase failed wholesale -- do not write a
+        # half-shell chapter. Leave it UNDONE (retried next run) + blocker.
+        block_fail = []
+        if not q_items:
+            block_fail.append("question")
+        if a_pages and not a_items:
+            block_fail.append("answer-key")
+        if s_pages and not s_items:
+            block_fail.append("solutions")
+        if block_fail:
+            detail = ("zone(s) existed but the phase extracted 0 items: "
+                      + ", ".join(block_fail)
+                      + " -- nothing written, chapter retried on the next run")
+            qp._append_jsonl(qp.DATA_DIR / "export_gate.jsonl", {
+                "chapter_id": self.chapter_id, "kind": "chapter_not_locked",
+                "q_no": None, "detail": detail,
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
+            qp.save_state(self.state)
+            print(f"[BPH] {self.chapter_id}: BLOCK-FAIL ({detail})")
+            return {"locked": False, "committed": False,
+                    "chapter_id": self.chapter_id, "questions": len(q_items),
+                    "answers": len(a_items), "solutions": len(s_items),
+                    "notes": self.notes}
 
         same_pages = sorted(set(q_pages) | set(a_pages) | set(s_pages))
         locked = self._cross_check(q_items, a_items, s_items, same_pages)
@@ -956,22 +1335,6 @@ class ChapterRunner:
             self.notes.append(f"count mismatch: {len(q_items)} questions vs "
                               f"{len(a_items)} answers")
         print(f"[BPH] {self.chapter_id}: final cross-check lock={locked}")
-
-        if not q_items:
-            # nothing trustworthy to write -- leave the chapter UNDONE so the
-            # next run retries it; the blocker row makes it visible meanwhile.
-            qp._append_jsonl(qp.DATA_DIR / "export_gate.jsonl", {
-                "chapter_id": self.chapter_id, "kind": "chapter_not_locked",
-                "q_no": None,
-                "detail": "question phase produced 0 parseable items -- "
-                          "nothing written, chapter will be retried on the "
-                          "next run",
-                "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
-            qp.save_state(self.state)
-            return {"locked": False, "committed": False,
-                    "chapter_id": self.chapter_id, "questions": 0,
-                    "answers": len(a_items), "solutions": len(s_items),
-                    "notes": self.notes}
 
         page_section = {p: "S" for p in s_pages}
         rows = self._commit(ch_first, ch_last, page_section,

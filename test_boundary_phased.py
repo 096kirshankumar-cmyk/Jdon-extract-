@@ -275,6 +275,50 @@ class EngineCase(unittest.TestCase):
         # 2 options < 4 -> structural INCOMPLETE (flagged for human, not fixed)
         self.assertEqual(row["qa_status"], "INCOMPLETE")
 
+    def test_printed_header_reask_recovers_dropped_block(self):
+        """OPH-001 live finding: the model silently dropped q15's solution
+        although the page PRINTS 'Solution to Question 15'. The text-layer
+        header proves existence -> one targeted re-ask must recover it."""
+        bnd = {"question_block": {"start_page": 5},
+               "answer_key_block": {"start_page": 10, "end_page": 10},
+               "solution_block": {"start_page": 11, "end_page": 13},
+               "confidence": "high"}
+        qs = [{"q_no": "1", "stem": "S1?", "options": {"A": "a", "B": "b",
+               "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
+               "source_page": 5, "text_confidence": "high"},
+              {"q_no": "2", "stem": "S2?", "options": {"A": "a", "B": "b",
+               "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
+               "source_page": 5, "text_confidence": "high"}]
+        an = [{"q_no": "1", "correct_option": "A", "low_confidence": False},
+              {"q_no": "2", "correct_option": "B", "low_confidence": False}]
+        so = [{"q_no": "1", "solution_text": "Sol1.", "has_figure": False,
+               "figure_location": None, "source_page_range": [11, 11],
+               "text_confidence": "high"}]          # q2 SILENTLY MISSING
+        ok = {"phase": "x", "total_entries_checked": 2,
+              "all_verified": True, "mismatches": []}
+        reasked = [{"q_no": "2", "solution_text": "Sol2 recovered.",
+                    "has_figure": False, "figure_location": None,
+                    "source_page_range": [12, 12], "text_confidence": "high"}]
+        cross = {"chapter": "OPH-001", "status": "LOCKED",
+                 "total_questions": 2, "issues": []}
+        model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
+                            json.dumps(qs), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
+                            json.dumps(so), json.dumps(ok),
+                            json.dumps(reasked),       # the re-ask call
+                            json.dumps(cross)])
+        r = self._runner(model)
+        r._printed_s_hdrs = {12: {1, 2}}   # page 12 PROVES q2's solution exists
+        res = r.run(5, 13)
+        self.assertTrue(res["locked"])
+        rows = {json.loads(l)["id"]: json.loads(l) for l in
+                (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
+                if l.strip()}
+        self.assertEqual(rows["OPH-001-002"]["solution"]["text"],
+                         "Sol2 recovered.")
+        self.assertIn("REASK_S", [lr["pass"] for lr in
+                                  r.ledger_rows])
+
     def test_quota_pause_is_systemexit_and_saves_state(self):
         model = _FakeModel(self._answers())
         r = self._runner(model)

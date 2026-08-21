@@ -15,24 +15,41 @@ writers) — koi doosra extraction "tareeka" nahi.
 
 ## Naya method ka flow (Steps 0-8, per chapter)
 
-0. **Boundary detect** — poore chapter ke pages dekh kar QUESTIONS /
-   ANSWER-KEY / SOLUTIONS blocks ki exact page boundaries (+ low-confidence
-   par ek re-check).
-1. **Question phase** — sirf question block ke pages; sirf stem + options.
-   Answer/explanation is phase me allowed hi nahi.
+0. **Boundary detect** — model zones karta hai, phir **printed-zone
+   validation** (ZERO tokens): text layer ke asli printed "Question N:" /
+   "Solution to Question N:" headers + answer-key grid probe (≥6 sequential
+   `N → letter` rows) model ke zones ko verify/override karta hai. Live
+   proof — OBG ch3 ko model ne clean 3-block padha jabki wo interleaved
+   tha; printed evidence ne zones correct kiye (model Q48-61/A62/S62-64 →
+   asli Q48-53/A52/S52-65). Scanned book (text layer empty) → model zones.
+1. **Question phase** — sirf question zone ke pages; sirf stem + options.
+   Answer/explanation is phase me allowed hi nahi. Chunking 7-page windows
+   with 1-page OVERLAP (koi header chunk-edge pe kat-ta nahi) +
+   dedupe/continuation merge at intake + `q_no` aliases
+   (`question_number` etc.) tolerate.
 2. **Verify loop** — extracted JSON + same pages dobara de kar
-   line-by-line compare; mismatch ho to 3 targeted re-asks tak fix-loop.
-3. **Answer-key phase** — sirf key table ke pages; sirf number → letter.
-   Answer *sirf* isi phase se aata hai (isolation rule; test-locked).
+   line-by-line compare; mismatch ho to targeted re-asks (original phase
+   rules prompt me re-format ho kar — shape drift nahi).
+2b. **Printed-header re-ask** — text layer jahan ek header PRINTED prove
+   karta hai par model ne block drop kar diya (live: OPH-001 q15), exactly
+   un q_no/pages par ek bounded re-ask; drop report orphan ledger me.
+3. **Answer-key phase** — sirf key grid ke page(s) par (170 dpi — chhota
+   grid text); answer *sirf* isi phase se aata hai (isolation rule;
+   test-locked). Na key table na inline marker? → answers empty + flagged,
+   KABHI guess nahi. Inline "Ans: B" wali books ke liye alag
+   zero-guess micro-phase hai (INLINE_ANSWER_PROMPT, spec extension).
 4. **Answer-key verify.**
-5. **Solutions phase** — solution block ke pages, **bleed-anchor rule** ke
-   saath (naya solution sirf explicit number-marker par khulta hai; image ke
-   aage/pichhe ka text usi question ka hissa rehta hai).
+5. **Solutions phase** — solution zone, **bleed-anchor rule** ke saath.
 6. **Solutions verify (+ bleed check line).**
-7. **Whole-chapter cross-check** + deterministic count guards (AI ko counts
-   par bharosa nahi — alag code guard hai).
-8. **LOCK / commit** — rows, split trio, images, state — sab wahi format jo
-   review queue / validator / zip pehle se jaante hain.
+7. **Whole-chapter cross-check** + deterministic count guards + strict
+   verdict semantics (sirf explicit `"LOCKED"` count hota hai; `{}` /
+   parse-fail / koi bhi missing status = NO lock). NEEDS_FIX issues per
+   block targeted-fix ho kar ek bounded re-check paate hain.
+8. **LOCK / commit** — rows, split trio, images, state — sab wahi format.
+
+**BLOCK-FAIL**: jo zone EXIST karta hai par phase ne 0 items diye
+(wholesale failure) → kuch nahi likha jata, chapter `chapters_done` me
+nahi jata (agla Run retry karega), + `chapter_not_locked` BLOCKER.
 
 ## LOCK semantics (kab kya hota hai)
 
@@ -86,7 +103,22 @@ khatam.
 `python -m unittest test_pipeline_json
 test_image_ownership_audit_regressions test_resume_relink_regressions
 test_review_queue test_review_routes test_flag_verifier test_boundary_phased`
-→ **323 OK (1 intentional skip)**. Purane method ke ~150 tests usi ke saath
+→ **324 OK (1 intentional skip)**. Purane method ke ~150 tests usi ke saath
 retire ho gaye; `test_boundary_phased.py` ab engine ke real write-through ko
-cover karta hai (locked commit, unlocked blocker, zero-question abort,
-answer-phase isolation, quota-pause, driver pause).
+cover karta hai (locked commit, unlocked blocker, block-fail abort,
+answer-phase isolation, printed-zone override, header re-ask recovery,
+quota-pause, driver pause).
+
+## Live verification (2026-08-22, production Gemini, real books)
+
+- **OBG ch3** (interleaved layout — har question ke neeche uska solution):
+  LOCKED, gate CLEAN, **16/16 answers EXACT vs printed key**, solutions
+  16/16, image ownership sahi (p55 q3/q4 aur p64 q15/q16 multi-draw shares
+  dono deterministic), 12 calls.
+- **OPH ch1** (sequential blocks): LOCKED, gate CLEAN, **23/23 answers
+  identical to the previously hand-verified extraction**, solutions 23/23
+  (q15 ka header printed-tha-par-drop-tha case overlap+re-ask se recover
+  hua — text_confidence=low honestly REVIEW_NEEDED mark), images 18=18
+  old-run se exact, 13 calls.
+- Cost feel: ~12-25 calls/chapter (chapter size par). 480/day/key brake +
+  multi-key rotation unchanged.
