@@ -81,6 +81,10 @@ class VerifyPoolError(RuntimeError):
 
 
 def _discover_verify_keys(env=None):
+    """Verify pool keys. Fallback = the extraction pool's keys (user rule: one
+    Gemini key serves every model; 3.1-flash-lite for verify, 3.5 for extract).
+    The verify budget is still tracked separately so extraction's daily brake
+    visibility stays clean; Google's per-key daily cap is shared anyway."""
     env = os.environ if env is None else env
     keys = []
     raw = env.get("GEMINI_VERIFY_API_KEYS", "")
@@ -92,6 +96,18 @@ def _discover_verify_keys(env=None):
         v = env.get(f"GEMINI_VERIFY_API_KEY_{i}", "")
         if v.strip():
             keys.append(v.strip())
+    if not keys:
+        for c in env.get("GEMINI_API_KEYS", "").replace("\n", ",").split(","):
+            c = c.strip().strip('"')
+            if c:
+                keys.append(c)
+        i = 1
+        while env.get(f"GEMINI_API_KEY_{i}"):
+            keys.append(env[f"GEMINI_API_KEY_{i}"].strip())
+            i += 1
+        single = env.get("GEMINI_API_KEY", "")
+        if single.strip():
+            keys.append(single.strip())
     seen, uniq = set(), []
     for k in keys:
         if k not in seen:
@@ -240,7 +256,8 @@ def run_verification(output_root, *, books_dir="/data/input_pdfs",
     keys = _discover_verify_keys()
     if not keys:
         return {"ok": False, "skipped": True,
-                "error": "verify pool not configured (set GEMINI_VERIFY_API_KEY_1..N)"}
+                "error": "no Gemini keys found anywhere (GEMINI_VERIFY_API_KEYS "
+                         "ya GEMINI_API_KEY_1..N set karo)"}
     left, cap, nkeys = _quota_left(out_root)
     if left <= 0:
         return {"ok": False, "skipped": True,
