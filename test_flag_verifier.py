@@ -118,12 +118,16 @@ class TestRunVerification(VEnv):
         self.assertEqual(q["counts"]["resolved"], 0)
 
     def test_no_pool_configured_skips_everything(self):
-        env = {f"GEMINI_VERIFY_API_KEY_{i}": "" for i in range(1, 9)}
-        env["GEMINI_VERIFY_API_KEYS"] = ""
-        # directly drive with empty env (never writes decisions)
+        # NOTHING anywhere: no verify keys AND no extraction keys -> polite skip
+        env = {k: "" for k in (
+            ["GEMINI_VERIFY_API_KEYS", "GEMINI_API_KEYS", "GEMINI_API_KEY"]
+            + [f"GEMINI_VERIFY_API_KEY_{i}" for i in range(1, 9)]
+            + [f"GEMINI_API_KEY_{i}" for i in range(1, 9)])}
+        # _run() pops verify vars and always adds key1; make it empty here
         res = self._run({"flag_genuine": False, "reason": "x",
                          "confidence": "high"}, env_extra={"k1": "", **env})
         self.assertTrue(res["skipped"])
+        self.assertIn("GEMINI_API_KEY", res["error"])
 
     def test_reopen_undoes_the_ai_close(self):
         self._run({"flag_genuine": False, "reason": "x", "confidence": "high"})
@@ -170,3 +174,23 @@ class TestContentLock(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKeyFallback(unittest.TestCase):
+    def test_falls_back_to_extraction_pool(self):
+        import os as _os
+        env = {"GEMINI_VERIFY_API_KEYS": "", "GEMINI_VERIFY_API_KEY_1": ""}
+        # clear all verify vars the test env may hold
+        rr = dict(env)
+        rr.pop("GEMINI_VERIFY_API_KEY_1", None)
+        keys = fv._discover_verify_keys({"GEMINI_VERIFY_API_KEY_1": "",
+                                         "GEMINI_API_KEY_1": "K_A", "GEMINI_API_KEY_2": "K_B"})
+        self.assertEqual(keys, ["K_A", "K_B"])  # verify pool empty -> extraction keys
+
+    def test_verify_pool_wins_when_set(self):
+        keys = fv._discover_verify_keys({"GEMINI_VERIFY_API_KEY_1": "V1",
+                                         "GEMINI_API_KEY_1": "X"})
+        self.assertEqual(keys, ["V1"])
+
+    def test_nothing_anywhere_empty(self):
+        self.assertEqual(fv._discover_verify_keys({}), [])
