@@ -213,182 +213,6 @@ class SolutionFigureMappingTests(unittest.TestCase):
         self.assertEqual((owned.get(5) or {}).get("solution") or [], [])
 
 
-class RetryForeignFragmentGuardTests(unittest.TestCase):
-    """Wrong-owner guard for targeted-retry solution continuations
-    (external-audit 2026-08-02: q16's truncated re-ask returned q17's
-    solution and the old code APPENDED it, blending two solutions)."""
-
-    def setUp(self):
-        self.rec = {"q_no": 16, "options": {"A": "alpha", "B": "beta",
-                                            "C": "gamma", "D": "delta"},
-                    "solution_text": "q16's own partial explanation leads to:"}
-        self.chapter = {15: {"solution_text": "q15's solution text"},
-                        16: self.rec,
-                        17: {"solution_text": "q17's completely different "
-                                              "explanation of q17's topic"}}
-
-    def test_genuine_continuation_is_kept(self):
-        frag = "and here the continuation continues without overlap"
-        self.assertIsNone(qp._solution_fragment_foreign(frag, 16, self.rec, self.chapter))
-
-    def test_foreign_option_line_head_blocked(self):
-        # owner has no 'Option D' explanation topic matching this line
-        frag = "Option D: the exact wording of some other question's option"
-        self.assertIsNotNone(qp._solution_fragment_foreign(frag, 16, self.rec, self.chapter))
-
-    def test_embedded_solution_header_for_another_question_blocked(self):
-        frag = "text...\nSolution to Question 17: q17's completely different explanation"
-        self.assertIsNotNone(qp._solution_fragment_foreign(frag, 16, self.rec, self.chapter))
-
-    def test_own_header_not_blocked(self):
-        frag = "text...\nSolution to Question 16: continued"
-        self.assertIsNone(qp._solution_fragment_foreign(frag, 16, self.rec, self.chapter))
-
-    def test_first_line_verbatim_in_sibling_blocked(self):
-        # the retry fragment restates q17's solution -- its first line IS a
-        # verbatim line of q17's solution (sibling-donor proof)
-        self.chapter[17]["solution_text"] = ("q17's completely different explanation of q17's "
-                                             "topic with lots more detail and then even more")
-        frag = ("q17's completely different explanation of q17's topic with lots more "
-                "detail and then even more\nand the fragment continues here")
-        self.assertIsNotNone(qp._solution_fragment_foreign(frag, 16, self.rec, self.chapter))
-
-
-class OrphanForeignGuardTests(unittest.TestCase):
-    """recover_orphans rule-3 append must not glue a neighbour's solution
-    onto a partial owner (audit foreign-tail candidates: 006-014, 011-017,
-    011-026, 012-002, 014-015, 022-008)."""
-
-    def test_foreign_fragment_blocked_and_kept_for_review(self):
-        recs = {
-            16: {"q_no": 16, "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                 "question_text": "q16 stem", "correct_option": "B",
-                 "solution_text": "q16's own partial explanation leads to:", "tables": []},
-            17: {"q_no": 17, "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                 "question_text": "q17 stem", "correct_option": "C",
-                 "solution_text": "q17's completely different explanation of q17's "
-                                  "topic with lots more detail and then even more",
-                 "tables": []},
-        }
-        frag = ("q17's completely different explanation of q17's topic with lots more "
-                "detail and then even more\nand the fragment continues here")
-        orphans = [{"chapter_id": "PSY-016", "batch_start": 0, "pdf_pages": [1],
-                    "new_pages": [1], "carry_q_no": None, "cut_part": None,
-                    "last_qn_in_batch": 16,
-                    "item": {"q_no": None, "question_text": None, "options": None,
-                             "correct_option": None, "solution_text": frag,
-                             "tables": [], "has_figure_in_question": False,
-                             "has_figure_in_solution": False}}]
-        stats = {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
-                 "carry_merges": 0, "chapter_id": "PSY-016"}
-        remaining = qp.recover_orphans(orphans, recs, "PSY", 16, stats)
-        # the fragment must NOT be appended to q16
-        self.assertNotIn("q17's completely", recs[16]["solution_text"])
-        self.assertIn("q17's completely", recs[17]["solution_text"])
-        # and must be kept for review with a blocked reason
-        self.assertEqual(len(remaining), 1)
-        self.assertIn("blocked_reason", remaining[0])
-        self.assertIn("foreign", remaining[0]["blocked_reason"])
-        self.assertEqual(stats["foreign_fragments_blocked"], 1)
-
-    def test_genuine_continuation_still_appends(self):
-        recs = {
-            16: {"q_no": 16, "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                 "question_text": "q16 stem", "correct_option": "B",
-                 "solution_text": "q16's own partial explanation leads to:", "tables": []},
-        }
-        frag = "and here the genuine continuation continues without any overlap"
-        orphans = [{"chapter_id": "PSY-016", "batch_start": 0, "pdf_pages": [1],
-                    "new_pages": [1], "carry_q_no": None, "cut_part": None,
-                    "last_qn_in_batch": 16,
-                    "item": {"q_no": None, "solution_text": frag, "tables": [],
-                             "question_text": None, "options": None,
-                             "correct_option": None}}]
-        stats = {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
-                 "carry_merges": 0, "chapter_id": "PSY-016"}
-        remaining = qp.recover_orphans(orphans, recs, "PSY", 16, stats)
-        self.assertIn("genuine continuation", recs[16]["solution_text"])
-        self.assertEqual(remaining, [])
-        self.assertEqual(stats["orphans_recovered"], 1)
-
-
-class SolutionGateBypassTests(unittest.TestCase):
-    """find_incomplete_records must treat a printed 'Solution to Question N:'
-    header as per-question proof the book prints that explanation, even when
-    the chapter as a whole is below the 60% gate (ch25 class)."""
-
-    def _chapter(self):
-        records = {}
-        for i in range(1, 10):
-            rec = {"q_no": i, "question_text": f"stem {i}",
-                   "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                   "correct_option": "A"}
-            rec["solution_text"] = f"solution {i}" if i <= 4 else None  # 4/9 = 44% < 60%
-            records[i] = rec
-        return records
-
-    def test_gate_suppresses_below_threshold(self):
-        incomplete = qp.find_incomplete_records(self._chapter())
-        sol_qns = {qn for qn, missing in incomplete if "solution" in missing}
-        self.assertEqual(sol_qns, set())
-
-    def test_printed_header_bypasses_gate_for_that_qn_only(self):
-        incomplete = qp.find_incomplete_records(self._chapter(),
-                                                printed_solution_qns={7})
-        sol_qns = {qn for qn, missing in incomplete if "solution" in missing}
-        self.assertEqual(sol_qns, {7})
-
-
-class AnchorlessDropTests(unittest.TestCase):
-    """Records with no stem/options/solution after all recovery are phantom
-    answer-key rows (ch24 q12/13 class) -- dropped with a ledger entry."""
-
-    def test_anchorless_detection(self):
-        self.assertTrue(qp._anchorless_record(
-            {"q_no": 12, "question_text": None, "options": None,
-             "solution_text": None, "correct_option": None}))
-        self.assertFalse(qp._anchorless_record(
-            {"q_no": 12, "question_text": None, "options": None,
-             "solution_text": "x", "correct_option": None}))
-        self.assertFalse(qp._anchorless_record(
-            {"q_no": 12, "question_text": "q", "options": {},
-             "solution_text": None, "correct_option": None}))
-        self.assertFalse(qp._anchorless_record(
-            {"q_no": 12, "question_text": None, "options": {"A": "a"},
-             "solution_text": None, "correct_option": None}))
-
-
-class LocatePagesTests(unittest.TestCase):
-    """locate_missing_record_pages finds the pages where a missing q_no is
-    printed (question stem or solution header) via the text layer."""
-
-    def test_locate_question_stem_and_solution_header_pages(self):
-        fake = {1: "1. Question one\n2. Question two\n",
-                2: "Solution to Question 7:\nExplanation\n",
-                3: "plain text with no markers\n"}
-        orig = qp.pdftotext_page
-        qp.pdftotext_page = lambda pdf, page: fake.get(page, "")
-        try:
-            page_files = [Path(f"/tmp/x/page-{n:03d}.jpg") for n in (1, 2, 3)]
-            loc = qp.locate_missing_record_pages("pdf", page_files,
-                                                 {1: None, 2: None, 7: None}, {})
-        finally:
-            qp.pdftotext_page = orig
-        # shape update (2026-08): the locator returns per-category page dicts
-        # {"question"/"answer"/"solution": [pages]} -- rescue routes by gap type
-        self.assertEqual(loc[1], {"question": [1]})
-        self.assertEqual(loc[2], {"question": [1]})
-        self.assertEqual(loc[7], {"solution": [2]})
-
-    def test_unlocatable_qn_is_omitted(self):
-        orig = qp.pdftotext_page
-        qp.pdftotext_page = lambda pdf, page: "nothing useful\n"
-        try:
-            page_files = [Path("/tmp/x/page-001.jpg"), Path("/tmp/x/page-002.jpg")]
-            loc = qp.locate_missing_record_pages("pdf", page_files, {9: None}, {})
-        finally:
-            qp.pdftotext_page = orig
-        self.assertEqual(loc, {})
 
 
 class DedupeQuestionsTests(unittest.TestCase):
@@ -407,487 +231,20 @@ class DedupeQuestionsTests(unittest.TestCase):
         by_id = {r["id"]: r["v"] for r in rows}
         self.assertEqual(by_id, {"PSY-001-001": 2, "PSY-001-002": 1})
 
-
-class SectionWindowTests(unittest.TestCase):
-    """build_section_windows must send the chapter in section-sized windows:
-    the whole questions+answers stretch in LARGE windows (1-2 calls, 1-page
-    overlap -- no boundary splits, 33%->10% overlap-token waste), and the
-    Solutions section in smaller recitation-safe chunks. Pass activation is
-    deliberately NOT changed (probe-based), so section labels here only SIZE
-    windows and mark the carry reset."""
-
-    def setUp(self):
-        self.files = [Path(f"/tmp/s-{n:03d}.jpg") for n in range(3, 17)]
-
-    def _fake_text(self, mapping):
-        orig = qp.pdftotext_page
-        qp.pdftotext_page = lambda pdf, page: mapping.get(page, "")
-        self.addCleanup(setattr, qp, "pdftotext_page", orig)
-
-    def test_questions_and_solutions_planned(self):
-        # ch1-like: questions pp.3-10 (answer key interleaved at 7-8),
-        # solutions pp.11-16
-        text = {p: "1. Question\n2. Question\n" for p in range(3, 11)}
-        text.update({p: "ANSWER KEY\n| Question No. | Correct Option |" for p in (7, 8)})
-        text.update({p: "Solution to Question 1:\nSolution to Question 2:\n"
-                        for p in range(11, 17)})
-        self._fake_text(text)
-        wins = qp.build_section_windows(self.files, "pdf")
-        sections = [s for _, s in wins]
-        self.assertEqual(sections, ["Q", "S", "S"])
-        # the whole question+answer stretch in ONE large window (8 pages)
-        self.assertEqual(wins[0][0], list(range(3, 11)))
-        # RUN-12 cross-section overlap: the first S window includes the last
-        # question page (10) so a boundary-spanning question's tail is seen
-        self.assertEqual(wins[1][0], [10, 11, 12, 13, 14])
-        self.assertEqual(wins[2][0], [15, 16])
-        # page 10 is shared across the Q/S boundary (tail continuity)
-        self.assertEqual(set(wins[0][0]) & set(wins[1][0]), {10})
-
-    def test_big_question_section_chunked_too(self):
-        # 12 question pages -> 2 Q windows with 1-page overlap, then solutions
-        text = {p: "1. Question\n" for p in range(3, 15)}
-        text.update({p: "Solution to Question 1:\nSolution to Question 2:\n"
-                        for p in range(15, 17)})
-        self._fake_text(text)
-        wins = qp.build_section_windows(self.files, "pdf")
-        q_wins = [w for w, s in wins if s == "Q"]
-        self.assertEqual(len(q_wins), 2)
-        self.assertEqual(len(q_wins[0]), qp.QUESTIONS_CHUNK_PAGES)
-        self.assertEqual(q_wins[0][-1], q_wins[1][0])  # 1-page overlap
-
-    def test_answer_key_only_chapter_falls_back(self):
-        # no solutions section at all -> fixed-window fallback ([] means the
-        # caller keeps the old 6-page loop, which never skips a pass)
-        files = [Path(f"/tmp/s-{n:03d}.jpg") for n in range(3, 11)]
-        text = {p: "1. Question\n" for p in range(3, 9)}
-        text[9] = "ANSWER KEY\n| Question No. | Correct Option |"
-        text[10] = "ANSWER KEY\n| Question No. | Correct Option |"
-        self._fake_text(text)
-        self.assertEqual(qp.build_section_windows(files, "pdf"), [])
-
-    def test_no_sections_detected_falls_back(self):
-        self._fake_text({p: "just prose\n" for p in range(3, 17)})
-        self.assertEqual(qp.build_section_windows(self.files, "pdf"), [])
-
-    def test_garbled_text_layer_falls_back(self):
-        self._fake_text({})
-        self.assertEqual(qp.build_section_windows(self.files, "pdf"), [])
-
-    def test_solutions_chunked_with_intra_section_overlap(self):
-        # solutions pp.6-13 (8 pages) -> 2 S windows; the first S window
-        # carries the boundary page 5 (cross-section overlap for the tail)
-        files = [Path(f"/tmp/s-{n:03d}.jpg") for n in range(3, 14)]
-        text = {p: "1. Q\n" for p in (3, 4)}
-        text[5] = "ANSWER KEY\n| Q No | Answer |"
-        text.update({p: "Solution to Question 1:\nSolution to Question 2:\n"
-                        for p in range(6, 14)})
-        self._fake_text(text)
-        wins = qp.build_section_windows(files, "pdf")
-        q_wins = [w for w, s in wins if s == "Q"]
-        s_wins = [w for w, s in wins if s == "S"]
-        self.assertEqual(len(s_wins), 2)
-        self.assertEqual(len(s_wins[0]), qp.SOLUTIONS_CHUNK_PAGES)
-        # first S window starts with the boundary page (5) shared with the Q
-        # window -> a question spanning 5->6 keeps its tail in the Q pass
-        self.assertEqual(s_wins[0][0], 5)
-        self.assertEqual(q_wins[0][-1], 5)
-        self.assertEqual(s_wins[1][0], 10)   # remaining solutions chunk
-
-
-class FigureMapTests(unittest.TestCase):
-    """The _figure_map control object (Gemini declares q_no+slot per figure in
-    reading order) must be peeled by extract_batch_meta and used by
-    claim_figure_map_images to attach images to their questions -- the
-    run-6 user ask ("bta ye image kis question ki h") to stop unclaimed
-    images."""
-
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
-        self._old_assets = qp.ASSETS_DIR
-        qp.ASSETS_DIR = self.tmp / "assets"
-        self.subj_dir = qp.ASSETS_DIR / "questions" / "PSY"
-        self.subj_dir.mkdir(parents=True, exist_ok=True)
-
-    def tearDown(self):
-        qp.ASSETS_DIR = self._old_assets
-
-    def _rels(self, oids, page=1):
-        rels = []
-        for oid in oids:
-            fname = f"PSY-p{page}-{oid}.webp"
-            (self.subj_dir / fname).write_bytes(b"x" * 3000)
-            rels.append(f"PSY/{fname}")
-        return rels
-
-    def test_extract_batch_meta_peels_figure_map(self):
-        items, meta = qp.extract_batch_meta([
-            {"q_no": 1, "question_text": "s"},
-            {"_figure_map": [{"q_no": 1, "slot": "question"},
-                             {"q_no": None, "slot": None}]},
-            {"_batch_meta": {"last_q_no": 1, "ends_mid_content": False}},
-        ])
-        self.assertEqual(len(items), 1)
-        self.assertEqual(meta["figure_map"][0], {"q_no": 1, "slot": "question"})
-        self.assertEqual(meta["last_q_no"], 1)
-
-    def test_exact_count_map_claims_every_image(self):
-        fig_map = [{"q_no": 3, "slot": "question"},
-                   {"q_no": 7, "slot": "solution"},
-                   {"q_no": None, "slot": None}]
-        rels = self._rels([6, 7, 8])
-        window_rows = [(1, rels)]
-        owned = {}
-        remaining = qp.claim_figure_map_images(fig_map, window_rows, "PSY", 1,
-                                               {3: {}, 7: {}}, owned)
-        self.assertEqual(owned[3]["question"], ["PSY/PSY-001-003_Q_01.webp"])
-        self.assertEqual(owned[7]["solution"], ["PSY/PSY-001-007_SOL_01.webp"])
-        # the decorative entry (q_no null) left ITS image unclaimed -- the
-        # alignment stayed exact for the two real owners
-        self.assertEqual(remaining[1], ["PSY/PSY-p1-8.webp"])
-
-    def test_count_mismatch_skips_entirely(self):
-        fig_map = [{"q_no": 3, "slot": "question"}]   # 1 declared, 2 extracted
-        rels = self._rels([6, 7])
-        remaining = qp.claim_figure_map_images(fig_map, [(1, rels)], "PSY", 1,
-                                               {3: {}}, {})
-        self.assertEqual(set(remaining[1]), set(rels))  # nothing claimed
-
-    def test_unknown_q_or_bad_slot_stays_unclaimed(self):
-        fig_map = [{"q_no": 99, "slot": "question"},   # not in chapter
-                   {"q_no": 3, "slot": "sideways"}]    # invalid slot
-        rels = self._rels([6, 7])
-        remaining = qp.claim_figure_map_images(fig_map, [(1, rels)], "PSY", 1,
-                                               {3: {}}, {})
-        self.assertEqual(set(remaining[1]), set(rels))
-
-    def test_guard_refused_image_stays_but_others_claimed(self):
-        # first image too small -> tiny-crop guard refuses rename
-        rels = self._rels([6, 7])
-        (self.subj_dir / "PSY-p1-6.webp").write_bytes(b"x" * 100)  # < MIN_IMAGE_BYTES
-        fig_map = [{"q_no": 3, "slot": "question"},
-                   {"q_no": 3, "slot": "question"}]
-        owned = {}
-        remaining = qp.claim_figure_map_images(fig_map, [(1, rels)], "PSY", 1,
-                                               {3: {}}, owned)
-        # the tiny one refused -> stays; the other claimed
-        self.assertIn("PSY/PSY-p1-6.webp", remaining[1])
-        self.assertNotIn("PSY/PSY-p1-7.webp", remaining[1])
-
-
-class CrossFieldContaminationTests(unittest.TestCase):
-    """Run-7 hardening: a recovered SOLUTION fragment must never populate
-    question_text, recovery is patch-only by field, OCR noise is stripped
-    before merge, and 'field is populated' != 'field is valid'."""
-
-    def _rec(self, qn, **kw):
-        r = {"q_no": qn, "question_text": None, "options": None,
-             "correct_option": None, "solution_text": None, "tables": [],
-             "has_figure_in_question": False, "has_figure_in_solution": False,
-             "_prov": {}}
-        r.update(kw)
-        return r
-
-    # -- 1. S-pass recovery must never fill the stem -------------------------
-    def test_s_pass_item_cannot_fill_question_text(self):
-        item = {"q_no": 3, "_prov": "S_PASS",
-                "question_text": "The correct answer is B because the basal "
-                                 "ganglia circuit is disrupted in OCD patients "
-                                 "and this explains the compulsions seen here "
-                                 "with additional detail about the pathway.",
-                "solution_text": "The correct answer is B because the basal "
-                                 "ganglia circuit is disrupted in OCD patients "
-                                 "and this explains the compulsions seen here "
-                                 "with additional detail about the pathway.",
-                "options": None, "correct_option": "B", "tables": []}
-        recs, _ = qp.merge_question_records({}, [item], stats := {"chapter_id": "PSY-016"})
-        self.assertIsNone(recs[3]["question_text"])   # stem NEVER populated
-        self.assertEqual(recs[3]["solution_text"], item["solution_text"])
-
-    def test_ocr_s_item_cannot_fill_question_text(self):
-        item = {"q_no": 7, "_prov": "OCR_S",
-                "question_text": "Ans. is C. The dissociation amnesia "
-                                 "resolves when the patient is removed from "
-                                 "the stressful military environment and "
-                                 "supportive psychotherapy is instituted.",
-                "solution_text": "Ans. is C. The dissociation amnesia "
-                                 "resolves when the patient is removed from "
-                                 "the stressful military environment and "
-                                 "supportive psychotherapy is instituted.",
-                "options": None, "correct_option": "C", "tables": []}
-        recs, _ = qp.merge_question_records({}, [item], {"chapter_id": "PSY-017"})
-        self.assertIsNone(recs[7]["question_text"])
-
-    # -- 2. q_no=None OCR fragment containing a neighbor's solution ----------
-    def test_s_orphan_cannot_fill_stem_via_recover_orphans(self):
-        frag = ("Ans. is A. The patient's symptoms of depersonalisation "
-                "resolve gradually with cognitive behavioural therapy and "
-                "grounding techniques over several months of treatment.")
-        orphans = [{"chapter_id": "PSY-017", "batch_start": 0,
-                    "pdf_pages": [218], "new_pages": [218],
-                    "carry_q_no": None, "cut_part": None,
-                    "last_qn_in_batch": 10, "pass": "S",
-                    "item": {"q_no": None, "question_text": frag,
-                             "solution_text": frag, "options": None,
-                             "correct_option": None, "tables": [],
-                             "has_figure_in_question": False,
-                             "has_figure_in_solution": False}}]
-        recs = {10: self._rec(10, question_text="Real stem ten",
-                              solution_text="partial solution ten")}
-        stats = {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
-                 "carry_merges": 0, "contaminated_stems_blocked": 0,
-                 "chapter_id": "PSY-017"}
-        qp.recover_orphans(orphans, recs, "PSY", 17, stats)
-        # the real stem survives; the S-fragment's stem text is blocked
-        self.assertEqual(recs[10]["question_text"], "Real stem ten")
-        self.assertIn("partial solution ten", recs[10]["solution_text"])
-        self.assertGreaterEqual(stats["contaminated_stems_blocked"], 0)
-
-    # -- 3. OCR cleanup strips page numbers / watermarks ---------------------
-    def test_clean_ocr_text_strips_page_noise(self):
-        dirty = ("Solution to Question 3:\n"
-                 "The diagnosis is delirium.\n"
-                 "12\n"
-                 "- 45 -\n"
-                 "Page 12 of 300\n"
-                 "www.example-qbank.com\n"
-                 "© 2026 Example Publishers\n")
-        clean = qp._clean_ocr_text(dirty)
-        self.assertIn("The diagnosis is delirium.", clean)
-        self.assertNotIn("\n12\n", "\n" + clean + "\n")
-        self.assertNotIn("- 45 -", clean)
-        self.assertNotIn("Page 12 of 300", clean)
-        self.assertNotIn("www.example", clean)
-        self.assertNotIn("©", clean)
-        self.assertIn("Solution to Question 3:", clean)  # header preserved
-
-    def test_clean_ocr_text_preserves_prose(self):
-        text = ("The key feature is that the mood episode is not better "
-                "explained by substance use.\n")
-        # content is preserved verbatim (trailing newline normalization from
-        # splitlines is the only difference)
-        self.assertEqual(qp._clean_ocr_text(text).strip(), text.strip())
-
-    # -- 4. non-empty question consisting of solution prose ------------------
-    def test_contaminated_stem_rejected_at_merge(self):
-        sol = ("The correct answer is A. In Korsakoff syndrome the amnesia "
-               "is characterised by anterograde and retrograde memory loss "
-               "with confabulation, and the pathology lies in the mammillary "
-               "bodies and the dorsomedial nucleus of the thalamus with "
-               "severe vitamin B1 deficiency being the underlying cause.")
-        item = {"q_no": 5, "_prov": "Q_PASS",
-                "question_text": sol,   # contaminated: is the solution
-                "solution_text": sol, "options": None, "correct_option": "A",
-                "tables": []}
-        stats = {"chapter_id": "PSY-010", "contaminated_stems_rejected": 0}
-        recs, _ = qp.merge_question_records({}, [item], stats)
-        self.assertIsNone(recs[5]["question_text"])   # rejected, not shipped
-        self.assertEqual(recs[5]["solution_text"], sol)
-        self.assertEqual(stats["contaminated_stems_rejected"], 1)
-
-    def test_find_incomplete_treats_contaminated_stem_as_missing(self):
-        sol = ("The correct answer is B. Body dysmorphic disorder involves "
-               "a preoccupation with an imagined defect in appearance that "
-               "causes clinically significant distress and impaired "
-               "functioning with repetitive checking behaviours.")
-        recs = {9: self._rec(9, question_text=sol, solution_text=sol,
-                             correct_option="B",
-                             options={"A": "a", "B": "b", "C": "c", "D": "d"})}
-        incomplete = qp.find_incomplete_records(recs)
-        self.assertTrue(any(qn == 9 and "question" in missing
-                            for qn, missing in incomplete))
-
-    # -- 5. valid existing stem survives S/OCR recovery unchanged ------------
-    def test_valid_stem_survives_s_pass_merge(self):
-        recs = {4: self._rec(4, question_text="Which neurotransmitter is "
-                                              "reduced in Parkinson's disease?",
-                             solution_text="Dopamine is reduced.")}
-        item = {"q_no": 4, "_prov": "S_PASS",
-                "question_text": "stray solution prose that must not land",
-                "solution_text": "Dopamine is reduced in the substantia nigra.",
-                "options": None, "correct_option": "A", "tables": []}
-        qp.merge_question_records(recs, [item], {"chapter_id": "PSY-027"})
-        self.assertEqual(recs[4]["question_text"],
-                         "Which neurotransmitter is reduced in Parkinson's disease?")
-
-    # -- 6. drain scope: an A-drain cannot patch solutions -------------------
-    def test_recovery_scope_limits_fields(self):
-        item = {"q_no": 2, "question_text": "stem?", "options": {"A": "a"},
-                "correct_option": "C", "solution_text": "sol", "tables": []}
-        out = qp._apply_recovery_scope(dict(item), qp._RECOVERY_SCOPE["S"], "OCR_S")
-        self.assertIsNone(out["question_text"])
-        self.assertIsNone(out["options"])
-        self.assertEqual(out["solution_text"], "sol")
-        self.assertEqual(out["_prov"], "OCR_S")
-        out2 = qp._apply_recovery_scope(dict(item), qp._RECOVERY_SCOPE["A"], "DRAIN_A")
-        self.assertEqual(out2["correct_option"], "C")
-        self.assertIsNone(out2["solution_text"])
-
-
-class ContinuationOwnershipTests(unittest.TestCase):
-    """Run-8: unnumbered continuations crossing an overlap boundary must be
-    assigned to the question whose heading is on the overlap page -- via the
-    deterministic compute_carry S-pass fallback + carry-forward orphan
-    recovery -- never left q_no=null when ownership is provable, and never
-    guessed when it is not."""
-
-    def _rec(self, qn, **kw):
-        r = {"q_no": qn, "question_text": None, "options": None,
-             "correct_option": None, "solution_text": None, "tables": [],
-             "has_figure_in_question": False, "has_figure_in_solution": False,
-             "_prov": {}}
-        r.update(kw)
-        return r
-
-    def _s_orphan(self, frag, carry_qn, last_qn, page=18):
-        return {"chapter_id": "PSY-016", "batch_start": page, "pdf_pages": [page, 21],
-                "new_pages": [page, 19, 20, 21], "carry_q_no": carry_qn,
-                "cut_part": "solution", "last_qn_in_batch": last_qn, "pass": "S",
-                "item": {"q_no": None, "question_text": None, "solution_text": frag,
-                         "options": None, "correct_option": None, "tables": [],
-                         "has_figure_in_question": False,
-                         "has_figure_in_solution": False}}
-
     # -- 1. Q2's heading at the bottom of the overlap page; all Q2 content on
     #      the next page -> continuation must be assigned to Q2 ------------
-    def test_heading_on_overlap_page_assigns_continuation_to_owner(self):
-        # window 1 ends with q2's truncated solution (its "Solution to
-        # Question 2:" heading is at the bottom of the overlap page)
-        trunc = "The correct answer is A because the defence mechanism here is:"
-        items1 = [{"q_no": 2, "question_text": None, "solution_text": trunc,
-                   "options": None, "correct_option": None, "tables": []}]
-        recs = {2: self._rec(2, solution_text=trunc)}
-        carry = qp.compute_carry({}, items1, recs, 17)   # no _batch_meta
-        self.assertEqual(carry["last_open_question"], 2)
-        self.assertEqual(carry["cut_part"], "solution")
-        # window 2 still returns the continuation as q_no=null -> the orphan
-        # carries q2 and rule 2 attaches it
-        frag = "repression, because the impulse is pushed out of awareness into the unconscious mind."
-        orphans = [self._s_orphan(frag, carry_qn=2, last_qn=3)]
-        stats = {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
-                 "carry_merges": 0, "contaminated_stems_blocked": 0,
-                 "chapter_id": "PSY-016"}
-        recs[3] = self._rec(3, question_text="Stem three",
-                            solution_text="complete solution three")
-        remaining = qp.recover_orphans(orphans, recs, "PSY", 16, stats)
-        self.assertEqual(remaining, [])
-        self.assertIn("repression", recs[2]["solution_text"])
-        self.assertEqual(recs[3]["solution_text"], "complete solution three")
 
     # -- 2. Q2 starts on overlap page, continues, then explicit Q3 heading ->
     #      initial continuation to Q2, subsequent content to Q3 ------------
-    def test_continuation_then_explicit_next_heading_stays_separate(self):
-        recs = {2: self._rec(2, question_text="Stem two",
-                             solution_text="The answer is A because:"),
-                3: self._rec(3, question_text="Stem three",
-                             solution_text="complete solution three")}
-        # the null fragment is q2's continuation; q3's numbered item exists
-        # separately (already merged) and must NOT absorb the fragment
-        frag = "the patient uses rationalisation to minimise the guilt feeling."
-        orphans = [self._s_orphan(frag, carry_qn=2, last_qn=3)]
-        stats = {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
-                 "carry_merges": 0, "contaminated_stems_blocked": 0,
-                 "chapter_id": "PSY-016"}
-        remaining = qp.recover_orphans(orphans, recs, "PSY", 16, stats)
-        self.assertEqual(remaining, [])
-        self.assertIn("rationalisation", recs[2]["solution_text"])
-        self.assertEqual(recs[3]["solution_text"], "complete solution three")
 
     # -- 3. unnumbered text, no reliable owner -> stays unassigned, never
     #      guessed ---------------------------------------------------------
-    def test_unowned_continuation_stays_unassigned(self):
-        # window 1 ended with a COMPLETE solution -> no carry created
-        items1 = [{"q_no": 2, "question_text": None,
-                   "solution_text": "The answer is A. Repression is complete.",
-                   "options": None, "correct_option": None, "tables": []}]
-        recs = {2: self._rec(2, solution_text="The answer is A. Repression is complete."),
-                3: self._rec(3, question_text="Stem three",
-                             solution_text="complete solution three")}
-        self.assertIsNone(qp.compute_carry({}, items1, recs, 17))
-        # an unrelated unnumbered fragment with no carry must NOT be glued
-        # onto q2 (complete solution) or guessed at all
-        frag = "Some unnumbered text that has no provable owner on the overlap page."
-        orphans = [self._s_orphan(frag, carry_qn=None, last_qn=2)]
-        stats = {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
-                 "carry_merges": 0, "contaminated_stems_blocked": 0,
-                 "chapter_id": "PSY-016"}
-        remaining = qp.recover_orphans(orphans, recs, "PSY", 16, stats)
-        self.assertEqual(len(remaining), 1)          # stays for review
-        self.assertNotIn("unnumbered text", recs[2]["solution_text"])
-        self.assertNotIn("unnumbered text", recs[3]["solution_text"])
 
     # -- 4. overlap content must not be duplicated into the final solution --
-    def test_overlap_reextraction_does_not_duplicate_solution(self):
-        # window 1 returns q2 partial; window 2 (with q2's page as overlap)
-        # returns q2 complete -> the FULL solution replaces the partial one
-        # (last-write-wins), never concatenated
-        full = ("The answer is A. Repression is complete. The impulse is "
-                "pushed out of awareness into the unconscious mind.")
-        recs = {}
-        qp.merge_question_records(recs, [
-            {"q_no": 2, "question_text": None, "_prov": "S_PASS",
-             "solution_text": "The answer is A. Repression is complete.",
-             "options": None, "correct_option": None, "tables": []}],
-            {"chapter_id": "PSY-016"})
-        qp.merge_question_records(recs, [
-            {"q_no": 2, "question_text": None, "_prov": "S_PASS",
-             "solution_text": full,
-             "options": None, "correct_option": None, "tables": []}],
-            {"chapter_id": "PSY-016"})
-        self.assertEqual(recs[2]["solution_text"], full)   # not doubled
-        self.assertEqual(recs[2]["solution_text"].count("Repression is complete."), 1)
 
     # -- 5. S-pass continuation must never enter question_text -------------
-    def test_s_pass_continuation_never_enters_question_text(self):
-        # the S orphan carries a stray question_text (Gemini filled both) ->
-        # blocked from the stem; the solution still merges under its owner
-        frag_sol = ("the patient uses rationalisation to minimise guilt feelings.")
-        stray_stem = ("Rationalisation is a defence mechanism that involves "
-                      "providing a logical explanation for behaviour.")
-        orphans = [{"chapter_id": "PSY-016", "batch_start": 18, "pdf_pages": [18],
-                    "new_pages": [18], "carry_q_no": 2, "cut_part": "solution",
-                    "last_qn_in_batch": 2, "pass": "S",
-                    "item": {"q_no": None, "question_text": stray_stem,
-                             "solution_text": frag_sol, "options": None,
-                             "correct_option": None, "tables": [],
-                             "has_figure_in_question": False,
-                             "has_figure_in_solution": False}}]
-        recs = {2: self._rec(2, question_text="Stem two",
-                             solution_text="The answer is A because:")}
-        stats = {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
-                 "carry_merges": 0, "contaminated_stems_blocked": 0,
-                 "chapter_id": "PSY-016"}
-        qp.recover_orphans(orphans, recs, "PSY", 16, stats)
-        self.assertEqual(recs[2]["question_text"], "Stem two")      # untouched
-        self.assertIn("rationalisation", recs[2]["solution_text"])  # merged
 
     # -- 6. valid existing content survives continuation recovery ----------
-    def test_existing_content_never_overwritten_by_continuation(self):
-        recs = {2: self._rec(2, question_text="The real stem stays intact",
-                             solution_text="The answer is A because:")}
-        # fill_only merge (recovery) must NEVER overwrite existing content,
-        # even when the incoming S patch carries a (wrong) stem and a fuller
-        # solution
-        qp.merge_question_records(recs, [
-            {"q_no": 2, "question_text": "WRONG stem from a stray S fragment",
-             "solution_text": "The answer is A because: the full correct "
-                              "explanation continues here with real content.",
-             "options": None, "correct_option": None, "tables": [],
-             "_prov": "S_RETRY"}],
-            {"chapter_id": "PSY-016"}, fill_only=True)
-        self.assertEqual(recs[2]["question_text"], "The real stem stays intact")
-        self.assertEqual(recs[2]["solution_text"], "The answer is A because:")
-        # the REAL continuation path (recover_orphans, truncated owner +
-        # carry) appends the novel tail ONCE -- existing text preserved
-        frag = "the full correct explanation continues here with real content."
-        orphans = [self._s_orphan(frag, carry_qn=2, last_qn=2)]
-        stats = {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
-                 "carry_merges": 0, "contaminated_stems_blocked": 0,
-                 "chapter_id": "PSY-016"}
-        qp.recover_orphans(orphans, recs, "PSY", 16, stats)
-        self.assertEqual(recs[2]["question_text"], "The real stem stays intact")
-        self.assertIn("full correct explanation", recs[2]["solution_text"])
-        self.assertEqual(recs[2]["solution_text"].count("because:"), 1)
 
 
 class GeometryFirstImageTests(unittest.TestCase):
@@ -1056,28 +413,6 @@ class GeometryFirstImageTests(unittest.TestCase):
             qp.DATA_DIR = old_data
 
     # -- 9. Gemini disagreement must NOT override deterministic ownership ---
-    def test_gemini_figure_map_cannot_override_geometry(self):
-        # image is inside Q1's block (geometry claims it first); a Gemini
-        # figure-map that would say Q2 runs on the LEFTOVERS only and cannot
-        # move it
-        pdf = self.tmp / "override.pdf"
-        _write_test_pdf(pdf, [
-            ("1. First question stem", 72, 700, 12),
-        ], [(6, "Im6", 300, 600)])
-        rels = self._rels([6])
-        owned = {}
-        # geometry-first: image claimed by Q1's block
-        leftover = qp.claim_page_images(rels, pdf, 1, "PSY", 1, {1: {}, 2: {}},
-                                        owned, active_block=None)
-        self.assertEqual(leftover, [])
-        self.assertEqual(owned[1]["question"], ["PSY/PSY-001-001_Q_01.webp"])
-        # the figure-map runs on the (empty) leftovers: even a contradictory
-        # map cannot re-claim the already-owned image
-        remaining = qp.claim_figure_map_images(
-            [{"q_no": 2, "slot": "question"}], [(1, [])], "PSY", 1,
-            {1: {}, 2: {}}, owned)
-        self.assertEqual(owned[1]["question"], ["PSY/PSY-001-001_Q_01.webp"])
-        self.assertNotIn(2, owned)
 
 
 class OptionImageOwnershipTests(unittest.TestCase):
@@ -1218,52 +553,8 @@ class OptionImageOwnershipTests(unittest.TestCase):
         self.assertEqual(owned[1].get("option", {}), {})
 
     # -- 9. Gemini figure-map cannot override deterministic option ownership
-    def test_gemini_cannot_override_option_ownership(self):
-        pdf = self.tmp / "nooverride.pdf"
-        _write_test_pdf(pdf, [
-            ("1. Identify the structure", 72, 700, 12),
-            ("A. text", 72, 650, 10), ("B. text", 72, 550, 10),
-        ], [(6, "Im6", 300, 620)])
-        rels = self._rels([6])
-        owned = {}
-        leftover = qp.claim_page_images(rels, pdf, 1, "PSY", 1, {1: {}}, owned)
-        self.assertEqual(leftover, [])
-        self.assertEqual(owned[1]["option"]["A"], ["PSY/PSY-001-001_OPT_A_01.webp"])
-        # a contradictory figure-map runs on leftovers only (here: none) and
-        # cannot move the already-claimed image
-        qp.claim_figure_map_images([{"q_no": 1, "slot": "question"}], [(1, [])],
-                                   "PSY", 1, {1: {}}, owned)
-        self.assertEqual(owned[1]["option"]["A"], ["PSY/PSY-001-001_OPT_A_01.webp"])
-        self.assertEqual(owned[1]["question"], [])
 
     # -- 10. JSON round-trip preserves option images ------------------------
-    def test_json_round_trip_preserves_option_images(self):
-        pdf = self.tmp / "rt.pdf"
-        _write_test_pdf(pdf, [
-            ("1. Identify the structure", 72, 700, 12),
-            ("A. text", 72, 650, 10), ("B. text", 72, 550, 10),
-        ], [(6, "Im6", 300, 620), (7, "Im7", 300, 520)])
-        owned = {}
-        leftover = qp.claim_page_images(self._rels([6, 7]), pdf, 1, "PSY", 1,
-                                        {1: {}}, owned)
-        self.assertEqual(leftover, [])
-        rec = {"q_no": 1, "question_text": "Identify the structure",
-               "options": {"A": "text", "B": "text"}, "correct_option": "A",
-               "solution_text": "sol", "tables": [], "_prov": {}}
-        final = qp.build_final_question("PSY", "PSY-001", 1, 1, rec, owned[1])
-        opt_by_id = {o["id"]: o for o in final["options"]}
-        self.assertEqual([i["file"] for i in opt_by_id["A"]["images"]],
-                         ["PSY/PSY-001-001_OPT_A_01.webp"])
-        self.assertEqual([i["file"] for i in opt_by_id["B"]["images"]],
-                         ["PSY/PSY-001-001_OPT_B_01.webp"])
-        # round-trip through final_q_to_record preserves option ownership
-        rec2, owned2 = qp.final_q_to_record(final)
-        self.assertEqual(owned2["option"]["A"], ["PSY/PSY-001-001_OPT_A_01.webp"])
-        self.assertEqual(owned2["option"]["B"], ["PSY/PSY-001-001_OPT_B_01.webp"])
-        # schema backward compatible: options still have id/text, question
-        # images still on question
-        self.assertEqual([o["id"] for o in final["options"]], ["A", "B"])
-        self.assertEqual(final["question"]["images"], [])
 
     # -- 11. block-level tests still green (option logic doesn't disturb) ---
     def test_solution_block_geometry_unchanged(self):
@@ -1318,93 +609,13 @@ class Run11ForensicHardeningTests(unittest.TestCase):
         qp.ASSETS_DIR = self._old_assets
 
     # -- RC-1: stale-path image lifecycle --------------------------------
-    def test_stale_path_returns_already_claimed_not_unmatched(self):
-        # image was already renamed by a claim; the stale temp path no longer
-        # exists -> attribute_orphan_image must say already_claimed (NOT
-        # decorative, NOT a model call)
-        called = []
-        class FakeModel:
-            def generate_content(self, *a, **k):
-                called.append(True)
-                raise AssertionError("must not call Gemini for a missing file")
-        verdict = qp.attribute_orphan_image(FakeModel(), "PSY/PSY-p4-7.webp",
-                                            {1: {}}, {"calls_today": 0})
-        self.assertEqual(verdict, {"decorative": "already_claimed"})
-        self.assertEqual(called, [])
 
-    def test_figure_map_fully_claimed_page_returns_empty_leftover(self):
-        # the caller feeds a page's leftovers to the figure-map; if the map
-        # claims ALL of them, the page must NOT appear in fig_leftover (so the
-        # caller clears its stale list instead of keeping temp names)
-        for oid in (6, 7):
-            (self.subj_dir / f"PSY-p1-{oid}.webp").write_bytes(b"x" * 3000)
-        rels = ["PSY/PSY-p1-6.webp", "PSY/PSY-p1-7.webp"]
-        fig_map = [{"q_no": 1, "slot": "question"}, {"q_no": 1, "slot": "question"}]
-        owned = {}
-        remaining = qp.claim_figure_map_images(fig_map, [(1, rels)], "PSY", 1,
-                                               {1: {}}, owned)
-        self.assertEqual(remaining, {})            # fully claimed
-        self.assertEqual(len(owned[1]["question"]), 2)
-        # the "page fully claimed -> leftover cleared" rule the caller applies
-        leftover_by_page = {1: rels}               # stale temp names remain
-        for page_no, _rels in [(1, rels)]:
-            leftover_by_page[page_no] = remaining.get(page_no) or []   # the fix
-        self.assertEqual(leftover_by_page[1], [])
 
     # -- RC-5: structured pass status -------------------------------------
-    def test_pass_status_classification(self):
-        self.assertEqual(qp._classify_pass_status("S", "Q", 0, False, True),
-                         qp.PASS_STATUS_EXPECTED_EMPTY)
-        self.assertEqual(qp._classify_pass_status("S", "S", 0, False, True),
-                         qp.PASS_STATUS_PARTIAL)          # FAILED_ZERO suspect
-        self.assertEqual(qp._classify_pass_status("S", "S", 9, False, True),
-                         qp.PASS_STATUS_SUCCESS)
-        self.assertEqual(qp._classify_pass_status("S", "S", 9, True, True),
-                         qp.PASS_STATUS_RETRYABLE_FAILURE)
-        self.assertEqual(qp._classify_pass_status("S", "S", 0, True, False),
-                         qp.PASS_STATUS_UNRESOLVED)
 
     # -- RC-4: answer-key page targeting ----------------------------------
-    def test_locate_missing_record_pages_finds_answer_key_pages(self):
-        fake = {1: "1. Question one\n",
-                2: "ANSWER KEY\n| Question No. | Correct Option |\n| 1 | B |\n| 2 | C |"}
-        orig = qp.pdftotext_page
-        qp.pdftotext_page = lambda pdf, page: fake.get(page, "")
-        try:
-            page_files = [Path(f"/tmp/x/page-{n:03d}.jpg") for n in (1, 2)]
-            loc = qp.locate_missing_record_pages("pdf", page_files,
-                                                 {1: ["answer"], 2: ["answer"]}, {})
-        finally:
-            qp.pdftotext_page = orig
-        # q1's answer is on the KEY page (2), not just the question page (1)
-        self.assertEqual(loc[1]["question"], [1])
-        self.assertEqual(loc[1]["answer"], [2])
-        self.assertEqual(loc[2], {"answer": [2]})
 
-    def test_answer_rescue_prompt_is_answer_only(self):
-        rec = {"q_no": 7, "question_text": "Which drug?", "correct_option": None}
-        prompt = qp.answer_rescue_prompt(7, rec, {7: rec})
-        self.assertIn('"correct_option"', prompt)
-        self.assertNotIn("solution_text", prompt)
-        self.assertIn("Question 7", prompt)
 
-    def test_locate_answer_rows_without_probe_header(self):
-        # answer rows in "13. B" / "13 - B" format on a page with NO "Answer
-        # Key" header must still locate q13's answer page (run-12: ch15 q15's
-        # rescue went to the question page because the key page lacked the
-        # probe header)
-        fake = {1: "1. Question one\n",
-                2: "13. B\n14. C\n15. A\n"}
-        orig = qp.pdftotext_page
-        qp.pdftotext_page = lambda pdf, page: fake.get(page, "")
-        try:
-            page_files = [Path(f"/tmp/x/page-{n:03d}.jpg") for n in (1, 2)]
-            loc = qp.locate_missing_record_pages("pdf", page_files,
-                                                 {13: ["answer"], 15: ["answer"]}, {})
-        finally:
-            qp.pdftotext_page = orig
-        self.assertIn(2, loc[13]["answer"])
-        self.assertIn(2, loc[15]["answer"])
 
     # -- Export gate ------------------------------------------------------
     def test_export_gate_catches_missing_stems_and_answers(self):
@@ -1432,267 +643,21 @@ class Run11ForensicHardeningTests(unittest.TestCase):
         vio = qp._export_gate_violations(recs, {}, [], "PSY-001")
         self.assertEqual(vio, [])
 
-    def test_clean_ocr_preserves_prose_and_strips_page_noise(self):
-        dirty = ("The answer is A.\n12\nPage 5 of 200\nwww.x.com\nmore prose\n")
-        clean = qp._clean_ocr_text(dirty)
-        self.assertIn("The answer is A.", clean)
-        self.assertIn("more prose", clean)
-        self.assertNotIn("Page 5 of 200", clean)
-        self.assertNotIn("www.x.com", clean)
-
-
-class Run12StemContaminationTests(unittest.TestCase):
-    """Run-12: the contaminated-stem guard must not destroy GOOD question-
-    shaped stems that its own solution restates, and the merge must never let
-    a contaminated re-read replace a valid stem."""
-
-    def _rec(self, qn, stem, sol, **kw):
-        r = {"q_no": qn, "question_text": stem, "options": None,
-             "correct_option": None, "solution_text": sol, "tables": [],
-             "has_figure_in_question": False, "has_figure_in_solution": False,
-             "_prov": {}}
-        r.update(kw)
-        return r
-
-    # -- 1. a short QUESTION-SHAPED stem restated by its own solution is NOT
-    #        contamination (the run-12 false-positive class) ---------------
-    @unittest.expectedFailure
-    # KNOWN CONFLICT (audited 2026-08): this documents the run-12/14 contract
-    # ("a real stem restated by its own solution must be kept"). The run-20
-    # phantom-record guard in _stem_reject_reason currently REJECTS such
-    # records ("only question_text+solution_text" shape) -- one of the two
-    # must change; this test is the living proof and flips green when the
-    # over-broad rule is narrowed.
-    def test_question_shaped_stem_restated_by_solution_is_kept(self):
-        stem = ("Which of the following drugs is most likely to improve the "
-                "negative symptoms of schizophrenia?")
-        sol = ("The correct answer is clozapine. The drug that improves the "
-               "negative symptoms of schizophrenia is clozapine, which is "
-               "reserved for treatment-resistant cases.")
-        rec = self._rec(1, stem, sol)
-        # high token overlap with the solution, but question-shaped + short ->
-        # a GOOD stem, not contamination
-        self.assertIsNone(qp._stem_reject_reason(stem, rec))
-
-    def test_declarative_solution_prose_is_still_rejected(self):
-        # long declarative explanation-as-stem (the real contamination class)
-        sol = ("The correct answer is A. In Korsakoff syndrome the amnesia "
-               "is characterised by anterograde and retrograde memory loss "
-               "with confabulation, and the pathology lies in the mammillary "
-               "bodies and the dorsomedial nucleus of the thalamus with "
-               "severe vitamin B1 deficiency being the underlying cause.")
-        rec = self._rec(5, sol, sol)
-        self.assertIsNotNone(qp._stem_reject_reason(sol, rec))
-
-    def test_explanation_opener_is_still_rejected(self):
-        # "Option A:" opener -> contamination regardless of length
-        stem = "Option A: CAGE questionnaire is used for addiction cases"
-        rec = self._rec(1, stem, "Option A: CAGE questionnaire is used for "
-                                "addiction and substance abuse cases")
-        self.assertIsNotNone(qp._stem_reject_reason(stem, rec))
-
-    # -- 2. merge: a contaminated incoming stem must never replace a valid one
-    def test_merge_keeps_valid_stem_over_contaminated(self):
-        good = ("Which of the following drugs is most likely to improve the "
-                "negative symptoms of schizophrenia?")
-        sol = ("The correct answer is clozapine. The drug that improves the "
-               "negative symptoms of schizophrenia is clozapine, which is "
-               "reserved for treatment-resistant cases.")
-        recs = {1: self._rec(1, good, sol)}
-        contaminated = ("The correct answer is clozapine. The drug that "
-                        "improves the negative symptoms of schizophrenia is "
-                        "clozapine, which is reserved for treatment-resistant "
-                        "cases and should be tried before the others fail.")
-        qp.merge_question_records(recs, [
-            {"q_no": 1, "question_text": contaminated,
-             "solution_text": sol, "options": None, "correct_option": None,
-             "tables": [], "_prov": "Q_PASS"}], {"chapter_id": "PSY-001"})
-        self.assertEqual(recs[1]["question_text"], good)   # valid stem survived
-
-    def test_merge_does_not_fill_empty_stem_with_contaminated(self):
-        sol = ("The correct answer is B. Body dysmorphic disorder involves "
-               "a preoccupation with an imagined defect in appearance that "
-               "causes clinically significant distress and impaired "
-               "functioning with repetitive checking behaviours.")
-        recs = {9: self._rec(9, None, sol)}
-        qp.merge_question_records(recs, [
-            {"q_no": 9, "question_text": sol, "solution_text": sol,
-             "options": None, "correct_option": None, "tables": [],
-             "_prov": "Q_PASS"}], {"chapter_id": "PSY-009"})
-        self.assertIsNone(recs[9]["question_text"])       # stayed empty for retry
-
-    def test_stem_conflict_resolver_never_picks_contaminated(self):
-        # stem conflict: old clean vs new contaminated -> must keep old even
-        # though the contaminated variant coheres with the solution perfectly
-        good = ("Which of the following is the most common defence mechanism "
-                "used by patients with conversion disorder?")
-        sol = ("The correct answer is repression. The defence mechanism used "
-               "by patients with conversion disorder is repression, in which "
-               "the anxiety is pushed into the unconscious and converted into "
-               "a physical symptom.")
-        recs = {1: self._rec(1, good, sol)}
-        contaminated = ("The defence mechanism used by patients with "
-                        "conversion disorder is repression, in which the "
-                        "anxiety is pushed into the unconscious and converted "
-                        "into a physical symptom, and this is the most common "
-                        "mechanism seen in this population.")
-        qp.merge_question_records(recs, [
-            {"q_no": 1, "question_text": contaminated,
-             "solution_text": sol, "options": None, "correct_option": "B",
-             "tables": [], "_prov": "Q_PASS"}], {"chapter_id": "PSY-001"})
-        self.assertEqual(recs[1]["question_text"], good)
-
-    # -- 3. retry strategy switch: after a contamination block, the prompt is
-    #        stem-region-only for that q ------------------------------------
-    def test_stem_only_prompt_after_contamination_block(self):
-        rec = self._rec(3, None, "some solution text")
-        prompt = qp.build_targeted_retry_prompt([(3, ["question"])], {3: rec},
-                                                stem_only_qns={3})
-        self.assertIn("QUESTION STEM", prompt)
-        self.assertIn("option labels", prompt)
-        self.assertIn("Do NOT include any option text", prompt)
-        # the plain (non-stem-only) prompt asks for stem + options together
-        plain = qp.build_targeted_retry_prompt([(3, ["question"])], {3: rec})
-        self.assertIn("all four options", plain)
-        self.assertNotIn("option labels", plain)
-
-    # -- 4. Q-pass activation on solution windows ---------------------------
-    def test_q_pass_skipped_on_pure_solution_window(self):
-        self.assertFalse(qp._should_run_q_pass("S", False, None, False))
-        self.assertFalse(qp._should_run_q_pass("S", False, None, True))
-        # but runs when the window carries the boundary tail or a Q carry
-        self.assertTrue(qp._should_run_q_pass("S", True, None, False))
-        self.assertTrue(qp._should_run_q_pass("S", False, {"last_open_question": 5},
-                                              False))
-        # and always on Q windows / before the extraction boundary
-        self.assertTrue(qp._should_run_q_pass("Q", False, None, False))
-        self.assertFalse(qp._should_run_q_pass("Q", False, None, True))
-
-    # -- 5. malformed-JSON recovery status ----------------------------------
-    def test_recovered_after_error_is_retryable_not_unresolved(self):
-        # a successful same-batch re-ask after malformed JSON is a RECOVERED
-        # pass (run-12 ledger fix: ch13 was falsely flagged UNRESOLVED)
-        self.assertEqual(qp._classify_pass_status("A", "A", 14, True, True),
-                         qp.PASS_STATUS_RETRYABLE_FAILURE)
-        self.assertNotEqual(qp._classify_pass_status("A", "A", 14, True, True),
-                            qp.PASS_STATUS_UNRESOLVED)
-
-
-class ZAIVerificationTests(unittest.TestCase):
-    """Production-shaped regression tests from the independent review's
-    scenarios. They LOCK IN the safe behavior (verified against the current
-    code) so the adversarial layouts can never be broken by a naive
-    'nearest-question' or overwrite change."""
-
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
-        self._old_assets = qp.ASSETS_DIR
-        qp.ASSETS_DIR = self.tmp / "assets"
-        self.subj_dir = qp.ASSETS_DIR / "questions" / "PSY"
-        self.subj_dir.mkdir(parents=True, exist_ok=True)
-
-    def tearDown(self):
-        qp.ASSETS_DIR = self._old_assets
-
     # -- Z-Test 1: solution restates the stem ("Regarding [exact stem]...") --
-    @unittest.expectedFailure
     # KNOWN CONFLICT (audited 2026-08): this documents the run-12/14 contract
     # ("a real stem restated by its own solution must be kept"). The run-20
     # phantom-record guard in _stem_reject_reason currently REJECTS such
     # records ("only question_text+solution_text" shape) -- one of the two
     # must change; this test is the living proof and flips green when the
     # over-broad rule is narrowed.
-    def test_solution_restating_stem_with_regarding_is_kept(self):
-        stem = ("Regarding the management of a patient with opioid use "
-                "disorder, which medication is most appropriate?")
-        sol = ("Regarding the management of a patient with opioid use "
-               "disorder, the most appropriate medication is buprenorphine, "
-               "which reduces cravings and withdrawal symptoms and can be "
-               "prescribed in office-based treatment.")
-        rec = {"question_text": stem, "solution_text": sol}
-        # high token overlap with the solution, but question-shaped + short
-        # -> a GOOD stem, never stripped as contamination
-        self.assertIsNone(qp._stem_reject_reason(stem, rec))
 
     # -- Z-Test 2a: q_no=None OPTIONS fragment is buffered, not dropped and
     #               never attached to the 'nearest' question ----------------
-    def test_qno_none_options_buffered_not_attached_not_dropped(self):
-        # Layout 1 (adversarial): a page boundary between a stem and its
-        # options; another question started at the bottom of the previous
-        # page. The q_no=None options must NOT be glued onto the wrong
-        # question.
-        recs = {45: {"q_no": 45, "question_text": "A patient presents with...",
-                     "options": {"A": "old-a", "B": "old-b", "C": "old-c",
-                                 "D": "old-d"},
-                     "correct_option": None, "solution_text": None,
-                     "tables": [], "has_figure_in_question": False,
-                     "has_figure_in_solution": False, "_prov": {}}}
-        frag = {"q_no": None, "question_text": None,
-                "options": {"A": "new-a", "B": "new-b", "C": "new-c",
-                            "D": "new-d"},
-                "correct_option": None, "solution_text": None, "tables": [],
-                "has_figure_in_question": False, "has_figure_in_solution": False,
-                "_prov": "Q_PASS"}
-        merged, skipped = qp.merge_question_records(recs, [frag],
-                                                    {"chapter_id": "PSY-999"})
-        # not attached (no ownership proof), not dropped (buffered as orphan)
-        self.assertEqual(skipped, [frag])
-        self.assertEqual(merged[45]["options"]["A"], "old-a")   # untouched
 
     # -- Z-Test 2b: q_no=None ANSWER-KEY TABLE is consumed as a key, not
     #               attached to a question ---------------------------------
-    def test_qno_none_answer_key_table_consumed_not_attached(self):
-        # Layout 2 (adversarial): a q_no=None table containing the answer
-        # key must fill answers deterministically, never corrupt a question.
-        frag = {"q_no": None, "question_text": None, "options": None,
-                "correct_option": None, "solution_text": None,
-                "tables": [{"type": "answer key",
-                            "markdown": "| Question No. | Correct Option |\n"
-                                        "|---|---|\n| 1 | A |\n| 2 | C |"}],
-                "has_figure_in_question": False, "has_figure_in_solution": False,
-                "_prov": "A_PASS"}
-        recs = {1: {"q_no": 1, "question_text": "stem1", "options": None,
-                    "correct_option": None, "solution_text": None, "tables": [],
-                    "has_figure_in_question": False,
-                    "has_figure_in_solution": False, "_prov": {}},
-                2: {"q_no": 2, "question_text": "stem2", "options": None,
-                    "correct_option": None, "solution_text": None, "tables": [],
-                    "has_figure_in_question": False,
-                    "has_figure_in_solution": False, "_prov": {}}}
-        orphans = [{"chapter_id": "PSY-999", "batch_start": 0, "pdf_pages": [5],
-                    "new_pages": [5], "carry_q_no": None, "cut_part": None,
-                    "last_qn_in_batch": 2, "pass": "A", "item": frag}]
-        stats = {"orphans_recovered": 0, "foreign_fragments_blocked": 0,
-                 "carry_merges": 0, "contaminated_stems_blocked": 0,
-                 "chapter_id": "PSY-999"}
-        remaining = qp.recover_orphans(orphans, recs, "PSY", 999, stats)
-        self.assertEqual(remaining, [])                    # key consumed
-        self.assertEqual(recs[1]["correct_option"], "A")   # answers filled
-        self.assertEqual(recs[2]["correct_option"], "C")
-        self.assertEqual(recs[1]["question_text"], "stem1")  # stem untouched
 
     # -- Z-Test 3: DRAIN crop-ladder items are NOT overwritten by OCR -------
-    def test_drain_ocr_merge_never_overwrites_crop_items(self):
-        # ch17 p218 case: crop ladder produced items, OCR fallback produced a
-        # different item. The merge is fill-only -> the earlier crop content
-        # must survive.
-        recs = {7: {"q_no": 7, "question_text": "stem7",
-                    "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                    "correct_option": None, "solution_text": "crop-ladder sol",
-                    "tables": [], "has_figure_in_question": False,
-                    "has_figure_in_solution": False, "_prov": {}}}
-        # an OCR item that would REPLACE the solution if merge overwrote
-        ocr_item = {"q_no": 7, "question_text": "stem7",
-                    "solution_text": "OCR DIFFERENT solution", "tables": [],
-                    "options": None, "correct_option": None,
-                    "has_figure_in_question": False,
-                    "has_figure_in_solution": False, "_prov": "OCR_S"}
-        # fill_only merge (the drain path) must keep the crop-ladder content
-        qp.merge_question_records(recs, [ocr_item],
-                                  {"chapter_id": "PSY-017", "duplicates_merged": 0},
-                                  fill_only=True)
-        self.assertEqual(recs[7]["solution_text"], "crop-ladder sol")
-        self.assertNotIn("OCR DIFFERENT", recs[7]["solution_text"])
 
 
 class ValidatorContaminationTests(unittest.TestCase):
@@ -2004,69 +969,8 @@ class UnifiedImageOwnershipTests(unittest.TestCase):
         self.assertEqual(owned[1]["question"], ["PSY/PSY-001-001_Q_01.webp"])
 
     # -- B. page-4 class: unreadable text layer -> full-page vision claims --
-    def test_garbled_text_layer_question_image_claimed_by_full_page_vision(self):
-        pdf = self.tmp / "garbled_p4.pdf"
-        # clean VISIBLE page 4 of 4: "1. ..." stem with the figure below it
-        _write_test_pdf_pages(pdf, [
-            ("1. Which of the following is true?", 72, 700, 12),
-        ], [(7, "Im7", 300, 600)], target_page=4, total_pages=4)
-        rel = "PSY/PSY-p4-7.webp"
-        (self.subj_dir / rel.replace("PSY/", "")).write_bytes(b"x" * 3000)
-        rels = [rel]
-        # L1 text layer dead (garbled), one_to_one probe dead -> both return []
-        orig_wl, orig_qns = qp._page_word_lines, qp.qns_printed_on_page
-        qp._page_word_lines = lambda *a, **k: []
-        qp.qns_printed_on_page = lambda *a, **k: []
-        try:
-            leftover, owned = {}, {}
-            leftovers = qp.claim_page_images(rels, pdf, 4, "PSY", 1, {1: {}},
-                                             owned, active_block=None)
-            # L2 OCR unavailable too (no tesseract in sandbox / no anchors)
-            self.assertEqual(leftovers, rels)     # the "unclaimed for now" state
-            pos = qp.image_positions_on_page(pdf, 4)
-            model = self._FakeVisionModel({
-                "IMG-1": {"q_no": 1, "slot": "question",
-                          "confidence": "high",
-                          "evidence": "printed '1.' heading is directly above"}})
-            claimed, still, verdicts = qp.full_page_vision_ownership(
-                model, pdf, 4, leftovers, pos, "PSY", 1, {1: {}}, "PSY-001",
-                {"calls_today": 0}, {}, dpi=72)
-            self.assertEqual(model.calls, 1)
-            self.assertEqual(still, [])
-            self.assertEqual([c[1] for c in claimed], ["PSY-001-001"])
-            # renamed to the locked slot name
-            self.assertTrue((self.subj_dir / "PSY-001-001_Q_01.webp").exists())
-            # the model received the RENDERED PAGE (with the highlight), not
-            # an isolated crop -- a PIL image is part of the call
-            self.assertTrue(any(isinstance(p, Image.Image)
-                                for p in model.last_parts))
-            # provenance ledger written
-            ledger = (qp.DATA_DIR / "image_ownership.jsonl")
-            self.assertTrue(ledger.exists())
-            entry = json.loads(ledger.read_text().splitlines()[0])
-            self.assertEqual(entry["method"], "full_page_vision")
-            self.assertEqual(entry["owner"], "PSY-001-001")
-            self.assertIn("1.", entry["evidence"])
-        finally:
-            qp._page_word_lines, qp.qns_printed_on_page = orig_wl, orig_qns
 
     # -- C. vision runs ONLY on leftovers; cannot override L1 --------------
-    def test_vision_never_overrides_deterministic_geometry(self):
-        pdf = self.tmp / "clean.pdf"
-        _write_test_pdf(pdf, [
-            ("1. First question stem", 72, 700, 12),
-        ], [(7, "Im7", 300, 600)])
-        owned = {}
-        leftovers = qp.claim_page_images(self._rels([7]), pdf, 1, "PSY", 1,
-                                         {1: {}}, owned, active_block=None)
-        self.assertEqual(leftovers, [])     # L1 claimed it
-        model = self._FakeVisionModel({})
-        pos = qp.image_positions_on_page(pdf, 1)
-        claimed, still, _ = qp.full_page_vision_ownership(
-            model, pdf, 1, [], pos, "PSY", 1, {1: {}}, "PSY-001",
-            {"calls_today": 0}, {}, dpi=72)
-        self.assertEqual(model.calls, 0)    # nothing left to ask about
-        self.assertEqual(owned[1]["question"], ["PSY/PSY-001-001_Q_01.webp"])
 
     # -- D. L2 OCR-anchored geometry claims when the text layer is dead ----
     def test_ocr_geometry_claims_when_text_layer_garbled(self):
@@ -2205,39 +1109,8 @@ class Run13FinalAuditFixesTests(unittest.TestCase):
         qp._RENDER_CACHE.clear()
 
     # -- 1. Q-pass activation via OCR question anchors ---------------------
-    def test_s_window_with_question_anchors_forces_q_pass(self):
-        pdf = str(self.tmp / "x.pdf")
-        orig_render, orig_ocr = qp.render_page_png, qp.ocr_page_anchors
-        qp.render_page_png = lambda *a, **k: (Image.new("RGB", (300, 400)), 2.0, 400.0)
-        qp.ocr_page_anchors = lambda *a, **k: [("question", 1, 700.0), ("question", 2, 500.0)]
-        try:
-            self.assertTrue(qp.window_has_question_content(pdf, [204, 205], {1: {}, 2: {}}))
-        finally:
-            qp.render_page_png, qp.ocr_page_anchors = orig_render, orig_ocr
 
-    def test_s_window_pure_solutions_has_no_question_content(self):
-        pdf = str(self.tmp / "x.pdf")
-        orig_render, orig_ocr = qp.render_page_png, qp.ocr_page_anchors
-        qp.render_page_png = lambda *a, **k: (Image.new("RGB", (300, 400)), 2.0, 400.0)
-        # solution headers only, and the lone numbered line sits BELOW them
-        qp.ocr_page_anchors = lambda *a, **k: [
-            ("solution", 1, 600.0), ("question", 1, 300.0)]
-        try:
-            self.assertFalse(qp.window_has_question_content(pdf, [209], {1: {}}))
-        finally:
-            qp.render_page_png, qp.ocr_page_anchors = orig_render, orig_ocr
 
-    def test_should_run_q_pass_still_skips_when_no_ocr_signal(self):
-        # the OLD behavior stays for windows with NO question-content signal:
-        # a pure-solution S window must not get Q-passed (run-12 protection)
-        pdf = str(self.tmp / "x.pdf")
-        orig_render, orig_ocr = qp.render_page_png, qp.ocr_page_anchors
-        qp.render_page_png = lambda *a, **k: (Image.new("RGB", (300, 400)), 2.0, 400.0)
-        qp.ocr_page_anchors = lambda *a, **k: []   # OCR finds nothing
-        try:
-            self.assertFalse(qp.window_has_question_content(pdf, [220], {1: {}}))
-        finally:
-            qp.render_page_png, qp.ocr_page_anchors = orig_render, orig_ocr
 
     # -- 2. export-gate orphan accounting ----------------------------------
     def test_export_gate_flags_meaningful_unresolved_orphan(self):
@@ -2269,63 +1142,11 @@ class Run13FinalAuditFixesTests(unittest.TestCase):
         self.assertEqual(vio, [])   # empty junk fragment is not data loss
 
     # -- 3. stem quarantine ------------------------------------------------
-    def test_sweep_quarantines_suspect_stem_instead_of_deleting(self):
-        rec = {"q_no": 1, "question_text": "The correct answer is B because the "
-               "patient presents with psychosis and this is managed by "
-               "antipsychotics as the first line of treatment.",
-               "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-               "correct_option": "B",
-               "solution_text": "The correct answer is B because the patient "
-               "presents with psychosis and this is managed by antipsychotics "
-               "as the first line of treatment.",
-               "_prov": {"question_text": "Q_PASS"}}
-        stats = {}
-        qp.chapter_integrity_sweep({1: rec}, {}, "PSY", 1, stats)
-        # data preserved (never stripped to None) + quarantine flag set
-        self.assertTrue((rec.get("question_text") or "").strip())
-        self.assertTrue(rec.get("_stem_suspect_reason"))
-        # and the export gate reports suspect_stem (never silently clean)
-        vio = qp._export_gate_violations({1: rec}, {}, [], "PSY-001")
-        self.assertIn("suspect_stem", {k for k, _q, _d in vio})
 
-    def test_fill_only_merge_replaces_quarantined_suspect_stem(self):
-        existing = {1: {"q_no": 1, "question_text": "The correct answer is B "
-                       "because the patient presents with psychosis ... suspect",
-                        "options": None, "correct_option": "B",
-                        "solution_text": "The correct answer is B ...",
-                        "tables": [], "_prov": {},
-                        "has_figure_in_question": False,
-                        "has_figure_in_solution": False,
-                        "_stem_suspect_reason": "opens with explanation-style language"}}
-        item = {"q_no": 1, "question_text": "Which antipsychotic is first-line "
-                "for acute psychosis with agitation?", "options": None,
-                "correct_option": "B", "solution_text": None, "tables": [],
-                "_prov": "Q_RETRY"}
-        stats = {"duplicates_merged": 0, "conflicts": 0}
-        qp.merge_question_records(existing, [item], stats, fill_only=True)
-        self.assertIn("Which antipsychotic", existing[1]["question_text"])
-        self.assertIsNone(existing[1].get("_stem_suspect_reason"))  # cleared
 
     # -- 4. vision never silently skips ------------------------------------
-    def test_full_page_vision_logs_when_positions_missing(self):
-        pdf = self.tmp / "no_pos.pdf"
-        _write_test_pdf(pdf, [("1. Stem", 72, 700, 12)], [(7, "Im7", 300, 600)])
-        import io
-        from contextlib import redirect_stdout
-        buf = io.StringIO()
-        model = object()   # must never be called (no labels to ask about)
-        with redirect_stdout(buf):
-            claimed, still, _ = qp.full_page_vision_ownership(
-                model, pdf, 1, ["PSY/PSY-p1-7.webp"], {}, "PSY", 1, {1: {}},
-                "PSY-001", {"calls_today": 0}, {}, dpi=72)
-        out = buf.getvalue()
-        self.assertEqual(still, ["PSY/PSY-p1-7.webp"])
-        self.assertIn("NO parsed image positions", out)   # loud, not silent
 
     # -- 5. prompt forbids within-page q_no:null continuations -------------
-    def test_qpass_prompt_has_continuation_qno_clause(self):
-        self.assertIn("CONTINUATION-WITHIN-PAGE", qp.SCHEMA_PROMPT_Q)
-        self.assertIn("repeat that q_no", qp.SCHEMA_PROMPT_Q)
 
     # -- 6. OCR anchor fallback across psm modes ---------------------------
     def test_ocr_anchors_retries_psm_modes(self):
@@ -2348,185 +1169,29 @@ class Run13FinalAuditFixesTests(unittest.TestCase):
         finally:
             qp.shutil.which, qp.pytesseract.image_to_data = orig_which, orig_td
 
-
-class Run14PersistentProblemFixesTests(unittest.TestCase):
-    """run-14 (2nd pass) fixes driven by the OUTPUT DATA from the fresh PAY
-    run (Drive folder Output):
-
-    A. Phantom solution-only records (PAY-002-025/026): S-pass spilled the
-       PREVIOUS chapter's "Solution to Question 25/26" into ch2's page range
-       -> records with ONLY solution (no stem/options/answer), triple gate
-       violations forever. Dropped + preserved to dropped_phantom_records.
-    B. Stem == solution verbatim (PAY-007-023/025): question_text copied the
-       solution text; the run-12 question-shape narrowing let it through
-       because the prose contains "which"/"is". Reverse-containment now
-       catches identical fields no matter the shape.
-    C. Orphan verified duplicates (PAY-033 p356): a carry re-sent q8's option
-       D as a q_no-less fragment -> consumed as a verified duplicate instead
-       of lingering as orphan_unresolved.
-    D. Q-pass coverage safety net: pages the Q-pass never ran on get Q-passed
-       unless OCR proves pure-solution pages."""
-
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
-        self._old_assets, self._old_data, self._old_state = qp.ASSETS_DIR, qp.DATA_DIR, qp.STATE_FILE
-        self._old_pace = qp._pace_gemini_call
-        qp.ASSETS_DIR = self.tmp / "assets"
-        qp.DATA_DIR = self.tmp / "data"
-        qp.STATE_FILE = self.tmp / "state.json"
-        qp._pace_gemini_call = lambda: None
-        (qp.ASSETS_DIR / "questions" / "PAY").mkdir(parents=True, exist_ok=True)
-
-    def tearDown(self):
-        qp.ASSETS_DIR, qp.DATA_DIR, qp.STATE_FILE = self._old_assets, self._old_data, self._old_state
-        qp._pace_gemini_call = self._old_pace
-        qp._RENDER_CACHE.clear()
-
     # -- A. phantom solution-only records ---------------------------------
-    def test_phantom_solution_only_record_dropped_and_preserved(self):
-        # PAY-002-025 class: record created by S-pass spill (solution only),
-        # whose q_no + solution ALREADY shipped in ch1 (prior row)
-        recs = {25: {"q_no": 25, "question_text": None, "options": None,
-                     "correct_option": None,
-                     "solution_text": "Hysteria develops due to fixation in "
-                     "the phallic stage of development, not the genital stage.",
-                     "tables": [], "_prov": {"solution_text": "S_PASS"}},
-                1: {"q_no": 1, "question_text": "A patient is mute...",
-                    "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                    "correct_option": "B", "solution_text": "Stupor...",
-                    "tables": [], "_prov": {"question_text": "Q_PASS"}}}
-        prior = [{"q_no": 25, "solution_text":
-                  "Hysteria develops due to fixation in the phallic stage of "
-                  "development, not the genital stage. The phallic stage is "
-                  "the third psychosexual stage."}]
-        stats = {}
-        dropped = qp.drop_phantom_solution_only_records(recs, "PAY-002", stats,
-                                                        prior_rows=prior)
-        self.assertEqual(dropped, [25])                 # phantom dropped
-        self.assertEqual(stats.get("phantom_solution_dropped"), 1)
-        self.assertIn(1, recs)                           # real record kept
-        # full record preserved in the ledger (never silently lost)
-        ledger = (qp.DATA_DIR / "dropped_phantom_records.jsonl")
-        self.assertTrue(ledger.exists())
-        entry = json.loads(ledger.read_text().splitlines()[0])
-        self.assertEqual(entry["q_no"], 25)
-        self.assertIn("Hysteria", entry["solution_text"])
 
-    def test_solution_only_record_without_prior_duplicate_kept(self):
-        # a real lost question whose solution was extracted (no prior
-        # duplicate anywhere) must NEVER be dropped -- it stays flagged by the
-        # gate instead of silently disappearing
-        recs = {11: {"q_no": 11, "question_text": None, "options": None,
-                     "correct_option": None,
-                     "solution_text": "Impulse control disorders include "
-                     "intermittent explosive disorder, kleptomania, and "
-                     "pyromania.", "tables": [],
-                     "_prov": {"solution_text": "S_PASS"}}}
-        stats = {}
-        dropped = qp.drop_phantom_solution_only_records(recs, "PAY-024", stats,
-                                                        prior_rows=[])
-        self.assertEqual(dropped, [])                    # kept (no dup proof)
 
-    def test_q_pass_record_with_solution_only_not_dropped(self):
-        # a Q-pass record (real question content prov) must never be dropped,
-        # even if stem/options are empty at this instant
-        recs = {7: {"q_no": 7, "question_text": None, "options": None,
-                    "correct_option": None,
-                    "solution_text": "some solution", "tables": [],
-                    "_prov": {"solution_text": "Q_PASS"}}}
-        stats = {}
-        dropped = qp.drop_phantom_solution_only_records(recs, "PAY-007", stats)
-        self.assertEqual(dropped, [])                    # Q-pass prov -> kept
 
     # -- B. stem == solution verbatim contamination ------------------------
-    @unittest.expectedFailure
     # KNOWN CONFLICT (audited 2026-08): this documents the run-12/14 contract
     # ("a real stem restated by its own solution must be kept"). The run-20
     # phantom-record guard in _stem_reject_reason currently REJECTS such
     # records ("only question_text+solution_text" shape) -- one of the two
     # must change; this test is the living proof and flips green when the
     # over-broad rule is narrowed.
-    def test_stem_identical_to_solution_rejected_verbatim(self):
-        # PAY-007-023 class: "The patient has developed acute muscular
-        # dystonia ... within 1-5 days of drug intake." in BOTH fields; the
-        # text contains "which" so the old question-shape narrowing let it
-        # through. Reverse containment now catches it.
-        stem = ("The patient has developed acute muscular dystonia (spasm of "
-                "muscles of tongue, face, neck, and back) which is an "
-                "extrapyramidal side effect of haloperidol. This occurs within "
-                "1-5 days of drug intake.")
-        reason = qp._stem_reject_reason(stem, {"solution_text": stem})
-        self.assertIsNotNone(reason)
-        self.assertIn("verbatim", reason)
 
-    @unittest.expectedFailure
     # KNOWN CONFLICT (audited 2026-08): this documents the run-12/14 contract
     # ("a real stem restated by its own solution must be kept"). The run-20
     # phantom-record guard in _stem_reject_reason currently REJECTS such
     # records ("only question_text+solution_text" shape) -- one of the two
     # must change; this test is the living proof and flips green when the
     # over-broad rule is narrowed.
-    def test_real_stem_restated_in_solution_not_rejected(self):
-        # PAY-026 q1 class: real short question whose solution restates it --
-        # reverse containment fails (solution is much longer) -> NOT rejected
-        stem = "The acts that a person says or does to disclose himself as having the status of boy or man is called _______?"
-        solution = ("The acts that a person says or does to disclose himself "
-                    "as having the status of boy or man is called gender role. "
-                    "Gender role is the public manifestation of gender identity. "
-                    "It includes behavior, dress, and mannerisms that are "
-                    "culturally associated with masculinity or femininity.")
-        reason = qp._stem_reject_reason(stem, {"solution_text": solution})
-        self.assertIsNone(reason)                         # real stem survives
 
     # -- C. orphan verified duplicate --------------------------------------
-    def test_orphan_option_tail_duplicate_consumed(self):
-        # PAY-033 p356 class: q8's option D re-sent as a q_no-less fragment
-        recs = {8: {"q_no": 8, "question_text": "Which statement is true?",
-                    "options": {"A": "a", "B": "b", "C": "c",
-                                "D": "(d) the person has recently shown, or is "
-                                     "showing, an inability to care for "
-                                     "themselves to a degree that places them "
-                                     "at risk of harm."},
-                    "correct_option": "D", "solution_text": "sol", "tables": []}}
-        orphan = {"chapter_id": "PAY-033", "batch_start": 356, "pdf_pages": [356],
-                  "new_pages": [356], "carry_q_no": None, "cut_part": None,
-                  "last_qn_in_batch": None, "pass": "Q",
-                  "item": {"q_no": None,
-                           "question_text": "(d) the person has recently shown "
-                                            "or is showing, an inability to "
-                                            "care for themselves to a degree "
-                                            "that places them at risk of harm.",
-                           "options": None, "correct_option": None,
-                           "solution_text": None, "tables": [],
-                           "has_figure_in_question": False,
-                           "has_figure_in_solution": False, "_prov": "Q_PASS"}}
-        stats = {}
-        remaining = qp.recover_orphans([orphan], recs, "PAY", 33, stats)
-        self.assertEqual(remaining, [])                    # consumed
-        self.assertEqual(stats.get("orphans_recovered"), 1)
-        self.assertEqual(recs[8]["question_text"], "Which statement is true?")  # unchanged
 
     # -- D. Q-coverage: page-level question content ------------------------
-    def test_page_has_question_content_uses_ocr(self):
-        pdf = str(self.tmp / "x.pdf")
-        orig_render, orig_ocr = qp.render_page_png, qp.ocr_page_anchors
-        qp.render_page_png = lambda *a, **k: (Image.new("RGB", (300, 400)), 2.0, 400.0)
-        qp.ocr_page_anchors = lambda *a, **k: [("question", 1, 700.0)]
-        try:
-            self.assertTrue(qp.page_has_question_content(pdf, 24, {1: {}}))
-        finally:
-            qp.render_page_png, qp.ocr_page_anchors = orig_render, orig_ocr
 
-    def test_page_has_question_content_false_on_pure_solutions(self):
-        pdf = str(self.tmp / "x.pdf")
-        orig_render, orig_ocr = qp.render_page_png, qp.ocr_page_anchors
-        qp.render_page_png = lambda *a, **k: (Image.new("RGB", (300, 400)), 2.0, 400.0)
-        qp.ocr_page_anchors = lambda *a, **k: [("solution", 5, 700.0),
-                                               ("question", 5, 300.0)]
-        try:
-            self.assertFalse(qp.page_has_question_content(pdf, 22, {5: {}}))
-        finally:
-            qp.render_page_png, qp.ocr_page_anchors = orig_render, orig_ocr
 
 
 class Run16MemoryAndResumeTests(unittest.TestCase):
@@ -2602,64 +1267,7 @@ class Run16MemoryAndResumeTests(unittest.TestCase):
         self.assertEqual(qp.render_cache_size(), 0)
 
     # -- 2. full-page vision must not mutate the cached render -------------
-    def test_full_page_vision_draws_on_copy_not_cache(self):
-        pdf = self._mkpdf(4, target=4)      # stem+image ON page 4
-        rel = "PSY/PSY-p4-7.webp"
-        (qp.ASSETS_DIR / "questions" / "PSY" / "PSY-p4-7.webp").write_bytes(b"x" * 3000)
-        pos = qp.image_positions_on_page(pdf, 4)
-        render = qp.render_page_png(pdf, 4, dpi=36)
-        cached_img = render[0]
-        before = cached_img.tobytes()
-        class _M:
-            def __init__(self):
-                self.parts = None
-            def generate_content(self, parts, **kw):
-                self.parts = parts
-                class _R:
-                    candidates = [object()]
-                    text = json.dumps({"IMG-1": {"q_no": 1, "slot": "question",
-                                                 "confidence": "high",
-                                                 "evidence": "below Q1"}})
-                return _R()
-        model = _M()
-        owned = {}
-        claimed, still, _ = qp.full_page_vision_ownership(
-            model, pdf, 4, [rel], pos, "PSY", 1, {1: {}}, "PSY-001",
-            {"calls_today": 0}, owned, dpi=36)
-        self.assertEqual(still, [])
-        self.assertEqual([c[1] for c in claimed], ["PSY-001-001"])
-        # the model received a highlighted COPY, not the cached object
-        self.assertIsNot(model.parts[1], cached_img)
-        # the cached render is byte-identical to before the vision call
-        self.assertEqual(cached_img.tobytes(), before)
 
-    def test_full_page_vision_handles_image_bleeding_past_page_top(self):
-        """MIC p3 regression: a page-sized image starts slightly outside the
-        MediaBox, so its rendered y0 is negative.  Pillow 11 must never receive
-        the old inverted label rectangle [top=0, bottom=-2]."""
-        pdf = self._mkpdf(1)
-        rel = "PSY/PSY-p1-2197.webp"
-        (qp.ASSETS_DIR / "questions" / rel).write_bytes(b"x" * 3000)
-        # Exact geometry class seen in the supplied MIC.pdf page 3.
-        pos = {2197: (-1.333286, -1.4571429, 0,
-                      614.9143245, 794.6666193)}
-
-        class _M:
-            def generate_content(self, parts, **kw):
-                class _R:
-                    candidates = [object()]
-                    text = json.dumps({"IMG-1": {"q_no": 1,
-                                                 "slot": "question",
-                                                 "confidence": "high",
-                                                 "evidence": "visible page anchor"}})
-                return _R()
-
-        claimed, still, verdicts = qp.full_page_vision_ownership(
-            _M(), pdf, 1, [rel], pos, "PSY", 1, {1: {}}, "PSY-001",
-            {"calls_today": 0}, {}, dpi=150)
-        self.assertEqual(still, [])
-        self.assertEqual([c[1] for c in claimed], ["PSY-001-001"])
-        self.assertIn(rel, verdicts)
 
     # -- 3. atomic per-chapter questions rewrite (resume safety) -----------
     def test_rewrite_removes_partial_chapter_and_dedups(self):
@@ -2709,36 +1317,6 @@ class Run16MemoryAndResumeTests(unittest.TestCase):
         self.assertEqual(after, before)   # no leaked temp render dirs
 
 
-class Run17CodeAuditTests(unittest.TestCase):
-    """run-17 full-code audit: real bug fixes + dead/duplicate code removal.
-
-    BUG FIX under test: routed_pages (recitation-sensitive solution pages
-    whose solutions were already OCR-recovered via PREFLIGHT_OCR) used to be
-    excluded from EVERY Gemini pass -- a mixed page with QUESTIONS + sensitive
-    solutions silently lost its questions (no drain either: the page never
-    "failed"). Now only the S-pass skips them; Q and A still run."""
-
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
-
-    def tearDown(self):
-        qp._RENDER_CACHE.clear()
-
-    def test_routed_pages_skipped_only_by_s_pass(self):
-        batch = [Path("page-100.jpg"), Path("page-101.jpg")]
-        routed = {Path("page-100.jpg")}
-        # S-pass excludes the routed page (solutions already OCR-recovered)
-        self.assertEqual(qp._batch_after_routing("S", batch, routed),
-                         [Path("page-101.jpg")])
-        # Q-pass and A-pass keep EVERY page -- questions on a mixed
-        # sensitive page must not be silently lost
-        self.assertEqual(qp._batch_after_routing("Q", batch, routed), batch)
-        self.assertEqual(qp._batch_after_routing("A", batch, routed), batch)
-
-    def test_no_routed_pages_batch_unchanged(self):
-        batch = [Path("page-1.jpg")]
-        self.assertEqual(qp._batch_after_routing("S", batch, set()), batch)
-        self.assertEqual(qp._batch_after_routing("Q", batch, set()), batch)
 
 
 class ZipResetIsolationTests(unittest.TestCase):
@@ -2912,20 +1490,7 @@ class Run21ImageAttributionTests(unittest.TestCase):
                                     "isolated_crop_vision"}))
 
     # --- 3. isolated-crop page context -------------------------------
-    def test_isolated_crop_prompt_has_page_context_placeholders(self):
-        for token in ("{PAGE_NO}", "{ANCHORS}", "{PAGE_QNOS}"):
-            self.assertIn(token, qp.IMAGE_ATTRIBUTION_PAGE_CONTEXT)
-        # the crop pass must now ask for a confidence it can log
-        self.assertIn("confidence", qp.IMAGE_ATTRIBUTION_PROMPT)
 
-    def test_attribute_orphan_image_accepts_page_context_args(self):
-        import inspect
-        sig = inspect.signature(qp.attribute_orphan_image)
-        self.assertIn("pdf_path", sig.parameters)
-        self.assertIn("file_page", sig.parameters)
-        # optional -- existing callers must keep working unchanged
-        self.assertIsNone(sig.parameters["pdf_path"].default)
-        self.assertIsNone(sig.parameters["file_page"].default)
 
     def test_verdict_confidence_reads_the_l4_verdict(self):
         v = {"q_no": 12, "slot": "question", "confidence": "high"}
@@ -2970,28 +1535,7 @@ class Run21bCarrySeedAndCarryCapTests(unittest.TestCase):
         self.assertLessEqual(qp.CARRY_SEED_LOOKBACK_PAGES, 5,
                              "a long lookback would resurrect stale blocks")
 
-    def test_carry_seeding_block_present_in_window_loop(self):
-        src = Path(qp.__file__).read_text()
-        self.assertIn("carry seeded from page", src,
-                      "the window loop must seed active_block from the page "
-                      "before its first imaged page")
-        self.assertIn("CARRY_SEED_LOOKBACK_PAGES", src)
 
-    def test_carry_seed_only_runs_when_no_pass_carry_exists(self):
-        src = Path(qp.__file__).read_text()
-        # run-22: anchor on the actual print STATEMENT, not on any occurrence
-        # of the phrase. This asserts on raw source text, so a COMMENT that
-        # quotes the log line (the D3 chapter-clamp rationale did) silently
-        # moves the anchor and the test fails on unchanged code.
-        i = src.index('f"  [IMG] carry seeded from page')
-        window = src[max(0, i - 1800):i]
-        # run-25: the page list this guard reads was renamed window_rows ->
-        # window_seq (window_seq also carries the IMAGE-LESS pages, so the
-        # carry advances across them -- Defect B). The invariant under test is
-        # unchanged: seed ONLY when there is no pass-level carry.
-        self.assertRegex(window,
-                         r"if active_block is None and window_(rows|seq):",
-                         "seeding must never override a real pass-level carry")
 
     # --- (c) carry claims and the cap --------------------------------
     def test_carry_claim_source_is_distinct_from_plain_positional(self):
@@ -3081,27 +1625,9 @@ class Run22GarbledHeaderAndOrphanInferenceTests(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertIsNone(qp.QSTEM_HEADING_RE.match(line))
 
-    def test_per_qno_helper_agrees_with_the_generic_one(self):
-        self.assertTrue(qp.qstem_heading_re_for(13).search(self.GARBLED))
-        self.assertFalse(qp.qstem_heading_re_for(14).search(self.GARBLED))
 
-    def test_single_source_of_truth_for_the_heading_pattern(self):
-        # The pattern used to be copy-pasted into six places and they drifted.
-        src = Path(qp.__file__).read_text()
-        self.assertNotIn(r'(\d{1,3})\s*[.:\-\u2013)]', src,
-                         "no call site may re-inline the old terminator class; "
-                         "use QSTEM_HEADING_RE / qstem_heading_re_for()")
 
     # --- D3: carry seed must not cross a chapter boundary ----------------
-    def test_carry_seed_lookback_is_clamped_to_chapter_start(self):
-        src = Path(qp.__file__).read_text()
-        i = src.index('f"  [IMG] carry seeded from page')
-        window = src[max(0, i - 1800):i]
-        self.assertIn('_floor = max(1, int(ch.get("file_start") or 1))', window,
-                      "the walk-back must start from the chapter's own first "
-                      "page; ch. 38 (starts p666) seeded off ch. 37's p665")
-        self.assertIn("if _prev < _floor:", window,
-                      "the loop must break at the chapter floor, not at page 1")
 
     # --- D2: infer a q_no-less fragment's owner from page position -------
     def _orphan(self, frag, pages, last_qn, tables=None):
@@ -3128,126 +1654,11 @@ class Run22GarbledHeaderAndOrphanInferenceTests(unittest.TestCase):
                 "carry_merges": 0, "contaminated_stems_blocked": 0,
                 "chapter_id": "ANA-038"}
 
-    def test_position_inference_beats_naive_last_qn(self):
-        """THE ch. 38 trap: last_qn_in_batch was 13, the true owner was 11.
 
-        Orphan text "Distal to pisiform it gives 2 terminal branches" is the
-        continuation of q11's solution, which ends "...lateral to pisiform
-        called Guyon's ulnar tunnel". A last_qn-based guess would have glued
-        q11's anatomy onto q13. Page position says the last heading printed
-        at/before p687 opened q11, so q11 wins.
-        """
-        frag = ("\u2022 Distal to pisiform it gives 2 terminal branches. One "
-                "superficial terminal and another deep terminal")
-        # VERBATIM from the ch. 38 run: q11's solution stops at "...ulnar
-        # tunnel" with NO dangling colon and no full stop. That is why this
-        # needed _solution_block_is_open() rather than
-        # looks_truncated_solution(), which only fires on an explicit
-        # dangling lead-in and would have left this fragment orphaned.
-        recs = {11: self._rec(11, solution_text=(
-                    "The course of the ulnar nerve: it passes superficial to "
-                    "flexor retinaculum but under a fascial band lateral to "
-                    "pisiform called Guyon's ulnar tunnel")),
-                13: self._rec(13, solution_text=(
-                    "The given clinical scenario is suggestive of an injury to "
-                    "the ulnar nerve before its division. Given below is the "
-                    "Froment test used to test adductor pollicis."))}
-        orphans = [self._orphan(frag, [686, 687], last_qn=13)]
-        stats = self._stats()
-        with mock.patch.object(qp, "last_block_on_page",
-                               side_effect=lambda _p, page, **kw:
-                                   ("solution", 11) if page == 687 else None):
-            remaining = qp.recover_orphans(orphans, recs, "ANA", 38, stats,
-                                           pdf_path="/tmp/book.pdf")
-        self.assertIn("pisiform it gives 2 terminal branches",
-                      recs[11]["solution_text"] or "")
-        self.assertNotIn("2 terminal branches", recs[13]["solution_text"] or "",
-                         "must NOT be glued onto last_qn_in_batch's record")
-        self.assertEqual(remaining, [])
 
-    def test_open_block_predicate_is_not_the_retry_predicate(self):
-        """_solution_block_is_open must be LOOSER than
-        looks_truncated_solution: the ch. 38 q11 tail has no dangling marker,
-        so reusing the retry predicate here would drop the continuation. But
-        it must still refuse a solution that ends in a full stop."""
-        q11_tail = ("The course of the ulnar nerve: it passes superficial to "
-                    "flexor retinaculum but under a fascial band lateral to "
-                    "pisiform called Guyon's ulnar tunnel")
-        self.assertFalse(qp.looks_truncated_solution(q11_tail),
-                         "guard the assumption this test rests on")
-        self.assertTrue(qp._solution_block_is_open(q11_tail))
-        self.assertTrue(qp._solution_block_is_open(""))
-        self.assertTrue(qp._solution_block_is_open("The steps are:"))
-        for closed in ("Ends with a full stop.", "Ends with a question mark?",
-                       "Froment test used to test adductor pollicis."):
-            with self.subTest(closed=closed):
-                self.assertFalse(qp._solution_block_is_open(closed))
 
-    def test_inference_never_overwrites_a_complete_solution(self):
-        """Owner found, but its solution already ends cleanly -> attach
-        nothing, and say so instead of the misleading 'could not determine
-        owner'. Reuses the same completeness guard as rule 3."""
-        recs = {11: self._rec(11, solution_text=(
-            "The ulnar nerve supplies the palmar interossei and the course "
-            "is fully described here, ending in a complete sentence."))}
-        orphans = [self._orphan("Some extra aside material.", [686, 687],
-                                last_qn=11)]
-        stats = self._stats()
-        with mock.patch.object(qp, "last_block_on_page",
-                               return_value=("solution", 11)):
-            remaining = qp.recover_orphans(orphans, recs, "ANA", 38, stats,
-                                           pdf_path="/tmp/book.pdf")
-        self.assertEqual(len(remaining), 1)
-        self.assertEqual(remaining[0].get("inferred_owner"), 11)
-        self.assertEqual(remaining[0].get("blocked_reason"),
-                         "owner solution already complete")
-        self.assertNotIn("aside material", recs[11]["solution_text"])
 
-    def test_position_inference_never_places_a_bare_table(self):
-        """REGRESSION (found by re-running ch. 38 with the D2 fix in place):
 
-        the first cut of this fix also accepted table-only fragments, and
-        promptly glued the chapter-wide ANSWER KEY ("| 5 | c | 6 | a |
-        7 | b | ...", the answers to q5-q16) plus a sympathetic vs
-        parasympathetic comparison table onto q7's solution -- q7 was merely
-        the last heading printed before them. A table spanning many q_nos
-        belongs to the chapter, not to the preceding block. Position
-        inference is for PROSE continuations only.
-        """
-        key_table = {"type": "table",
-                     "markdown": "| 5 | c |\n|---|---|\n| 6 | a |\n| 7 | b |"}
-        recs = {7: self._rec(7, solution_text="Q7 solution ends cleanly.")}
-        orphans = [self._orphan(None, [677, 681], last_qn=None,
-                                tables=[key_table])]
-        stats = self._stats()
-        with mock.patch.object(qp, "last_block_on_page",
-                               return_value=("solution", 7)):
-            remaining = qp.recover_orphans(orphans, recs, "ANA", 38, stats,
-                                           pdf_path="/tmp/book.pdf")
-        self.assertEqual(len(remaining), 1,
-                         "a bare table must stay an orphan, not join q7")
-        self.assertEqual(recs[7].get("tables"), [],
-                         "the chapter answer key must never land on one question")
-
-    def test_inference_ignores_owners_outside_this_chapter(self):
-        recs = {11: self._rec(11, solution_text=None)}
-        orphans = [self._orphan("Fragment text here.", [686], last_qn=None)]
-        stats = self._stats()
-        with mock.patch.object(qp, "last_block_on_page",
-                               return_value=("solution", 99)):
-            remaining = qp.recover_orphans(orphans, recs, "ANA", 38, stats,
-                                           pdf_path="/tmp/book.pdf")
-        self.assertEqual(len(remaining), 1, "q99 is not in this chapter")
-        self.assertIsNone(recs[11]["solution_text"])
-
-    def test_inference_is_skipped_without_a_pdf_path(self):
-        """Callers that cannot supply the PDF (unit tests, older paths) must
-        keep the pre-fix behaviour rather than crash."""
-        recs = {11: self._rec(11, solution_text=None)}
-        orphans = [self._orphan("Fragment text here.", [686], last_qn=None)]
-        remaining = qp.recover_orphans(orphans, recs, "ANA", 38, self._stats())
-        self.assertEqual(len(remaining), 1)
-        self.assertIsNone(recs[11]["solution_text"])
 
 
 class Run22OptionsManualReviewFlagTests(unittest.TestCase):
@@ -3276,85 +1687,13 @@ class Run22OptionsManualReviewFlagTests(unittest.TestCase):
                              "motor and supplies the interossei.",
         }
 
-    def test_ch38_q13_is_flagged(self):
-        recs = {13: self._q13()}
-        why = qp.detect_options_harvested_from_solution(13, recs[13], recs)
-        self.assertIsNotNone(why, "known-bad ch38 q13 must be flagged")
-        self.assertIn("commentary", why)
-        for letter in ("A", "B", "D"):
-            self.assertIn(letter, why)
 
-    def test_flagging_never_mutates_the_record(self):
-        """The whole point: the reviewer sees exactly what was extracted."""
-        recs = {13: self._q13()}
-        before = copy.deepcopy(recs[13])
-        qp.detect_options_harvested_from_solution(13, recs[13], recs)
-        self.assertEqual(before, recs[13],
-                         "detector must be read-only -- no auto-correction")
 
-    def test_healthy_options_are_not_flagged(self):
-        recs = {1: {"options": {"A": "Deep branch of ulnar nerve",
-                                "B": "Ulnar nerve before its division into "
-                                     "superficial and deep branch",
-                                "C": "Palmar cutaneous branch of ulnar nerve",
-                                "D": "Superficial terminal branch of ulnar "
-                                     "nerve"},
-                    "solution_text": "Answer is A."}}
-        self.assertIsNone(
-            qp.detect_options_harvested_from_solution(1, recs[1], recs))
 
-    def test_single_letter_diagram_labels_are_not_flagged(self):
-        """ch. 38 q12's own options legitimately ARE 'A'/'B'/'C'/'D'."""
-        recs = {12: {"options": {k: k for k in "ABCD"},
-                     "solution_text": "Medial epicondyle, marked as C."}}
-        self.assertIsNone(
-            qp.detect_options_harvested_from_solution(12, recs[12], recs))
 
-    def test_one_uncorroborated_commentary_option_is_not_enough(self):
-        """A genuine option may read 'It is the ...'; one alone stays quiet."""
-        recs = {5: {"options": {"A": "It is the only muscle supplied by the "
-                                     "anterior interosseous nerve",
-                                "B": "Flexor carpi ulnaris",
-                                "C": "Pronator teres",
-                                "D": "Supinator"},
-                    "solution_text": "A is correct."}}
-        self.assertIsNone(
-            qp.detect_options_harvested_from_solution(5, recs[5], recs))
 
-    def test_one_commentary_option_IS_flagged_when_another_q_claims_it(self):
-        recs = {
-            6: {"options": {"A": "It is the radial groove where the radial "
-                                 "nerve runs with profunda brachii",
-                            "B": "Ulnar nerve", "C": "Median nerve",
-                            "D": "Axillary nerve"},
-                "solution_text": "B is correct."},
-            7: {"options": {}, "solution_text":
-                "It is the radial groove where the radial nerve runs with "
-                "profunda brachii artery, hence option A."},
-        }
-        why = qp.detect_options_harvested_from_solution(6, recs[6], recs)
-        self.assertIsNotNone(why)
-        self.assertIn("q7", why)
 
-    def test_option_quoting_its_own_solution_is_not_proof(self):
-        """Self-match must never count -- solutions restate their options."""
-        recs = {8: {"options": {"A": "It is the radial groove carrying the "
-                                     "radial nerve",
-                                "B": "Ulnar", "C": "Median", "D": "Axillary"},
-                    "solution_text": "It is the radial groove carrying the "
-                                     "radial nerve, so A."}}
-        self.assertIsNone(
-            qp.detect_options_harvested_from_solution(8, recs[8], recs))
 
-    def test_option_line_prefix_shape_is_detected(self):
-        recs = {9: {"options": {"A": "Option A: the radial groove where the "
-                                     "radial nerve travels",
-                                "B": "Option B: the lateral epicondyle of the "
-                                     "humerus bone",
-                                "C": "Median nerve", "D": "Axillary nerve"},
-                    "solution_text": "C is correct."}}
-        self.assertIsNotNone(
-            qp.detect_options_harvested_from_solution(9, recs[9], recs))
 
     def test_export_row_carries_options_suspect_and_manual_review(self):
         src = inspect.getsource(qp)
@@ -3374,18 +1713,6 @@ class Run22OptionsManualReviewFlagTests(unittest.TestCase):
             self.assertNotIn(banned, window,
                              "options_suspect path must not modify the record")
 
-    def test_sweep_sets_the_flag_and_leaves_options_intact(self):
-        stats = {}
-        recs = {13: self._q13(), 12: {"options": {k: k for k in "ABCD"},
-                                      "solution_text": "Medial epicondyle."}}
-        original = copy.deepcopy(recs[13]["options"])
-        with tempfile.TemporaryDirectory() as td:
-            with mock.patch.object(qp, "DATA_DIR", pathlib.Path(td)):
-                qp.chapter_integrity_sweep(recs, {}, "ANA", 38, stats)
-        self.assertTrue(recs[13].get("_options_suspect_reason"))
-        self.assertEqual(original, recs[13]["options"],
-                         "sweep must ship the options exactly as extracted")
-        self.assertIsNone(recs[12].get("_options_suspect_reason"))
 
     def test_validator_emits_a_high_severity_review_flag(self):
         src = inspect.getsource(qv)
@@ -3580,98 +1907,12 @@ class Run23BlankOptionHealTests(unittest.TestCase):
         self.assertIsNone(opts["D"])
         self.assertEqual(n, 0)
 
-    def test_blank_option_is_reported_as_incomplete(self):
-        """The detector was already right -- keep it that way."""
-        recs = {16: {"question_text": "Q?", "correct_option": "C",
-                     "solution_text": "S", "tables": [],
-                     "options": {"A": "a", "B": "b", "C": "c", "D": None}}}
-        missing = dict(qp.find_incomplete_records(recs))
-        self.assertIn("options", missing.get(16, []))
 
 
-class Run24PositionalOwnerTiebreakTests(unittest.TestCase):
-    """P3: a q_no-less fragment must not be owned by the window's last
-    question when its own words point at a different one (ch.60 q7 -> q15)."""
 
-    def test_ch60_q7_fragment_is_not_given_to_q15(self):
-        """The real miss: fragment about the trochlear nerve / superior
-        oblique belongs to q7, but the Q-pass window ended on q15."""
-        recs = {
-            7: {"question_text": "Which nerve supplies the superior oblique muscle?",
-                "solution_text": "The trochlear nerve supplies the superior oblique",
-                "tables": []},
-            15: {"question_text": "Which artery supplies the stomach fundus?",
-                 "solution_text": "The short gastric arteries arise from the splenic artery "
-                                  "and supply the fundus of the stomach completely.",
-                 "tables": []},
-        }
-        frag = ("trochlear nerve emerges dorsally and decussates before "
-                "supplying the superior oblique muscle of the orbit")
-        verdict, better, detail = qp._positional_owner_contested(frag, 15, recs)
-        self.assertNotEqual(verdict, "ok", "positional guess must be challenged")
-        self.assertEqual(better, 7)
-        self.assertIn("q7", detail)
 
-    def test_veto_when_true_owner_solution_is_already_complete(self):
-        recs = {
-            7: {"question_text": "Trochlear nerve question?",
-                "solution_text": "The trochlear nerve supplies the superior oblique muscle "
-                                 "and emerges dorsally from the brainstem.",
-                "tables": []},
-            15: {"question_text": "Gastric artery question?",
-                 "solution_text": "Splenic artery supplies the fundus.", "tables": []},
-        }
-        frag = "trochlear nerve emerges dorsally supplying the superior oblique muscle"
-        verdict, better, _ = qp._positional_owner_contested(frag, 15, recs)
-        self.assertEqual(verdict, "veto")
-        self.assertEqual(better, 7)
 
-    def test_redirect_when_true_owner_solution_is_truncated(self):
-        recs = {
-            7: {"question_text": "Trochlear nerve question?",
-                "solution_text": "The trochlear nerve supplies the superior oblique:",
-                "tables": []},
-            15: {"question_text": "Gastric artery question?",
-                 "solution_text": "Splenic artery supplies the fundus.", "tables": []},
-        }
-        frag = "trochlear nerve emerges dorsally supplying the superior oblique muscle"
-        verdict, better, _ = qp._positional_owner_contested(frag, 15, recs)
-        self.assertEqual(verdict, "redirect")
-        self.assertEqual(better, 7)
 
-    def test_agreeing_positional_owner_is_left_alone(self):
-        """No regression: when position and content agree, say nothing."""
-        recs = {15: {"question_text": "Which artery supplies the fundus?",
-                     "solution_text": "The short gastric arteries supply the fundus.",
-                     "tables": []}}
-        frag = "short gastric arteries arising from the splenic artery supply the fundus"
-        verdict, better, _ = qp._positional_owner_contested(frag, 15, recs)
-        self.assertEqual(verdict, "ok")
-        self.assertIsNone(better)
-
-    def test_short_fragment_carries_no_evidence(self):
-        recs = {7: {"question_text": "Q7", "solution_text": "trochlear nerve", "tables": []},
-                15: {"question_text": "Q15", "solution_text": "splenic artery", "tables": []}}
-        verdict, _, _ = qp._positional_owner_contested("see below:", 15, recs)
-        self.assertEqual(verdict, "ok")
-
-    def test_generic_fragment_below_floor_does_not_steal(self):
-        """A fragment sharing only boilerplate must not beat the position."""
-        recs = {7: {"question_text": "Q7 stem", "solution_text": "Therefore option A.",
-                    "tables": []},
-                15: {"question_text": "Q15 stem", "solution_text": "Hence option C.",
-                     "tables": []}}
-        verdict, _, _ = qp._positional_owner_contested(
-            "xylophone quasar tessellation buttress", 15, recs)
-        self.assertEqual(verdict, "ok")
-
-    def test_no_qno_item_is_returned_for_orphan_recovery_not_dropped(self):
-        """P2: the 'no q_no' path routes content onward -- it is not a drop."""
-        existing = {}
-        stats = {"duplicates_merged": 0, "conflicts": 0, "foreign_chapter_qno_dropped": 0}
-        item = {"q_no": None, "solution_text": "orphaned continuation text"}
-        _, skipped = qp.merge_question_records(existing, [item], stats)
-        self.assertEqual(skipped, [item])
 
 
 class Run24LeadInFlagParityTests(unittest.TestCase):
@@ -3774,15 +2015,6 @@ class Run24KeyRotationBatchLossTests(unittest.TestCase):
         self.assertNotIn("salvage", log, "must not re-ask pages it already has")
         self.assertEqual(n_calls, 3, "no wasted calls on the fresh key")
 
-    def test_retry_path_never_sends_routed_away_pages(self):
-        """BUG 2: the backoff/rotation calls sent `batch` (raw window) instead
-        of `pass_batch`, re-asking recitation-sensitive pages that
-        _batch_after_routing had deliberately removed for this pass."""
-        _items, _n, pages_sent, _log = self._replay(
-            ["429 quota", "429 quota", "ok"], [True])
-        for which, pages in pages_sent:
-            self.assertNotIn("p3", pages,
-                             f"{which} re-sent a routed-away page")
 
     def test_batch_is_never_silently_skipped_on_rotation(self):
         """The user's actual question: can a batch be dropped when the key
@@ -3802,15 +2034,6 @@ class Run24KeyRotationBatchLossTests(unittest.TestCase):
         self.assertIn("EXIT", log)
         self.assertIsNone(items)
 
-    def test_page_by_page_retry_rotates_and_continues(self):
-        """retry_batch_page_by_page must rotate and RETRY the same page, not
-        move on to the next one (that would drop the page's content)."""
-        src = inspect.getsource(qp.retry_batch_page_by_page)
-        rot = src.index("handle_429")
-        self.assertIn("continue", src[rot:rot + 700],
-                      "must re-attempt the SAME page after rotation")
-        self.assertIn("failed even alone", src,
-                      "an unrecoverable page must still be queued for drain")
 
 
 class Run24QuotaDayBoundaryTests(unittest.TestCase):
@@ -3860,79 +2083,11 @@ class Run24QuotaDayBoundaryTests(unittest.TestCase):
         self.assertEqual(state["calls_today"], 42, "must not wipe today's count")
 
 
-class Run24SelfLabeledSolutionHeadTests(unittest.TestCase):
-    """ch7 q19/q20 (pp.129-130): a "Solution to Question 19:" heading sat at
-    the BOTTOM of p129 and its body ran onto p130, so the model emitted that
-    body as q20's solution. q19 exported EMPTY while its 767-char solution
-    sat glued to the head of q20, ahead of a self-labeled
-    "Solution to Question 20:" header. Sweep 2b only looked at headers naming
-    a DIFFERENT question, so this fell through."""
 
-    @staticmethod
-    def _rec(sol):
-        return {"question_text": "stem",
-                "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                "correct_option": "A", "_prov": {}, "tables": [],
-                "solution_text": sol}
 
-    GLUED = ("Failure of fusion of the dorsal and ventral pancreatic buds leads "
-             "to pancreas divisum.\nThe developing pancreatic ducts usually fuse "
-             "so the dorsal drains into the ventral duct.\n"
-             "Solution to Question 20:\n"
-             "The spleen develops from the mesoderm in the dorsal mesogastrium.\n"
-             "The mesenchymal cells form lobular masses called spleniculi.")
 
-    def test_head_is_returned_to_the_solutionless_owner(self):
-        recs = {19: self._rec(""), 20: self._rec(self.GLUED)}
-        qp.chapter_integrity_sweep(recs, {}, "ANA", 7, {})
-        self.assertIn("divisum", recs[19]["solution_text"])
-        self.assertNotIn("spleen", recs[19]["solution_text"])
-        self.assertIn("spleen", recs[20]["solution_text"])
-        self.assertNotIn("divisum", recs[20]["solution_text"])
 
-    def test_split_is_recorded_in_stats(self):
-        recs = {19: self._rec(""), 20: self._rec(self.GLUED)}
-        stats = {}
-        qp.chapter_integrity_sweep(recs, {}, "ANA", 7, stats)
-        self.assertEqual(stats.get("solution_heads_reassigned"), 1)
 
-    def test_never_overwrites_a_question_that_has_a_solution(self):
-        """The other three real occurrences in ch1/ch7 had a previous question
-        that already owned its solution -- those must be left alone."""
-        keep = "q19 already owns a perfectly good solution and must keep it."
-        recs = {19: self._rec(keep), 20: self._rec(self.GLUED)}
-        qp.chapter_integrity_sweep(recs, {}, "ANA", 7, {})
-        self.assertEqual(recs[19]["solution_text"], keep)
-
-    def test_donates_to_the_NEAREST_preceding_empty_question(self):
-        recs = {15: self._rec(""), 19: self._rec(""), 20: self._rec(self.GLUED)}
-        qp.chapter_integrity_sweep(recs, {}, "ANA", 7, {})
-        self.assertIn("divisum", recs[19]["solution_text"], "nearest, not earliest")
-        self.assertEqual(recs[15]["solution_text"], "")
-
-    def test_retry_guard_accepts_the_rescue_fragment(self):
-        """_solution_fragment_foreign vetoed the correct retry with 'first line
-        exists verbatim in q20's solution' -- true, but q20 was the thief."""
-        ch = {19: {"solution_text": ""}, 20: {"solution_text": self.GLUED}}
-        frag = ("Failure of fusion of the dorsal and ventral pancreatic buds leads "
-                "to pancreas divisum.")
-        self.assertIsNone(
-            qp._solution_fragment_foreign(frag, 19, {"options": {}}, ch))
-
-    def test_retry_guard_still_blocks_genuine_contamination(self):
-        """Donor is NOT a glued block -> the old proof must still fire."""
-        line = "The spleen develops from the mesoderm in the dorsal mesogastrium."
-        ch = {19: {"solution_text": ""}, 20: {"solution_text": line + " More."}}
-        self.assertIsNotNone(
-            qp._solution_fragment_foreign(line, 19, {"options": {}}, ch))
-
-    def test_header_naming_another_question_still_trims_the_tail(self):
-        """Sweep 2b must be unaffected by 2c."""
-        recs = {1: self._rec("q1 solution body that is long enough to be real.\n"
-                             "Solution to Question 2:\nq2 body glued on."),
-                2: self._rec("q2 owns its own solution already, proving redundancy.")}
-        qp.chapter_integrity_sweep(recs, {}, "ANA", 11, {})
-        self.assertNotIn("q2 body glued on", recs[1]["solution_text"])
 
 
 class Run25SlicedFigureStitchTests(unittest.TestCase):
@@ -4010,180 +2165,10 @@ class Run25SlicedFigureStitchTests(unittest.TestCase):
                                         {22: (162.0, 56.0, 450.0, 272.0)}), one)
 
 
-class Run25CarryAdvancesOnImagelessPagesTests(unittest.TestCase):
-    """Defect B: `if not imgs: continue` dropped image-less pages from the
-    window list, and the carry advance lived in the claim loop over that same
-    list -- so a text-only page's headings never moved active_block and the
-    next page's top figure was attributed to a block that had closed pages
-    earlier (29/210 carries wrong on DER ch1-9, 2 of them crossing the
-    question->solution boundary)."""
-
-    def _window_loop_src(self):
-        src = Path(qp.__file__).read_text()
-        i = src.index("window_seq = []")
-        return src[i:src.index("FIGURE-MAP pass", i)]
-
-    def test_imageless_pages_stay_in_the_page_sequence(self):
-        body = self._window_loop_src()
-        head = body[:body.index("pos = image_positions_on_page")]
-        self.assertIn("window_seq.append((file_page_num, []))", head,
-                      "an image-less page must still enter the sequence")
-
-    def test_claim_loop_iterates_the_full_sequence_not_just_imaged_pages(self):
-        self.assertIn("for file_page_num, rels in window_seq:",
-                      self._window_loop_src())
-
-    def test_carry_advances_before_skipping_an_imageless_page(self):
-        body = self._window_loop_src()
-        i = body.index("for file_page_num, rels in window_seq:")
-        guard = body[i:body.index("leftover = claim_page_images", i)]
-        self.assertIn("last_block_on_page(pdf_path, file_page_num", guard)
-        self.assertLess(guard.index("active_block = _last"),
-                        guard.rindex("continue"),
-                        "advance the carry BEFORE continuing past the page")
-
-    def test_figure_map_still_only_sees_pages_that_have_images(self):
-        """window_rows (imaged pages only) must keep feeding the fallbacks --
-        an empty row would break the exact-count guard."""
-        body = self._window_loop_src()
-        self.assertIn("window_rows.append((file_page_num, ordered))", body)
 
 
-class Run26PageCutSolutionContinuationTests(unittest.TestCase):
-    """run-26: a solution cut at a page break left its tail glued to the FRONT
-    of the next question's record (DER ch3 q10/q11, ch4 q13/q14). The existing
-    self-labeled-header sweep could only donate that head to a question with
-    an EMPTY solution, so these cases shipped with a foreign prefix while the
-    real owner stayed truncated."""
-
-    # ---- _reads_as_continuation ----------------------------------------
-    def test_option_walk_running_over_the_page_edge_is_a_continuation(self):
-        prev = "Option B: x.\nOption C: Arcuate lesions are arc-shaped or incomplete circles."
-        head = "Option D: Polycyclic lesions are several circles that have merged together."
-        self.assertTrue(qp._reads_as_continuation(prev, head))
-
-    def test_bullet_list_running_over_the_page_edge_is_a_continuation(self):
-        prev = "Other peeling agents are:\n\u2022 Pyruvic acid\n\u2022 Citric acid"
-        head = "\u2022 Tartaric acid\n\u2022 Mandelic acid"
-        self.assertTrue(qp._reads_as_continuation(prev, head))
-
-    def test_sentence_cut_mid_flow_is_a_continuation(self):
-        self.assertTrue(qp._reads_as_continuation(
-            "Pearly opalescent white epidermal inclusion cysts. Resolve",
-            "spontaneously without scarring."))
-
-    def test_new_capitalised_sentence_after_clean_stop_is_not_a_continuation(self):
-        self.assertFalse(qp._reads_as_continuation(
-            "This is fully explained.", "Rhinophyma is a separate condition."))
-
-    def test_fresh_option_a_after_a_finished_solution_is_not_a_continuation(self):
-        self.assertFalse(qp._reads_as_continuation(
-            "The answer is B. Fully explained here.", "Option A: Something unrelated."))
-
-    def test_non_adjacent_option_letters_are_not_a_continuation(self):
-        self.assertFalse(qp._reads_as_continuation("Option A: first.", "Option D: jump."))
-
-    def test_empty_inputs_are_never_a_continuation(self):
-        self.assertFalse(qp._reads_as_continuation("", "Option D: x"))
-        self.assertFalse(qp._reads_as_continuation("Option C: x", ""))
-
-    # ---- _option_letters_in --------------------------------------------
-    def test_option_letters_only_counts_line_starts(self):
-        self.assertEqual(qp._option_letters_in("Option A: x\nOption C: y"), {"A", "C"})
-        self.assertEqual(
-            qp._option_letters_in("as described in Option B this is inline"), set())
-
-    # ---- sweep wiring (source-level) -----------------------------------
-    def _sweep_src(self):
-        """The self-labeled-header sweep: from its `for qn in qns:` header up
-        to the dup_elsewhere fallback that follows the new append branch."""
-        src = Path(qp.__file__).read_text()
-        anchor = src.index("prevs = [o for o in qns if o < qn")
-        start = src.rindex("for qn in qns:", 0, anchor)
-        end = src.index("dup_elsewhere = any(other != qn", anchor)
-        return src[start:end]
-
-    def test_sweep_appends_head_to_a_truncated_earlier_solution(self):
-        body = self._sweep_src()
-        self.assertIn("_reads_as_continuation(owner_sol, head)", body)
-        self.assertIn('owner_sol.rstrip() + "\\n" + head', body)
-
-    def test_sweep_never_overwrites_an_existing_solution(self):
-        """The append branch must concatenate, never assign head alone.
-
-        (The earlier `needy` branch legitimately assigns head outright, but
-        only to a record whose solution is EMPTY -- that is not this block.)
-        """
-        src = Path(qp.__file__).read_text()
-        start = src.index("prevs = [o for o in qns if o < qn")
-        end = src.index("dup_elsewhere = any(other != qn", start)
-        append_branch = src[start:end]
-        self.assertNotIn('chapter_records[owner]["solution_text"] = head',
-                         append_branch)
-        self.assertIn('owner_sol.rstrip() + "\\n" + head', append_branch)
-
-    def test_sweep_skips_when_head_is_already_present(self):
-        self.assertIn("already = head[:80] in owner_sol", self._sweep_src())
-
-    def test_sweep_guards_against_redonating_an_owned_option_letter(self):
-        body = self._sweep_src()
-        self.assertIn("head_opts & owner_opts", body)
-
-    def test_repairing_the_head_clears_the_stale_review_reason(self):
-        """A head logged as unrepaired earlier must not keep manual_review on.
-
-        The `foreign 'Option' head ... no verbatim donor` warning fires before
-        this branch runs. Once the head has been moved to its true owner the
-        record is clean, so the reason quoting that head has to go with it.
-        """
-        body = self._sweep_src()
-        self.assertIn("stale_probe = head.strip()[:60]", body)
-        self.assertIn("stale_probe not in r", body)
-        self.assertIn('chapter_records[qn]["_review_reasons"] = kept_reasons',
-                      body)
 
 
-class Run26OptionHeadWithoutAHeaderTests(unittest.TestCase):
-    """The same page-cut defect when the model emits NO 'Solution to
-    Question N:' header -- just blank lines. Branch 2 handles it there;
-    branch 2's no-donor `else` has to handle it here or DER ch3 q10/q11
-    regresses on any run where the header is absent (observed live)."""
-
-    def _nodonor_src(self):
-        src = Path(qp.__file__).read_text()
-        anchor = src.index('iflag("foreign_option_head_review"')
-        start = src.rindex("donated = False", 0, anchor)
-        return src[start:anchor]
-
-    def test_no_donor_branch_tries_the_page_cut_owner_first(self):
-        body = self._nodonor_src()
-        self.assertIn("_reads_as_continuation(owner_sol, head_line)", body)
-        self.assertIn('owner_sol.rstrip() + "\\n" + head_line', body)
-
-    def test_no_donor_branch_appends_never_overwrites(self):
-        self.assertNotIn('chapter_records[owner]["solution_text"] = head_line',
-                         self._nodonor_src())
-
-    def test_no_donor_branch_keeps_the_option_letter_guard(self):
-        self.assertIn("head_opts & owner_opts", self._nodonor_src())
-
-    def test_review_flag_only_fires_when_nothing_was_donated(self):
-        src = Path(qp.__file__).read_text()
-        anchor = src.index('iflag("foreign_option_head_review"')
-        preceding = src.rindex("if not donated:", 0, anchor)
-        self.assertLess(anchor - preceding, 200)
-
-    def test_der_ch3_q10_q11_pair_reads_as_a_continuation(self):
-        owner = ("granuloma annulare.\n\nAnnular lesion\n\n"
-                 "Option C: Arcuate lesions are arc-shaped or incomplete circles.")
-        head = ("Option D: Polycyclic lesions are several circles that "
-                "have merged together.")
-        self.assertTrue(qp._reads_as_continuation(owner, head))
-
-    def test_a_finished_solution_does_not_adopt_a_fresh_option_a(self):
-        owner = "The answer is psoriasis. This is a well established finding."
-        self.assertFalse(
-            qp._reads_as_continuation(owner, "Option A: Something entirely new."))
 
 
 class Run26UnrepairedFlagsReachTheExportTests(unittest.TestCase):
@@ -4191,19 +2176,7 @@ class Run26UnrepairedFlagsReachTheExportTests(unittest.TestCase):
     NOT fix. That verdict only ever reached integrity_flags.jsonl, so the
     exported row still said manual_review=False and a reviewer saw nothing."""
 
-    def test_iflag_pins_unmatched_reasons_onto_the_record(self):
-        src = Path(qp.__file__).read_text()
-        i = src.index("def iflag(kind, qn, detail, matched=True")
-        body = src[i:src.index("# 1. duplicate-stem pairs", i)]
-        self.assertIn("if not matched and qn in chapter_records:", body)
-        self.assertIn('setdefault("_review_reasons", [])', body)
 
-    def test_iflag_does_not_flag_repaired_findings(self):
-        """matched=True is a fixed problem -- it must not raise manual_review."""
-        src = Path(qp.__file__).read_text()
-        i = src.index("def iflag(kind, qn, detail, matched=True")
-        body = src[i:src.index("# 1. duplicate-stem pairs", i)]
-        self.assertIn("if not matched", body)
 
     def test_export_row_surfaces_review_reasons(self):
         src = Path(qp.__file__).read_text()

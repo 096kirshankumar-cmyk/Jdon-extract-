@@ -10,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY qbank_pipeline.py qbank_validator.py fix_output.py app.py test_v2_chapter.py split_outputs.py master_review_export.py gemini_keys.py review_digest.py review_queue.py flag_verifier.py boundary_phased.py FORMAT.md ./
+COPY qbank_pipeline.py qbank_validator.py fix_output.py app.py split_outputs.py master_review_export.py gemini_keys.py review_digest.py review_queue.py flag_verifier.py boundary_phased.py FORMAT.md ./
 # PDFs get uploaded via the dashboard now, so no need to bake them into the image.
 # (If you'd rather pre-load them at build time, uncomment the next line and
 #  add a pdfs/ folder next to this Dockerfile.)

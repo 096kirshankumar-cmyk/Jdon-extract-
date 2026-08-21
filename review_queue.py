@@ -66,6 +66,11 @@ BLOCKER_KINDS = {
     "answer_key_disagrees",     # printed key contradicts extracted answer
     "unresolved_qid",           # record could not be anchored
     "incomplete_records",       # completeness.json says records missing
+    # boundary engine (the one extraction method): a chapter that could not
+    # prove itself LOCKED must hold the Final zip shut until a human looks.
+    "chapter_not_locked",       # cross-check/count guards refused, or the
+                                # chapter failed before any commit
+    "phase_unresolved",         # a verify loop exhausted its fix attempts
 }
 
 HUMAN_EDIT_LEDGER = "human_edit_ledger.jsonl"

@@ -23,10 +23,10 @@ are NOT touched by this module. The split is built from the same
 chapter_records dict the master file is built from, so the two are
 guaranteed consistent for the same chapter.
 
-Inserted at one call site in process_pdf() (qbank_pipeline.py), AFTER
-every existing check (batches, orphans, drain, sweep, retry, rescue,
-anchorless drop, phantom drop, critique) and BEFORE the existing
-build_final_question loop.
+Inserted at one call site in the boundary engine's Step-8 commit
+(boundary_phased.ChapterRunner._commit), AFTER the export gate and BEFORE
+the master build_final_question loop. (History: this layer first lived in
+the retired multi-pass process_pdf; the call contract is unchanged.)
 
 Public entry points
 -------------------
@@ -66,7 +66,9 @@ Provenance taxonomy (confirmed in design doc §2, Phase-2 upgrade landed)
 Phase-2 anchors (now populated, design doc §3.1)
 -------------------------------------------------
 The split writer accepts a `chapter_anchor_observations` dict
-captured read-only by process_pdf in the same chapter. Two
+captured read-only by the caller in the same chapter (the boundary engine
+currently passes None -- Phase-1 grading only; the retired multi-pass
+process_pdf was the original source). Two
 non-printed anchors are derived from those observations and
 attached to q_no_anchors:
   * neighbor_run: a {size, first, last, near_chapter_max} dict
