@@ -1659,10 +1659,16 @@ def apply_image_op(output_root, q_id: str, op: str, file: str,
             return {"ok": False, "error": f"{file} not under assets/questions/"}
         if q_id in refs:
             return {"ok": False, "error": f"{file} already attached to {q_id}"}
-        # an UNREFERENCED crop-style file takes the owner's slot name on
-        # attach (locked naming in exports); shared files are never renamed
+        # an UNREFERENCED file takes the target owner's slot name on attach
+        # (locked naming in exports) -- this covers BOTH crop-style temp names
+        # AND final-convention names that embed ANOTHER question's id (user
+        # case: image moved manually, but its name still says "OBG-009-010").
+        # A file with other owners is never renamed (rename would break them).
         eff = file
-        if re.search(r"-p\d+-", file) and not refs:
+        is_crop = bool(re.search(r"-p\d+-", file))
+        fm = re.match(r"^([^/]+)/\1-(\d{3})-(\d{3})_[A-Z0-9_]+_\d{2}\.webp$", file)
+        other_owner_named = fm and f"{fm.group(1)}-{fm.group(2)}-{fm.group(3)}" != q_id
+        if not refs and (is_crop or other_owner_named):
             kind = _KIND_FOR[side]
             letter = f"{kind}_{option_letter.upper()}" if side == "option" else kind
             slot = _next_slot(out_root, subject, q_id, letter)
@@ -1675,10 +1681,15 @@ def apply_image_op(output_root, q_id: str, op: str, file: str,
                 "page": int(pm.group(1)) if pm else None,
                 "file": file, "owner": q_id, "slot": side,
                 "method": "human_edit",
-                "evidence": f"human attached crop {file} (review queue)",
+                "evidence": f"human attached crop {file} (review queue)"
+                            if is_crop else
+                            f"human re-owned {file} (name embedded another question; renamed to match true owner)",
                 "confidence": "high", "outcome": "claimed",
                 "ts": _now(), "obj_id": None, "final_file": new_name})
             eff = new_name
+        else:
+            if fm and other_owner_named and refs:
+                pass  # shared file: name stays, both owners ride it
         changed = _update_image_lists(out_root, q_id, side, option_letter,
                                       eff, add=True)
         _rebuild_manifest(out_root, subject, chap, _ledger_page_map(out_root))

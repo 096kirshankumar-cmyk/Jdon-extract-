@@ -695,3 +695,32 @@ class TestNumericDrift(QEnv):
         flags_by, _ = qv.validate_deterministic(self.root, page_text_provider_of_row=prov)
         kinds = [f["kind"] for f in flags_by.get(CH, [])]
         self.assertIn("numeric_drift_suspect", kinds)
+
+
+class TestAttachRenamesAlienNamedFile(QEnv):
+    """Final-convention file whose NAME embeds another q ("OBG-009-010_*")
+    re-owned to someone else gets renamed to the true owner (user case: moved
+    manually, name still said the old owner)."""
+    def test_alien_name_renamed_on_attach(self):
+        from PIL import Image as I
+        import io
+        f = f"{SUB}/{CH}-p70-9.webp"   # crop style
+        (self.root / "assets" / "questions" / SUB / f"{CH}-p70-9.webp").write_bytes(b"x"*3000)
+        # make it look final-convention but for a DIFFERENT q in same chapter:
+        alien = f"{SUB}/{SUB}-003-999_SOL_01.webp"  # CH-003? careful: file name embedded owner
+        # easier: name it for q2 while we attach to q1:
+        alien = f"{SUB}/{CH}-002_SOL_01.webp"
+        (self.root / "assets" / "questions" / SUB / f"{CH}-002_SOL_01.webp").write_bytes(b"x"*3000)
+        # q2's fixture row references this file via solution_images; un-reference
+        # it so the file is truly unclaimed for the test
+        for m in self.masters:
+            m["solution"]["images"] = [i for i in (m["solution"]["images"] or [])
+                                       if i.get("file") != alien]
+        self._write_masters(self.masters)
+        # q2 does NOT reference it (we simulate orphan-with-final-name):
+        res = rq.apply_image_op(self.root, f"{CH}-001", "attach", alien,
+                                side="solution", reason="renamed alien")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["new_file"], f"{SUB}/{CH}-001_SOL_01.webp")
+        st = rq.image_status(self.root, res["new_file"])
+        self.assertEqual(st["owners"], [f"{CH}-001"])
