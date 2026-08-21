@@ -1723,11 +1723,23 @@ document.querySelectorAll('.att-pick').forEach(function(l){
 // ---- optimistic AJAX for all queue-card actions (no full reload) --------
 function rq_dec(id, delta){var e=document.getElementById(id);if(!e)return;var n=parseInt(e.textContent||'0',10);e.textContent=Math.max(0,n+delta);}
 function rq_flash(form, txt, okc){var old=form.querySelector('.rq-fl');var f=document.createElement('span');f.className='rq-fl text-[11px] '+(okc?'text-emerald-700':'text-red-600');f.textContent=txt;if(old)old.replaceWith(f);else form.appendChild(f);setTimeout(function(){f.remove()},2400);}
+// clicked submit-button tracker: new FormData(form) never includes the
+// button that fired the submit, so buttons like name="action" (Approve/Skip)
+// vanished from the AJAX body and the server got '' -> 'bad action'. Remember
+// the last clicked named button and append it manually BEFORE posting.
+var rq_lastBtn = null;
+document.addEventListener('click', function(ev){
+  var b = ev.target && ev.target.closest ? ev.target.closest('button[name]') : null;
+  if (b) rq_lastBtn = b;
+}, true);
 document.addEventListener('submit', function(ev){
   var form=ev.target;
   if(!form.classList || !form.classList.contains('qact')) return;
   ev.preventDefault();
-  var fd=new FormData(form); fd.append('ajax','1');
+  var fd=new FormData(form);
+  if (rq_lastBtn && form.contains(rq_lastBtn) && rq_lastBtn.name)
+    fd.append(rq_lastBtn.name, rq_lastBtn.value);
+  fd.append('ajax','1');
   var card=form.closest('[data-card]');
   var mode=form.getAttribute('data-opt')||'stay';
   if(mode==='hide' && card){card.style.opacity='0.35';card.style.pointerEvents='none';}

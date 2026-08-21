@@ -465,3 +465,16 @@ class TestFormActionShadowGuard(unittest.TestCase):
         bad = _re.findall(r"form\.action\b", code)
         self.assertEqual(bad, [], "form.action (property) is shadowed by "
                             "name=action; use form.getAttribute('action')")
+
+
+class TestSubmitterButtonInAjax(Routes):
+    def test_js_appends_clicked_button_name_value(self):
+        """Buttons named 'action' do NOT ride along in `new FormData(form)`
+        (only the clicked submitter ever would) -- the AJAX decision arrived
+        as '' server-side ('bad action' toast the user saw). Source-locked:
+        the handler must track+append the last clicked button."""
+        src = open('app.py', encoding='utf-8').read()
+        self.assertIn('button[name]', src)        # click tracker exists
+        self.assertIn('rq_lastBtn', src)
+        self.assertIn('fd.append(rq_lastBtn.name, rq_lastBtn.value)', src)
+        self.assertIn('form.contains(rq_lastBtn)', src)   # cross-form guard
