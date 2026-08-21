@@ -6,6 +6,7 @@ in setUp redirects the whole review stack at a temp output root regardless of
 import order in a combined suite run.
 """
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -379,3 +380,44 @@ class TestBulkAndBack(Routes):
             "flag_keys": json.dumps(keys), "action": "ignored",
             "back": "/review?kind=unmatched_images&sev=REVIEW"})
         self.assertIn("kind=unmatched_images", r.headers["Location"])
+
+
+class TestAjaxAndPaged(Routes):
+    def test_decide_ajax_returns_json_no_redirect(self):
+        d = self.tmp / "data"
+        (d / "unmatched_images.jsonl").write_text(json.dumps(
+            {"chapter_id": CH, "q_no": 1, "detail": "img unclaimed"}) + "\n")
+        import review_queue as rq
+        q = rq.collect_review_queue(self.tmp)
+        keys = [x["flag_key"] for x in q["rows"]]
+        r = self.client.post("/review-decide",
+                             data={"flag_keys": json.dumps(keys),
+                                   "action": "ignored", "ajax": "1"})
+        self.assertEqual(r.status_code, 200)               # JSON, NOT a 302
+        j = r.get_json()
+        self.assertTrue(j["ok"])
+        # and the OLD path still redirects (no ajax field)
+        r2 = self.client.post("/review-decide",
+                              data={"flag_keys": json.dumps([]), "action": "ignored"})
+        self.assertEqual(r2.status_code, 302)
+
+    def test_pagination_bounds_and_links(self):
+        # 27 DISTINCT cards (27 q_nos) -> exactly 2 pages (25 + 2)
+        import review_queue as rq
+        d = self.tmp / "data"
+        with open(d / "unmatched_images.jsonl", "w") as fh:
+            for i in range(1, 28):
+                fh.write(json.dumps({"chapter_id": CH, "q_no": i,
+                                     "detail": f"img {i} unclaimed"}) + "\n")
+        q = rq.collect_review_queue(self.tmp)
+        cards = rq.group_review_rows(self.tmp, q["rows"], {})
+        self.assertGreater(len(cards), 25)        # fixture makes >1 page
+        def ids(resp):
+            dcd = resp.data.decode()
+            return set(re.findall(r'<span class="font-mono font-bold">([^<]+)</span>', dcd))
+        r1 = self.client.get("/review")
+        r2 = self.client.get("/review?pg=2")
+        a, b = ids(r1), ids(r2)
+        self.assertTrue(a and b)
+        self.assertFalse(a & b)                   # pages never repeat cards
+        self.assertIn(b"next", r1.data)           # pager visible
