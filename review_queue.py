@@ -560,6 +560,23 @@ def _page_watermark_ids(pdf_path):
     return _WM_ID_CACHE[key]
 
 
+_PDF_READERS = {}
+
+
+def _pdf_reader(path):
+    """One PdfReader per book per process -- without it every page probe
+    re-parses an ~890-page PDF (seconds each). This was the real reload drag."""
+    key = str(path)
+    r = _PDF_READERS.get(key)
+    if r is None:
+        from pypdf import PdfReader
+        r = PdfReader(str(path))
+        if len(_PDF_READERS) > 2:
+            _PDF_READERS.pop(next(iter(_PDF_READERS)))   # bounded (LRU-ish)
+        _PDF_READERS[key] = r
+    return r
+
+
 def _page_has_raster_image(pdf_path, page):
     """True iff this file page carries at least one NON-watermark raster image
     (Marrows scan books embed figures as raster objects). Zero objects on the
@@ -617,7 +634,52 @@ def _auto_prove_no_figure(output_root, flag, books_dir):
     return None
 
 
+_QCACHE = {}
+
+
+def _root_signature(out):
+    """(mtime_ns, size) of every thing the queue reads. Any decision/edit/
+    pipeline write bumps it -> cache naturally invalidates; no change ->
+    identical queue served instantly."""
+    out = Path(out)
+    sig = []
+    dd = out / "data"
+    if dd.exists():
+        for p in sorted(dd.glob("*.jsonl")) + sorted(dd.glob("*.json")):
+            try:
+                st = p.stat()
+                sig.append((p.name, st.st_mtime_ns, st.st_size))
+            except OSError:
+                continue
+    cj = out / "subjects"
+    if cj.exists():
+        for p in sorted(cj.rglob("*.jsonl"))[:400]:
+            try:
+                st = p.stat()
+                sig.append((str(p.relative_to(out)), st.st_mtime_ns, st.st_size))
+            except OSError:
+                continue
+    return sig
+
+
 def collect_review_queue(output_root, books_dir=None) -> dict:
+    out = Path(output_root)
+    key = str(out)
+    sig = _root_signature(out)
+    hit = _QCACHE.get(key)
+    if hit and hit[0] == sig and not _force_fresh:
+        return hit[1]
+    res = _collect_review_queue_uncached(out, books_dir)
+    if len(_QCACHE) > 3:
+        _QCACHE.pop(next(iter(_QCACHE)))
+    _QCACHE[key] = (sig, res)
+    return res
+
+
+_force_fresh = False
+
+
+def _collect_review_queue_uncached(output_root, books_dir=None) -> dict:
     """Read EVERYTHING and return the normalized queue. See contract 2/3."""
     out_root = Path(output_root)
     data = out_root / "data"

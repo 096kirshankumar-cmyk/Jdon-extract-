@@ -1418,9 +1418,8 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
     {% endif %}
     {% for sn in r.stale_notes %}<p class="text-xs text-orange-600 font-semibold">♻️ {{ sn }}</p>{% endfor %}
 
-    <div class="text-[11px]">📄 book page(s):
-    {% for p in r.pages %}<a class="text-sky-700 underline font-mono" target="_blank" href="/review/page?subject={{ r.subject }}&p={{ p }}">{{ p }}</a>{{ ' ' }}{% endfor %}
-    <span class="text-gray-400">(book page kholo aur compare karo)</span></div>
+    <div class="text-[11px]">📄 source page(s): <b class="font-mono">{{ r.pages|join(' ') }}</b>
+    <span class="text-gray-400">(apni PDF me ye number kholo)</span></div>
 
     {% set v = views.get(r.flag_keys[0], {}) %}
     {% if r.images %}
@@ -1445,7 +1444,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
     {% endif %}
     {% for ov in r.orphan %}
     <div class="border border-amber-300 bg-amber-50 rounded p-2 text-[11px]">
-      <b>📦 Unclaimed fragment (pipeline ne kisi ko diYA NAHI — sab tools ne isi ko flag kiya):</b>
+      <b>📦 Unclaimed fragment (pipeline ne kisi ko diYA NAHI) {% if ov.orphan.pages %} — pages: <span class="font-mono">{{ ov.orphan.pages|join(' ') }}</span>{% endif %}</b>
       <div class="whitespace-pre-wrap mt-1">{{ ov.orphan.text }}</div>
       {% if ov.owner_qid %}
       <div class="mt-2 border-t border-amber-300 pt-1">
@@ -1638,7 +1637,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
               <label class="att-pick shrink-0 border-2 border-transparent rounded p-1 text-center cursor-pointer hover:border-emerald-500" data-f="{{ u.f }}">
                 <img src="/review/img?f={{ u.f }}" loading="lazy" style="max-height:90px" class="rounded">
                 <span class="font-mono block">{{ u.f.split('/')[-1] }}</span>
-                {% if u.page %}<a class="text-sky-700 underline" target="_blank" href="/review/page?subject={{ m.subject }}&p={{ u.page }}">book p{{ u.page }}</a>{% endif %}
+                {% if u.page %}(book p{{ u.page }}){% endif %}
               </label>
               {% else %}
               <span class="text-gray-400 p-1">(is subject ka koi unclaimed image nahi)</span>
@@ -2184,7 +2183,7 @@ img.big{max-width:100%;border:1px solid #94a3b8;border-radius:8px;background:#ff
 {% if fstat %}
 <div class="bg-white rounded shadow p-3 text-xs space-y-1 border-l-4 border-indigo-500">
   <b>🖼️ File status:</b> <span class="font-mono">{{ fstat.file }}</span>
-  <div>disk pe hai: <b>{{ 'haan' if fstat.exists_on_disk else 'NAHI' }}</b>{% if fstat.page %} · book page: <a class="text-sky-700 underline" target="_blank" href="/review/page?subject={{ fstat.file.split('/')[0] }}&p={{ fstat.page }}">{{ fstat.page }}</a>{% endif %}</div>
+  <div>disk pe hai: <b>{{ 'haan' if fstat.exists_on_disk else 'NAHI' }}</b>{% if fstat.page %} · book page: <b class="font-mono">{{ fstat.page }}</b>{% endif %}</div>
   <div class="text-sm">current owner(s): <b class="font-mono">{{ fstat.owners|join(', ') if fstat.owners else '❌ KISI KO NAHI (unlinked)' }}</b></div>
   <div><img class="big" src="/review/img?f={{ fstat.file }}"></div>
 </div>
@@ -2195,7 +2194,7 @@ img.big{max-width:100%;border:1px solid #94a3b8;border-radius:8px;background:#ff
   <div class="flex flex-wrap gap-2 items-center">
     <span class="font-mono font-bold text-base">{{ m.id }}</span>
     <span class="text-xs bg-gray-200 rounded px-1">qa: {{ m.qa }}</span>
-    <span class="text-xs">pages: {% for p in m.pages %}<a class="text-sky-700 underline" target="_blank" href="/review/page?subject={{ m.subject }}&p={{ p }}">{{ p }}</a> {% endfor %}</span>
+    <span class="text-xs">pages: <b class="font-mono">{{ m.pages|join(' ') }}</b></span>
     <a class="text-xs text-sky-700 underline" href="/review?chapter={{ m.chapter_id }}">is chapter ki queue →</a>
   </div>
   {% if m.qa_reasons %}<div class="text-[11px] text-amber-700">⚠ {{ m.qa_reasons|join('; ') }}</div>{% endif %}
