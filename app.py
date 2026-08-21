@@ -229,7 +229,12 @@ def run_validator_and_log():
     """Zero-token deterministic validation; every flag printed to the
     dashboard log box so no terminal is needed. Returns the report dict."""
     import qbank_validator
-    rep = qbank_validator.run_hybrid(pipeline.OUTPUT_ROOT, audit=False)
+    try:
+        provider = qbank_validator.default_page_text_provider(INPUT_META_DIR)
+    except Exception:
+        provider = None
+    rep = qbank_validator.run_hybrid(pipeline.OUTPUT_ROOT, audit=False,
+                                     page_text_provider=provider)
     s = rep["summary"]
     log(f"🧪 Validator: {s['flags_total']} flag(s) across "
         f"{s['flagged_chapters']}/{s['chapters']} chapters ({s['questions']} questions)")
@@ -345,7 +350,12 @@ def run_pipeline_thread(subject_code, pdf_path, page_offset):
         # unmatched-image sidecars) lands in data/validation_report.json.
         try:
             import qbank_validator
-            rep = qbank_validator.run_hybrid(pipeline.OUTPUT_ROOT, audit=False)
+            try:
+                provider = qbank_validator.default_page_text_provider(INPUT_META_DIR)
+            except Exception:
+                provider = None
+            rep = qbank_validator.run_hybrid(pipeline.OUTPUT_ROOT, audit=False,
+                                             page_text_provider=provider)
             log(f"🧪 Validation: {rep['summary']['flags_total']} flag(s) across "
                 f"{rep['summary']['flagged_chapters']}/{rep['summary']['chapters']} chapters → "
                 f"see data/validation_report.json")
@@ -1338,10 +1348,10 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
 
   <div class="sticky top-0 z-20 bg-gray-100 pb-2 -mx-3 px-3 pt-1 shadow-sm">
   <div class="bg-white rounded shadow p-3 text-sm flex gap-4 flex-wrap">
-    <span>🏷️ <b>{{ rows|length }}</b> issues <span class="text-gray-400">({{ n_raw_flags }} flags)</span></span>
-    <span>🔴 <b>{{ counts.blocker }}</b> blocker</span>
-    <span>🟡 <b>{{ counts.review }}</b> review</span>
-    <span>✅ <b>{{ counts.resolved }}</b> resolved</span>
+    <span id="cnt-issues-wrap">🏷️ <b id="cnt-issues">{{ rows|length }}</b> issues <span class="text-gray-400">(<span id="cnt-flags">{{ n_raw_flags }}</span> flags)</span></span>
+    <span>🔴 <b id="cnt-blocker">{{ counts.blocker }}</b> blocker</span>
+    <span>🟡 <b id="cnt-review">{{ counts.review }}</b> review</span>
+    <span>✅ <b id="cnt-resolved">{{ counts.resolved }}</b> resolved</span>
     {% if counts.auto_resolved %}<span title="ye flags ab galat nahi hain (jaise image ab attached) -- self-verify hoke band hue">🤖 <b>{{ counts.auto_resolved }}</b> auto-resolved</span>{% endif %}
   </div>
 
@@ -1382,7 +1392,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
     <span class="text-gray-400">(bar upar chipki rahegi)</span>
   </form>
   {% if rows %}
-  <form method="POST" action="/review/decide-bulk" class="bg-amber-50 border border-amber-300 rounded p-2 text-xs flex flex-wrap gap-2 items-center"
+  <form method="POST" action="/review/decide-bulk" class="qact bg-amber-50 border border-amber-300 rounded p-2 text-xs flex flex-wrap gap-2 items-center" data-opt="hide-all"
        onsubmit="return confirm('{{ rows|length }} issue(s) ke saare flags par ye action lagega. Pakka?')">
     <input type="hidden" name="chapter" value="{{ sel_chapter }}">
     <input type="hidden" name="kind" value="{{ sel_kind }}">
@@ -1401,7 +1411,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
   {% if r.chapter_id != last_ch[0] %}{% set _ = last_ch.pop() %}{% set _ = last_ch.append(r.chapter_id) %}
   <h2 class="text-sm font-bold text-slate-600 pt-3">📖 {{ r.chapter_id or '—' }}</h2>
   {% endif %}
-  <div class="bg-white rounded shadow p-3 space-y-2 border-l-4 {{ 'border-red-500' if r.severity == 'BLOCKER' else 'border-amber-400' }}">
+  <div data-card data-sev="{{ r.severity }}" class="bg-white rounded shadow p-3 space-y-2 border-l-4 {{ 'border-red-500' if r.severity == 'BLOCKER' else 'border-amber-400' }}">
     <div class="flex flex-wrap items-center gap-2 text-xs">
       <span class="font-bold {{ 'text-red-700' if r.severity == 'BLOCKER' else 'text-amber-700' }}">{{ r.severity }}</span>
       <span class="font-mono font-bold">{{ r.q_id or r.chapter_id or '—' }}</span>
@@ -1412,9 +1422,10 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
     <div class="text-[11px] bg-sky-50 border border-sky-200 rounded p-1">💡 {{ r.guide }}</div>
     {% for d in r.details %}{% if loop.first %}<p class="text-xs text-gray-700 whitespace-pre-wrap">{{ d.detail }}</p>{% endif %}{% endfor %}
     {% if r.details|length > 1 %}
-    <details class="text-[11px]"><summary class="cursor-pointer text-gray-500">🔁 same issue, {{ r.details|length }} sources — sab reports:</summary>
-      {% for d in r.details %}<p class="text-gray-600 whitespace-pre-wrap border-t pt-1 mt-1">[{{ d.kind }} · {{ d.source }}] {{ d.detail }}</p>{% endfor %}
-    </details>
+    <div class="text-[11px] text-gray-500">↔ same issue seen by:
+      {% for d in r.details[1:] %}<span class="bg-gray-200 rounded px-1">{{ d.kind }} · {{ d.source }}</span> {% endfor %}
+      <span class="text-gray-400">(text same, repeat nahi dikhaya)</span>
+    </div>
     {% endif %}
     {% for sn in r.stale_notes %}<p class="text-xs text-orange-600 font-semibold">♻️ {{ sn }}</p>{% endfor %}
 
@@ -1428,7 +1439,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
       <div class="border rounded p-1 bg-gray-50">
         <img class="thumb" loading="lazy" src="/review/img?f={{ im }}">
         <div class="text-[10px] font-mono break-all text-gray-500">{{ im }} — <a class="text-sky-700 underline" href="/review/lookup?f={{ im }}">🔎 lookup</a></div>
-        <form method="POST" action="/review/apply-image" class="flex flex-wrap gap-1 items-center mt-1">
+        <form method="POST" action="/review/apply-image" class="qact flex flex-wrap gap-1 items-center mt-1" data-opt="stay">>
           <input type="hidden" name="op" value="attach">
           <input type="hidden" name="file" value="{{ im }}">
           <input name="q_id" placeholder="owner q_id (jaise OBG-003-009)" class="border rounded px-1 py-0.5 text-[11px] font-mono flex-1 min-w-32">
@@ -1467,7 +1478,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
         {% if ov.already_inside %}
         <div class="mt-1 text-red-700 font-semibold">⚠️ Ye text uski solution me ALREADY maujood lagta hai (extra copy). Merge MAT karo — bas Ignore.</div>
         {% else %}
-        <form method="POST" action="/review/attach-orphan" class="mt-1 flex flex-wrap gap-1 items-center">
+        <form method="POST" action="/review/attach-orphan" class="qact mt-1 flex flex-wrap gap-1 items-center" data-opt="hide">>
           <input type="hidden" name="chapter_id" value="{{ r.chapter_id }}">
           <input type="hidden" name="frag_key" value="{{ ov.frag_key }}">
           <input type="hidden" name="flag_key" value="{{ r.flag_keys[0] }}">
@@ -1489,7 +1500,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
     </div>
     {% endif %}
 
-    <form method="POST" action="/review-decide" class="flex flex-wrap gap-2 items-center">
+    <form method="POST" action="/review-decide" class="qact flex flex-wrap gap-2 items-center" data-opt="hide">
       <input type="hidden" name="flag_keys" value='{{ r.flag_keys_json }}'>
       <input type="hidden" name="q_id" value="{{ r.q_id or '' }}">
       <input type="hidden" name="back" value="{{ self_qs }}">
@@ -1512,7 +1523,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
     <details class="text-xs bg-gray-50 rounded p-2">
       <summary class="font-bold cursor-pointer">✏️ Edit content of {{ r.q_id }}</summary>
       <div class="space-y-2 mt-2">
-        <form method="POST" action="/review/apply-text">
+        <form method="POST" action="/review/apply-text" class="qact" data-opt="stay">
           <input type="hidden" name="q_id" value="{{ r.q_id }}">
           <input type="hidden" name="field" value="question_text">
           <label class="font-semibold">Stem</label>
@@ -1521,7 +1532,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
           <button class="bg-sky-600 text-white px-2 py-1 rounded mt-1">Save stem</button>
         </form>
         {% for o in m.options %}
-        <form method="POST" action="/review/apply-text" class="flex gap-1 items-center">
+        <form method="POST" action="/review/apply-text" class="qact flex gap-1 items-center" data-opt="stay">>
           <input type="hidden" name="q_id" value="{{ r.q_id }}">
           <input type="hidden" name="field" value="option">
           <input type="hidden" name="option_letter" value="{{ o.id }}">
@@ -1531,7 +1542,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
           <button class="bg-sky-600 text-white px-2 py-1 rounded whitespace-nowrap">Save {{ o.id }}</button>
         </form>
         {% endfor %}
-        <form method="POST" action="/review/apply-text" class="flex gap-2 items-center">
+        <form method="POST" action="/review/apply-text" class="qact flex gap-2 items-center" data-opt="stay">>
           <input type="hidden" name="q_id" value="{{ r.q_id }}">
           <input type="hidden" name="field" value="correct_option">
           <label class="font-semibold">Answer</label>
@@ -1548,7 +1559,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
         <div class="border rounded p-1">
           <div class="rtd overflow-x-auto">{{ t.markdown | mdtable | safe }}</div>
           <details><summary class="text-gray-500 cursor-pointer">markdown source</summary>
-          <form method="POST" action="/review/apply-text">
+          <form method="POST" action="/review/apply-text" class="qact" data-opt="stay">
             <input type="hidden" name="q_id" value="{{ r.q_id }}">
             <input type="hidden" name="field" value="table">
             <input type="hidden" name="table_index" value="{{ loop.index0 }}">
@@ -1556,7 +1567,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
             <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 w-full">
             <button class="bg-sky-600 text-white px-2 py-1 rounded mt-1">Save table {{ loop.index }}</button>
           </form></details>
-          <form method="POST" action="/review/apply-text" onsubmit="return confirm('Table {{ loop.index }} delete karein? (undo nahi)')">
+          <form method="POST" action="/review/apply-text" class="qact" data-opt="stay" onsubmit="return confirm('Table {{ loop.index }} delete karein? (undo nahi)')">
             <input type="hidden" name="q_id" value="{{ r.q_id }}">
             <input type="hidden" name="field" value="table_delete">
             <input type="hidden" name="table_index" value="{{ loop.index0 }}">
@@ -1569,14 +1580,14 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
         <div class="border rounded p-1">
           <div class="rtd overflow-x-auto">{{ t.markdown | mdtable | safe }}</div>
           <details><summary class="text-gray-500 cursor-pointer">markdown source</summary>
-          <form method="POST" action="/review/apply-text">
+          <form method="POST" action="/review/apply-text" class="qact" data-opt="stay">
             <input type="hidden" name="q_id" value="{{ r.q_id }}">
             <input type="hidden" name="field" value="table_q">
             <input type="hidden" name="table_index" value="{{ loop.index0 }}">
             <textarea name="value" class="w-full font-mono border rounded p-1" rows="4">{{ t.markdown }}</textarea>
             <button class="bg-sky-600 text-white px-2 py-1 rounded mt-1">Save Q-table {{ loop.index }}</button>
           </form></details>
-          <form method="POST" action="/review/apply-text" onsubmit="return confirm('Q-table {{ loop.index }} delete karein?')">
+          <form method="POST" action="/review/apply-text" class="qact" data-opt="stay" onsubmit="return confirm('Q-table {{ loop.index }} delete karein?')">
             <input type="hidden" name="q_id" value="{{ r.q_id }}">
             <input type="hidden" name="field" value="table_q_delete">
             <input type="hidden" name="table_index" value="{{ loop.index0 }}">
@@ -1586,7 +1597,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
         </div>
         {% endfor %}
         {% for side_field, side_label, side_tabs in [('table', 'solution', (m.solution.tables or [])), ('table_q', 'question', (m.question.tables or []))] %}
-        <form method="POST" action="/review/apply-text" class="border-t pt-1">
+        <form method="POST" action="/review/apply-text" class="qact border-t pt-1" data-opt="stay">>
           <input type="hidden" name="q_id" value="{{ r.q_id }}">
           <input type="hidden" name="field" value="{{ side_field }}">
           <input type="hidden" name="table_index" value="{{ side_tabs|length }}">
@@ -1597,7 +1608,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
         </form>
         {% endfor %}
 
-        <form method="POST" action="/review/apply-text">
+        <form method="POST" action="/review/apply-text" class="qact" data-opt="stay">
           <input type="hidden" name="q_id" value="{{ r.q_id }}">
           <input type="hidden" name="field" value="solution_text">
           <label class="font-semibold">Solution</label>
@@ -1613,7 +1624,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
           <div class="border rounded p-1 bg-white">
             <img class="thumb" loading="lazy" src="/review/img?f={{ im.file }}">
             <div class="text-[10px] font-mono break-all text-gray-500">{{ im.file }} — <a class="text-sky-700 underline" href="/review/lookup?f={{ im.file }}">🔎 lookup</a></div>
-            <form method="POST" action="/review/apply-image" class="flex flex-wrap gap-1 items-center text-[11px] mt-1">
+            <form method="POST" action="/review/apply-image" class="qact flex flex-wrap gap-1 items-center text-[11px] mt-1" data-opt="stay">>
               <input type="hidden" name="q_id" value="{{ r.q_id }}">
               <input type="hidden" name="file" value="{{ im.file }}">
               <input type="hidden" name="side" value="{{ side }}">
@@ -1627,7 +1638,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
           </div>
           {% endfor %}
           {% endfor %}
-          <form method="POST" action="/review/apply-image" class="text-[11px] space-y-1">
+          <form method="POST" action="/review/apply-image" class="qact text-[11px] space-y-1" data-opt="stay">>
             <input type="hidden" name="q_id" value="{{ r.q_id }}">
             <input type="hidden" name="op" value="attach">
             <input type="hidden" name="file" class="att-file" value="">
@@ -1653,7 +1664,7 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
               <button class="bg-emerald-600 text-white px-2 py-0.5 rounded">Attach</button>
             </div>
           </form>
-          <form method="POST" action="/review/upload-image" enctype="multipart/form-data" class="flex flex-wrap gap-1 items-center text-[11px]">
+          <form method="POST" action="/review/upload-image" enctype="multipart/form-data" class="qact flex flex-wrap gap-1 items-center text-[11px]" data-opt="stay">>
             <input type="hidden" name="q_id" value="{{ r.q_id }}">
             <span class="font-semibold">📤 ya manually upload karo (figure extract hi nahi hui toh):</span>
             <input type="file" name="image" accept="image/*" class="border rounded px-1 py-0.5 flex-1 min-w-32">
@@ -1668,6 +1679,16 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
   </div>
   {% endfor %}
 
+  {% if pager.pages > 1 %}
+  <div class="bg-white rounded shadow p-2 text-xs flex gap-2 items-center justify-between sticky bottom-0">
+    {% set qs = '&chapter=' ~ (sel_chapter or '') ~ '&kind=' ~ (sel_kind or '') ~ '&sev=' ~ (sel_sev or '') %}
+    <span>Page {{ pager.pg }}/{{ pager.pages }} — {{ pager.total }} issue(s) total</span>
+    <span>
+      {% if pager.pg > 1 %}<a class="bg-slate-700 text-white px-2 py-1 rounded" href="/review?pg={{ pager.pg - 1 }}{{ qs }}">← prev</a>{% endif %}
+      {% if pager.pg < pager.pages %}<a class="bg-slate-700 text-white px-2 py-1 rounded" href="/review?pg={{ pager.pg + 1 }}{{ qs }}">next →</a>{% endif %}
+    </span>
+  </div>
+  {% endif %}
   <p class="text-[10px] text-gray-500 text-center pb-6">State lives in data/review_decisions.jsonl + human_edit_ledger.jsonl — refresh/redeploy safe.</p>
 </div>
 <script>
@@ -1693,6 +1714,41 @@ document.querySelectorAll('.att-pick').forEach(function(l){
     ev.preventDefault();
   });
 });
+// ---- optimistic AJAX for all queue-card actions (no full reload) --------
+function rq_dec(id, delta){var e=document.getElementById(id);if(!e)return;var n=parseInt(e.textContent||'0',10);e.textContent=Math.max(0,n+delta);}
+function rq_flash(form, txt, okc){var old=form.querySelector('.rq-fl');var f=document.createElement('span');f.className='rq-fl text-[11px] '+(okc?'text-emerald-700':'text-red-600');f.textContent=txt;if(old)old.replaceWith(f);else form.appendChild(f);setTimeout(function(){f.remove()},2400);}
+document.addEventListener('submit', function(ev){
+  var form=ev.target;
+  if(!form.classList || !form.classList.contains('qact')) return;
+  ev.preventDefault();
+  var fd=new FormData(form); fd.append('ajax','1');
+  var card=form.closest('[data-card]');
+  var mode=form.getAttribute('data-opt')||'stay';
+  if(mode==='hide' && card){card.style.opacity='0.35';card.style.pointerEvents='none';}
+  rq_flash(form,'…',false);
+  fetch(form.action,{method:'POST',body:fd}).then(function(r){return r.json()})
+   .then(function(j){
+     if(j.ok){
+       if(mode==='hide'&&card){
+         card.style.transition='opacity .25s';card.style.opacity='0.12';
+         card.style.filter='grayscale(1)';
+         var sev=card.getAttribute('data-sev');
+         rq_dec(sev==='BLOCKER'?'cnt-blocker':'cnt-review',-1);
+         rq_dec('cnt-resolved',1);rq_dec('cnt-flags',-1);
+         rq_flash(form,'✅ '+ (j.msg||'saved'),true);
+       }else if(mode==='hide-all'){
+         document.querySelectorAll('[data-card]').forEach(function(c){c.style.opacity='0.12';c.style.filter='grayscale(1)';});
+         location.href=(form.querySelector('input[name=back]')||{}).value||'/review';
+         return;
+       }
+       rq_flash(form,'✅ '+(j.msg||'saved'),true);
+     }else{
+       if(card){card.style.opacity='1';card.style.pointerEvents='auto';}
+       rq_flash(form,'❌ '+(j.msg||'failed'),false);
+     }
+   }).catch(function(e){if(card){card.style.opacity='1';card.style.pointerEvents='auto';}rq_flash(form,'❌ network/server error',false);});
+});
+
 // attach with no thumbnail picked -> block before the server round-trip
 document.querySelectorAll('input.att-file').forEach(function(h){
   h.closest('form').addEventListener('submit', function(ev){
@@ -1774,7 +1830,17 @@ def review_home():
         rows = [r for r in rows if r.get("severity") == sel_sev]
     groups = review_queue.group_review_rows(pipeline.OUTPUT_ROOT, rows,
                                             ctx["views"])
-    return render_template_string(REVIEW_PAGE, rows=groups,
+    PAGE = 25
+    try:
+        pg = max(1, int(request.args.get("pg") or 1))
+    except ValueError:
+        pg = 1
+    total_pages = max(1, (len(groups) + PAGE - 1) // PAGE)
+    pg = min(pg, total_pages)
+    slice_ = groups[(pg - 1) * PAGE: pg * PAGE]
+    pager = {"pg": pg, "pages": total_pages, "total": len(groups), "per": PAGE}
+    return render_template_string(REVIEW_PAGE, rows=slice_,
+                                  pager=pager,
                                   n_raw_flags=len(rows),
                                   sel_chapter=sel_chapter, sel_kind=sel_kind,
                                   sel_sev=sel_sev, **{k: v for k, v in ctx.items()
@@ -1833,6 +1899,14 @@ def _review_redirect(result, ok_word="done"):
     ok = bool(result.get("ok"))
     msg = (result.get("msg") or ok_word) if ok else \
         ("FAILED: " + str(result.get("error") or "unknown"))
+    # AJAX path (optimistic UI): JSON, no page reload. Non-JS forms fall back
+    # to the redirect flow unchanged -- both supported forever.
+    if request.form.get("ajax") == "1" or \
+            "application/json" in (request.headers.get("Accept") or ""):
+        return jsonify({"ok": ok, "msg": msg,
+                        "verified": bool(result.get("verified", ok)),
+                        "result": {k: v for k, v in (result or {}).items()
+                                   if isinstance(v, (str, int, bool, list, dict))}})
     back = request.form.get("back") or ""
     if back.startswith("/review"):
         sep = "&" if "?" in back else "?"
@@ -1978,7 +2052,7 @@ def _edit_forms_html(q_id, row, unclaimed_by_subject, out, back=""):
     parts = [f"""
 <div class="space-y-2 text-xs border-t border-sky-200 pt-2">
   <div class="font-bold text-slate-600">✏️ Edit (bina flag bhi chalega)</div>
-  <form method="POST" action="/review/apply-text">
+  <form method="POST" action="/review/apply-text" class="qact" data-opt="stay">
     <input type="hidden" name="q_id" value="{q_id}">{b[0]}
     <input type="hidden" name="field" value="question_text">
     <label class="font-semibold">Stem</label>
@@ -1988,7 +2062,7 @@ def _edit_forms_html(q_id, row, unclaimed_by_subject, out, back=""):
   </form>"""]
     for o in row.get("options") or []:
         parts.append(f"""
-  <form method="POST" action="/review/apply-text" class="flex gap-1 items-center">
+  <form method="POST" action="/review/apply-text" class="qact flex gap-1 items-center" data-opt="stay">>
     <input type="hidden" name="q_id" value="{q_id}">{b[0]}
     <input type="hidden" name="field" value="option">
     <input type="hidden" name="option_letter" value="{o.get('id')}">
@@ -1997,7 +2071,7 @@ def _edit_forms_html(q_id, row, unclaimed_by_subject, out, back=""):
     <button class="bg-sky-600 text-white px-2 py-1 rounded">Save {o.get('id')}</button>
   </form>""")
     parts.append(f"""
-  <form method="POST" action="/review/apply-text" class="flex gap-2 items-center">
+  <form method="POST" action="/review/apply-text" class="qact flex gap-2 items-center" data-opt="stay">>
     <input type="hidden" name="q_id" value="{q_id}">{b[0]}
     <input type="hidden" name="field" value="correct_option">
     <label class="font-semibold">Answer</label>
@@ -2005,7 +2079,7 @@ def _edit_forms_html(q_id, row, unclaimed_by_subject, out, back=""):
     <input name="reason" placeholder="why" class="border rounded px-1 py-0.5 flex-1">
     <button class="bg-sky-600 text-white px-2 py-0.5 rounded">Save answer</button>
   </form>
-  <form method="POST" action="/review/apply-text">
+  <form method="POST" action="/review/apply-text" class="qact" data-opt="stay">
     <input type="hidden" name="q_id" value="{q_id}">{b[0]}
     <input type="hidden" name="field" value="solution_text">
     <label class="font-semibold">Solution</label>
@@ -2019,14 +2093,14 @@ def _edit_forms_html(q_id, row, unclaimed_by_subject, out, back=""):
   <div class="border rounded p-1">
     <div class="rtd overflow-x-auto">{review_queue.md_to_html(t.get("markdown"))}</div>
     <details><summary class="text-gray-500 cursor-pointer">markdown</summary>
-    <form method="POST" action="/review/apply-text">
+    <form method="POST" action="/review/apply-text" class="qact" data-opt="stay">
       <input type="hidden" name="q_id" value="{q_id}">{b[0]}
       <input type="hidden" name="field" value="{side_field}">
       <input type="hidden" name="table_index" value="{i}">
       <textarea name="value" class="w-full font-mono border rounded p-1" rows="3">{_esc(t.get("markdown"))}</textarea>
       <button class="bg-sky-600 text-white px-2 py-1 rounded mt-1">Save {side_lbl} table {i+1}</button>
     </form></details>
-    <form method="POST" action="/review/apply-text" onsubmit="return confirm('delete {side_lbl} table {i+1}?')">
+    <form method="POST" action="/review/apply-text" class="qact" data-opt="stay" onsubmit="return confirm('delete {side_lbl} table {i+1}?')">
       <input type="hidden" name="q_id" value="{q_id}">{b[0]}
       <input type="hidden" name="field" value="{side_field}_delete">
       <input type="hidden" name="table_index" value="{i}">
@@ -2035,7 +2109,7 @@ def _edit_forms_html(q_id, row, unclaimed_by_subject, out, back=""):
     </form>
   </div>""")
         parts.append(f"""
-  <form method="POST" action="/review/apply-text" class="border-t border-dashed pt-1">
+  <form method="POST" action="/review/apply-text" class="qact border-t border-dashed pt-1" data-opt="stay">>
     <input type="hidden" name="q_id" value="{q_id}">{b[0]}
     <input type="hidden" name="field" value="{side_field}">
     <input type="hidden" name="table_index" value="{len(holder.get('tables') or [])}">
@@ -2053,7 +2127,7 @@ def _edit_forms_html(q_id, row, unclaimed_by_subject, out, back=""):
   <div class="border rounded p-1 bg-white">
     <img loading="lazy" src="/review/img?f={f}" style="max-height:140px" class="rounded">
     <div class="text-[10px] font-mono break-all text-gray-500">{f}</div>
-    <form method="POST" action="/review/apply-image" class="flex flex-wrap gap-1 items-center mt-1">
+    <form method="POST" action="/review/apply-image" class="qact flex flex-wrap gap-1 items-center mt-1" data-opt="stay">>
       <input type="hidden" name="q_id" value="{q_id}">{b[0]}
       <input type="hidden" name="file" value="{f}">
       <input type="hidden" name="side" value="{side}">
@@ -2069,7 +2143,7 @@ def _edit_forms_html(q_id, row, unclaimed_by_subject, out, back=""):
         opts = "".join(f"<option value='{_esc(u['f'])}'>{_esc(u['f'].split('/')[-1])} (p{u['page']})</option>"
                        for u in pool)
         parts.append(f"""
-  <form method="POST" action="/review/apply-image" class="flex flex-wrap gap-1 items-center">
+  <form method="POST" action="/review/apply-image" class="qact flex flex-wrap gap-1 items-center" data-opt="stay">>
     <input type="hidden" name="q_id" value="{q_id}">{b[0]}
     <input type="hidden" name="op" value="attach">
     <span>Attach📎:</span>
@@ -2079,7 +2153,7 @@ def _edit_forms_html(q_id, row, unclaimed_by_subject, out, back=""):
     <button class="bg-emerald-600 text-white px-2 py-0.5 rounded">Attach</button>
   </form>""")
     parts.append(f"""
-  <form method="POST" action="/review/upload-image" enctype="multipart/form-data" class="flex flex-wrap gap-1 items-center border-t border-dashed pt-1">
+  <form method="POST" action="/review/upload-image" enctype="multipart/form-data" class="qact flex flex-wrap gap-1 items-center border-t border-dashed pt-1" data-opt="stay">>
     <input type="hidden" name="q_id" value="{q_id}">{b[0]}
     <span class="font-semibold">📤 manual upload (pipeline ne nikali hi nahi ho toh):</span>
     <input type="file" name="image" accept="image/*" class="border rounded px-1 py-0.5 flex-1 min-w-40">
@@ -2214,7 +2288,7 @@ img.big{max-width:100%;border:1px solid #94a3b8;border-radius:8px;background:#ff
   {% for im in m.s_imgs %}<div><img class="big" src="/review/img?f={{ im }}"><div class="text-[10px] font-mono text-gray-500">{{ im }}</div></div>{% endfor %}
   {% for t in m.s_tables %}<div class="rtd overflow-x-auto">{{ t.markdown | mdtable | safe }}</div>{% endfor %}
   {% if fstat and fstat.exists_on_disk and m.id not in fstat.owners %}
-  <form method="POST" action="/review/apply-image" class="flex flex-wrap gap-1 items-center border-t pt-2 text-xs">
+  <form method="POST" action="/review/apply-image" class="qact flex flex-wrap gap-1 items-center border-t pt-2 text-xs" data-opt="stay">>
     <input type="hidden" name="q_id" value="{{ m.id }}">
     <input type="hidden" name="op" value="attach">
     <input type="hidden" name="file" value="{{ fstat.file }}">

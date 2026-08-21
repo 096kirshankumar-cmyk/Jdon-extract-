@@ -561,7 +561,57 @@ def is_answer_key_only(rows, min_share=ANSWER_KEY_ONLY_MIN_SHARE):
     return no_sol / len(with_answer) >= min_share
 
 
-def validate_deterministic(output_root=OUTPUT_ROOT, explicit_source_gap=()):
+_NUM_UNIT_CACHE = None
+
+
+def _num_unit_re():
+    import re as _re
+    global _NUM_UNIT_CACHE
+    if _NUM_UNIT_CACHE is None:
+        _NUM_UNIT_CACHE = _re.compile(
+            r"\b(\d+(?:[.,]\d+)*)\s*(cGy|Gy|cgy|mg|g|kg|cm|mm|µg|IU|iu|%|mmHg|"
+            r"cmH2O|minutes?|mins?|weeks?|wks?|days?|hours?|hrs?)\b", _re.I)
+    return _NUM_UNIT_CACHE
+
+
+def _printed_numbers(page_text):
+    return {m.group(0).replace(" ", "").replace(",", "")
+            for m in _num_unit_re().finditer(page_text or "")}
+
+
+def numeric_drift_flag(row, page_text_getter):
+    """The old production run hallucinated 'Point B: 5000 cGy' when the book
+    says 6000. Numbers with clinical units in an extracted solution MUST exist
+    on the printed source pages -- a number that never appeared there cannot
+    be verbatim. Zero-token REVIEW flag; the human opens the page and decides
+    (never auto-corrected)."""
+    sol = (row.get("solution") or {}).get("text") or ""
+    if len(sol.strip()) < 40 or not page_text_getter:
+        return None
+    pages = [p for p in (row.get("source_pages") or []) if isinstance(p, int)]
+    if not pages:
+        return None
+    printed = set()
+    for p in pages:
+        printed |= _printed_numbers(page_text_getter(p) or "")
+    if not printed:
+        return None     # no text layer on these pages -> nothing provable
+    hits = []
+    for m in _num_unit_re().finditer(sol):
+        tok = m.group(0).replace(" ", "").replace(",", "")
+        if tok and tok not in printed:
+            hits.append(m.group(0))
+    if hits:
+        return flag(row.get("chapter_id"), "numeric_drift_suspect",
+                    f"solution contains unit-number(s) never printed on its "
+                    f"source pages: {sorted(set(hits))[:6]} -- verify verbatim vs book",
+                    q_no=q_no_of(row), severity=HIGH, pages=pages,
+                    source="numeric_drift")
+    return None
+
+
+def validate_deterministic(output_root=OUTPUT_ROOT, explicit_source_gap=(),
+                           page_text_provider_of_row=None):
     """Stage 1 over the whole output. Returns (flags_by_chapter, summary)."""
     output_root = Path(output_root)
     data_dir, assets_q = output_root / "data", output_root / "assets" / "questions"
@@ -583,6 +633,11 @@ def validate_deterministic(output_root=OUTPUT_ROOT, explicit_source_gap=()):
             n = len(crows) or 1
             sol_rates[cid] = sum(1 for r in crows
                                  if not ((r.get("solution") or {}).get("text") or "").strip()) / n
+        if page_text_provider_of_row:
+            for r in crows:
+                f2 = numeric_drift_flag(r, page_text_provider_of_row(r))
+                if f2:
+                    row_flags.append(f2)
         flags_by[cid] = row_flags + ch_flags
 
     # suspect density vs book median (answer-key-only chapters excluded so
@@ -1051,7 +1106,10 @@ def run_hybrid(output_root=OUTPUT_ROOT, audit=False, model=None, image_opener=No
     human_log = data_dir / "human_review_queue.jsonl"
     assets_q = output_root / "assets" / "questions"
 
-    flags_by, summary = validate_deterministic(output_root, explicit_source_gap)
+    flags_by, summary = validate_deterministic(
+        output_root, explicit_source_gap,
+        page_text_provider_of_row=(lambda r: page_text_provider(r["chapter_id"])
+                                 if page_text_provider else None))
     report = {"mode": "audit" if audit else "report-only", "summary": summary,
               "chapters": {cid: flags for cid, flags in flags_by.items() if flags},
               "metrics": {}}
@@ -1191,6 +1249,35 @@ def make_window_provider(pdf_path, dpi=150):
                         "-f", str(lo), "-l", str(hi), str(pdf_path), str(out_dir / "page")])
         return sorted(out_dir.glob("page-*.jpg"))
     return provider
+
+
+def default_page_text_provider(books_dir):
+    """chapter_id -> fn(true_page)->text via pdftotext, cached per book.
+    Missing PDF -> chapter fn returns None (numeric-drift stage skips that
+    chapter; nothing else changes)."""
+    import subprocess
+    base = Path(books_dir)
+    per_book_txt = {}
+
+    def for_chapter(chapter_id):
+        subj = str(chapter_id).split("-")[0]
+        pdf = base / f"{subj}.pdf"
+        if not pdf.exists():
+            return None
+        if subj not in per_book_txt:
+            per_book_txt[subj] = {}
+        def fn(p):
+            per = per_book_txt[subj]
+            if p not in per:
+                try:
+                    per[p] = subprocess.run(
+                        ["pdftotext", "-f", str(p), "-l", str(p), str(pdf), "-"],
+                        capture_output=True, text=True, timeout=30).stdout or ""
+                except Exception:
+                    per[p] = ""
+            return per[p]
+        return fn
+    return for_chapter
 
 
 def main():
