@@ -1732,7 +1732,11 @@ document.addEventListener('submit', function(ev){
   var mode=form.getAttribute('data-opt')||'stay';
   if(mode==='hide' && card){card.style.opacity='0.35';card.style.pointerEvents='none';}
   rq_flash(form,'…',false);
-  fetch(form.action,{method:'POST',body:fd}).then(function(resp){
+  // form.action is SHADOWED by our own <button name="action"> (Approve/Skip)
+  // -- it returns a RadioNodeList, not the URL ("[object RadioNodeList]" was
+  // the 404 the user showed). getAttribute reads the real attribute value.
+  var ACTION_URL=form.getAttribute('action');
+  fetch(ACTION_URL,{method:'POST',body:fd}).then(function(resp){
      if(!resp.ok){ return resp.text().then(function(t){throw new Error('HTTP '+resp.status+': '+(t||'').slice(0,180));}); }
      var ct=resp.headers.get('content-type')||'';
      if(ct.indexOf('json')<0){ return resp.text().then(function(t){throw new Error('server ne non-JSON diya: '+(t||'').slice(0,180));}); }
