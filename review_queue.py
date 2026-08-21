@@ -28,6 +28,7 @@ DESIGN CONTRACT (user-signed-off, 2026-08-19)
 
 import hashlib
 import json
+import threading
 import re
 import time
 import zipfile
@@ -467,7 +468,39 @@ _RE_FLAGS_KNOWN_FILE = re.compile(r"\.jsonl$")
 # Small IO helpers (atomic, append-safe, read-back friendly)
 # ---------------------------------------------------------------------------
 
+_TL = threading.local()
+
+
+class batch_cache:
+    """Per-request JSONL memoization keyed by (path, mtime_ns, size). Any write
+    invalidates via stat -- never stale. A /review load reads the same ledger
+    files from hundreds of helpers; this collapses it to one read per file
+    per request. The 470-flag reload drag was this O(n x filesize) crawl."""
+    def __enter__(self):
+        self.prev = getattr(_TL, "jcache", None)
+        _TL.jcache = {}
+        return self
+
+    def __exit__(self, *a):
+        if self.prev is None:
+            try: del _TL.jcache
+            except AttributeError: pass
+        else:
+            _TL.jcache = self.prev
+
+
 def _read_jsonl(path: Path):
+    path = Path(path)
+    cache = getattr(_TL, "jcache", None)
+    key = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        return []
+    if cache is not None:
+        hit = cache.get(key)
+        if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+            return hit[2]
     if not path.exists():
         return []
     out = []
@@ -478,6 +511,8 @@ def _read_jsonl(path: Path):
                 out.append(json.loads(line))
             except json.JSONDecodeError:
                 out.append({"_unparseable": line[:120]})
+    if cache is not None:
+        cache[key] = (st.st_mtime_ns, st.st_size, out)
     return out
 
 
@@ -669,7 +704,8 @@ def collect_review_queue(output_root, books_dir=None) -> dict:
     hit = _QCACHE.get(key)
     if hit and hit[0] == sig and not _force_fresh:
         return hit[1]
-    res = _collect_review_queue_uncached(out, books_dir)
+    with batch_cache():
+        res = _collect_review_queue_uncached(out, books_dir)
     if len(_QCACHE) > 3:
         _QCACHE.pop(next(iter(_QCACHE)))
     _QCACHE[key] = (sig, res)
