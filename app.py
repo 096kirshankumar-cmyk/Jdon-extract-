@@ -1389,6 +1389,10 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
     <button class="bg-slate-700 text-white px-3 py-1 rounded">Apply</button>
     <span class="text-gray-500">{{ rows|length }} issue(s)</span>
     <a class="bg-indigo-600 text-white px-3 py-1 rounded" href="/review/lookup">🔎 lookup</a>
+    <form method="POST" action="/review/ai-verify" style="display:inline">
+      <button class="bg-purple-700 text-white px-3 py-1 rounded">🤖 AI-verify (separate 3.1 pool)</button>
+    </form>
+    <a class="bg-teal-600 text-white px-3 py-1 rounded" href="/review/ai-resolved">✅ AI-resolved tab</a>
     <span class="text-gray-400">(bar upar chipki rahegi)</span>
   </form>
   {% if rows %}
@@ -1726,7 +1730,11 @@ document.addEventListener('submit', function(ev){
   var mode=form.getAttribute('data-opt')||'stay';
   if(mode==='hide' && card){card.style.opacity='0.35';card.style.pointerEvents='none';}
   rq_flash(form,'…',false);
-  fetch(form.action,{method:'POST',body:fd}).then(function(r){return r.json()})
+  fetch(form.action,{method:'POST',body:fd}).then(function(resp){
+     if(!resp.ok){ return resp.text().then(function(t){throw new Error('HTTP '+resp.status+': '+(t||'').slice(0,180));}); }
+     var ct=resp.headers.get('content-type')||'';
+     if(ct.indexOf('json')<0){ return resp.text().then(function(t){throw new Error('server ne non-JSON diya: '+(t||'').slice(0,180));}); }
+     return resp.json();})
    .then(function(j){
      if(j.ok){
        if(mode==='hide'&&card){
@@ -1746,7 +1754,9 @@ document.addEventListener('submit', function(ev){
        if(card){card.style.opacity='1';card.style.pointerEvents='auto';}
        rq_flash(form,'❌ '+(j.msg||'failed'),false);
      }
-   }).catch(function(e){if(card){card.style.opacity='1';card.style.pointerEvents='auto';}rq_flash(form,'❌ network/server error',false);});
+   }).catch(function(e){if(card){card.style.opacity='1';card.style.pointerEvents='auto';}
+     rq_flash(form,'❌ '+String((e&&e.message)||'network/server error'),false);
+     if(window.console&&console.error){console.error('review-queue ajax',e);}});
 });
 
 // attach with no thumbnail picked -> block before the server round-trip
@@ -2389,6 +2399,93 @@ def review_upload_image():
         "obj_id": None, "final_file": rel})
     log(f"🖼️ manual upload {rel} -> {q_id} ({side}); {len(blob)} bytes")
     return _review_redirect(res, f"uploaded + attached as {rel}")
+
+
+@app.errorhandler(Exception)
+def _queue_ajax_errors(e):
+    """AJAX actions must NEVER get an HTML error page back -- the optimistic
+    reader does res.json() and an HTML body throws -> 'network/server error'
+    hides the real failure (user's live report). Turn EVERY 500 into JSON."""
+    if request.form.get("ajax") == "1" or \
+            "application/json" in (request.headers.get("Accept") or ""):
+        import traceback as _tb; _tb.print_exc()
+        return jsonify({"ok": False,
+                        "msg": f"server error: {type(e).__name__}: {e}"}), 500
+    return "Internal Server Error", 500
+
+
+@app.route("/review/ai-verify", methods=["POST"])
+def review_ai_verify():
+    """AI false-flag pass on a SEPARATE pool+model (flag_verifier.py).
+    Background thread; only flag STATUS can change through it - content
+    lock is hardcoded in the engine (never calls apply_*)."""
+    if state.get("status") == "processing":
+        return _review_redirect({"ok": False, "error": "pipeline busy"}, "…")
+
+    def _job():
+        import flag_verifier as fv
+        log("🤖 AI verify pass started (separate 3.1 pool)...")
+        def prog(checked, resolved):
+            _p, d = fv._daily_counter(pipeline.OUTPUT_ROOT)
+            if checked % 10 == 0:
+                log(f"   … verify: {checked} checked, {resolved} auto-resolved, "
+                    f"verification (3.1) calls used today: {d['calls']}")
+        res = fv.run_verification(pipeline.OUTPUT_ROOT, progress=prog)
+        if res.get("skipped"):
+            log(f"🤖 verify skipped: {res['error']}")
+            return
+        log(f"🤖 AI verify done: {res['checked']} checked | "
+            f"{res['resolved']} auto-resolved (high-conf false only) | "
+            f"{res['kept']} kept | {res['sampled_back']} sampled-back | "
+            f"{res['parse_failed']} parse-fail kept | "
+            f"verification (3.1) calls used today: {res['calls_used_after']}/{res['budget_cap']}")
+
+    threading.Thread(target=_job, daemon=True).start()
+    return _review_redirect({"ok": True},
+                            "AI verify pass started in background — progress "
+                            "dashboard log me dikhega")
+
+
+@app.route("/review/ai-resolved")
+def review_ai_resolved():
+    """✅ Auto-resolved by AI (N) tab -- every one re-restorable."""
+    out = Path(pipeline.OUTPUT_ROOT)
+    import flag_verifier as fv
+    rows = fv.list_ai_resolved(out)
+    cards = "".join(
+        f"""<div class="bg-white rounded shadow p-3 text-xs space-y-1">
+          <div class="font-mono font-bold">{r.get('q_id') or '—'}</div>
+          <div><span class="bg-gray-200 rounded px-1">{r.get('flag_kind')}</span>
+               <span class="text-gray-500">pages: {r.get('pages')}</span>
+               <span class="text-gray-500">conf: {r.get('confidence')}</span>
+               {'<b class="text-orange-600">[self-audit sample — open hai abhi bhi]</b>' if r.get('sampled_back') else ''}
+          </div>
+          <div class="text-gray-700">🤖 "{{ r.get('ai_reason') }}"</div>
+          <div class="text-gray-400">{{ r.get('ts') }}</div>
+          <form method="POST" action="/review/unresolve" class="qact" data-opt="stay">
+            <input type="hidden" name="flag_key" value="{r.get('flag_key')}">
+            <button class="bg-slate-700 text-white px-2 py-0.5 rounded">🔁 reopen (wapas queue me)</button>
+          </form>
+        </div>""" for r in rows)
+    return render_template_string(
+        """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+        <script src="https://cdn.tailwindcss.com"></script></head><body class="bg-gray-100 p-3">
+        <div class="max-w-2xl mx-auto space-y-2">
+        <h1 class="text-lg font-bold">✅ Auto-resolved by AI ({{ n }})</h1>
+        <a href="/review" class="text-xs text-sky-700 underline">← review queue</a>
+        <p class="text-[11px] text-gray-500">Har row wapas queue me le sakte ho.
+        Audit trail: data/ai_auto_resolved.jsonl (kabhi delete nahi hota).</p>
+        {{ cards|safe }}
+        </div></body></html>""", n=len(rows), cards=cards)
+
+
+@app.route("/review/unresolve", methods=["POST"])
+def review_unresolve():
+    """One click restores an AI-resolved flag into the queue."""
+    review_queue.record_decision(Path(pipeline.OUTPUT_ROOT),
+                                 request.form.get("flag_key") or "",
+                                 "reopened", reason="human reversed AI auto-resolve")
+    return _review_redirect({"ok": True}, "reopened — queue me wapas aaya")
 
 
 @app.route("/download-final")

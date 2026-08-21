@@ -59,7 +59,7 @@ CORE_DATA_FILES = {
     "export_gate_advisory.jsonl", "orphans.jsonl",
     "still_incomplete_after_retry.jsonl", "stem_conflicts.jsonl",
     "unmatched_images.jsonl", "human_edit_ledger.jsonl",
-    "review_decisions.jsonl",
+    "review_decisions.jsonl", "ai_auto_resolved.jsonl", "verify_counter.json",
 } | set(FLAG_SOURCES)
 
 BLOCKER_KINDS = {
@@ -897,6 +897,11 @@ def _collect_review_queue_uncached(output_root, books_dir=None) -> dict:
             r["state"] = "open"
             open_rows.append(r)
             continue
+        if d.get("action") == "reopened":
+            # restored from the AI tab -- never auto-closed by a ledger fact
+            r["state"] = "open"
+            open_rows.append(r)
+            continue
         sig = _row_current_signature(out_root, r)
         if sig is not None and d.get("content_sig") and sig != d["content_sig"]:
             r["state"] = "open"
@@ -961,7 +966,8 @@ def record_decision(output_root, flag_key: str, action: str, reason: str = "",
                     q_id: str = None) -> dict:
     """action: approved | ignored | resolved | edited. Persist FIRST; the
     caller re-reads the queue afterwards (never trust memory)."""
-    if action not in ("approved", "ignored", "resolved", "edited"):
+    if action not in ("approved", "ignored", "resolved", "edited",
+                      "ai_auto_resolved", "reopened"):
         return {"ok": False, "error": f"bad action {action!r}"}
     out_root = Path(output_root)
     sig = None
