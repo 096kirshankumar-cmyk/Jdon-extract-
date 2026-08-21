@@ -451,3 +451,17 @@ class TestAjaxErrorsAreJson(Routes):
             self.assertIn("deliberate crash", j["msg"])
         finally:
             rq.record_decision = orig
+
+
+class TestFormActionShadowGuard(unittest.TestCase):
+    def test_js_never_reads_form_action_property(self):
+        """<button name="action"> shadows form.action in the DOM (it becomes a
+        RadioNodeList) -- fetch() then posted to '/[object RadioNodeList]', the
+        404 the user showed. Lock the rule: JS must use getAttribute."""
+        src = open(AG if (AG:="app.py") else "app.py", encoding="utf-8").read()
+        js = src[src.index("optimistic AJAX"):]
+        import re as _re
+        code = "\n".join(l for l in js.splitlines() if not l.strip().startswith("//"))
+        bad = _re.findall(r"form\.action\b", code)
+        self.assertEqual(bad, [], "form.action (property) is shadowed by "
+                            "name=action; use form.getAttribute('action')")
