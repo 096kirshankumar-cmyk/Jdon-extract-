@@ -1389,12 +1389,14 @@ details>summary{list-style:none}details>summary::-webkit-details-marker{display:
     <button class="bg-slate-700 text-white px-3 py-1 rounded">Apply</button>
     <span class="text-gray-500">{{ rows|length }} issue(s)</span>
     <a class="bg-indigo-600 text-white px-3 py-1 rounded" href="/review/lookup">🔎 lookup</a>
+    <span class="text-gray-400">(bar upar chipki rahegi)</span>
+  </form>
+  <div class="flex flex-wrap gap-2 items-center mt-1 text-xs">
     <form method="POST" action="/review/ai-verify" style="display:inline">
       <button class="bg-purple-700 text-white px-3 py-1 rounded">🤖 AI-verify (separate 3.1 pool)</button>
     </form>
     <a class="bg-teal-600 text-white px-3 py-1 rounded" href="/review/ai-resolved">✅ AI-resolved tab</a>
-    <span class="text-gray-400">(bar upar chipki rahegi)</span>
-  </form>
+  </div>
   {% if rows %}
   <form method="POST" action="/review/decide-bulk" class="qact bg-amber-50 border border-amber-300 rounded p-2 text-xs flex flex-wrap gap-2 items-center" data-opt="hide-all"
        onsubmit="return confirm('{{ rows|length }} issue(s) ke saare flags par ye action lagega. Pakka?')">
@@ -2405,13 +2407,22 @@ def review_upload_image():
 def _queue_ajax_errors(e):
     """AJAX actions must NEVER get an HTML error page back -- the optimistic
     reader does res.json() and an HTML body throws -> 'network/server error'
-    hides the real failure (user's live report). Turn EVERY 500 into JSON."""
-    if request.form.get("ajax") == "1" or \
-            "application/json" in (request.headers.get("Accept") or ""):
+    hides the real failure (user's live report). Turn EVERY 500 into JSON.
+    Also: a routing 404 says WHICH path was asked -- surface it so a stale
+    deploy or a mis-wired button is diagnosable from the toast itself."""
+    need_json = request.form.get("ajax") == "1" or \
+        "application/json" in (request.headers.get("Accept") or "")
+    is_404 = getattr(e, "code", None) == 404
+    if is_404:
+        log(f"❓ 404 asked: {request.method} {request.path} (route not in map)")
+        detail = (f"404: {request.method} {request.path} is not a registered "
+                  f"route on this server")
+    else:
         import traceback as _tb; _tb.print_exc()
-        return jsonify({"ok": False,
-                        "msg": f"server error: {type(e).__name__}: {e}"}), 500
-    return "Internal Server Error", 500
+        detail = f"server error: {type(e).__name__}: {e}"
+    if need_json:
+        return jsonify({"ok": False, "msg": detail, "path": request.path}), (404 if is_404 else 500)
+    return (detail, 404) if is_404 else ("Internal Server Error", 500)
 
 
 @app.route("/review/ai-verify", methods=["POST"])
