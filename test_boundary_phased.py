@@ -60,6 +60,34 @@ class T(unittest.TestCase):
         self.assertIsNone(m2["answer_key_block"])
         self.assertIsNone(m2["solution_block"])
 
+    def test_inclusive_pages_no_extra_page(self):
+        """OBG-001: printed Q headers 5-12 must become Q 5-12, not 5-13."""
+        self.assertEqual(bph._inclusive_pages([5, 6, 7, 8, 9, 10, 11, 12], 31),
+                         list(range(5, 13)))
+        self.assertEqual(bph._inclusive_pages([13, 31], 31),
+                         list(range(13, 32)))
+        self.assertEqual(bph._inclusive_pages([31], 31), [31])
+
+    def test_printed_q_span_stops_at_last_header(self):
+        """Q phase must not swallow the solution page after the last Question
+        header (OBG-001: Q25-26 on p12, p13 is key-tail + Solution 1)."""
+        r = bph.ChapterRunner("x.pdf", "OBG", 1, "/tmp", model=object(),
+                              state={})
+        r._printed_zones = lambda a, b: {
+            "q": {5, 6, 7, 8, 9, 10, 11, 12},
+            "s": set(range(13, 32)) - {30},
+            "keys": [12, 13],
+        }
+        r._printed_s_hdrs = {13: {1}, 31: {26}}
+        bounds = {"question_block": {"start_page": 5},
+                  "answer_key_block": {"start_page": 26, "end_page": 26},
+                  "solution_block": {"start_page": 26, "end_page": 31}}
+        q, a, s = r._resolve_zones(bounds, 5, 31)
+        self.assertEqual((q[0], q[-1]), (5, 12))
+        self.assertEqual(a, [12, 13])
+        self.assertEqual((s[0], s[-1]), (13, 31))
+        self.assertNotIn(13, q)
+
     def test_clamp_solution_cannot_start_before_questions(self):
         """OBG-002 live: printed S span 31-46 while Q starts at 32.
         Used S must not start before Q."""

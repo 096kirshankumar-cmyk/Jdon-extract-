@@ -633,6 +633,23 @@ def _issue_self_contradicts(issue):
     return len(set(letters)) >= 2
 
 
+def _inclusive_pages(pages, ch_last):
+    """File-page list from min(pages) through max(pages), clamped at ch_last.
+
+    Python range is exclusive at the end, so the only +1 is that exclusive
+    bound. A second +1 (OBG-001) included the page AFTER the last printed
+    Question header in the Q phase.
+    """
+    pages = [p for p in pages if p is not None]
+    if not pages:
+        return []
+    lo = min(pages)
+    hi = min(max(pages), ch_last)
+    if hi < lo:
+        return []
+    return list(range(lo, hi + 1))
+
+
 class ChapterRunner:
     """One chapter through Steps 0-8, then a real commit into the pipeline's
     normal output (Step 8 is WRITE-THROUGH, not a dry run).
@@ -1712,12 +1729,13 @@ class ChapterRunner:
             return q_pages, a_pages, s_pages
         q_pages = m_q
         if printed["q"]:
-            q_pages = list(range(min(printed["q"]),
-                                 min(max(printed["q"]) + 1, ch_last) + 1))
+            # Inclusive [min, max] of printed Question headers only.
+            # OBG-001 live: max Q header is p12 (Q25-26 + key start);
+            # the old `max+1` then another `+1` pulled p13 (solutions) into Q.
+            q_pages = _inclusive_pages(printed["q"], ch_last)
         s_pages = m_s
         if printed["s"]:
-            s_pages = list(range(min(printed["s"]),
-                                 min(max(printed["s"]) + 1, ch_last) + 1))
+            s_pages = _inclusive_pages(printed["s"], ch_last)
         a_pages = m_a
         if printed["keys"]:
             a_pages = sorted(set(printed["keys"]))
@@ -1767,8 +1785,7 @@ class ChapterRunner:
             if after_floor:
                 valid = after_floor
         if valid:
-            s_pages = list(range(min(valid),
-                                 min(max(valid) + 1, ch_last) + 1))
+            s_pages = _inclusive_pages(valid, ch_last)
         return q_pages, a_pages, s_pages
 
     def _log_zone_audit(self, bounds, m_q, m_a, m_s, printed,
