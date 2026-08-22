@@ -855,6 +855,169 @@ class EngineCase(unittest.TestCase):
                          "Sol2 recovered.")
         self.assertEqual(rows["OPH-001-002"]["qa_status"], "READY")
 
+    def test_c1_split_solutions_embedded_headers_deterministic(self):
+        """C1 (ANAT-001 live): model folded q17's body into q16's item and
+        later chained q17->q18->q19. The printed 'Solution to Question N:'
+        marker inside an item is a hard boundary: split deteterministically
+        (move overflow to N, create if absent, dedupe, flag everything)."""
+        r = self._runner(_FakeModel([]))
+        # REAL ANAT-001 re-ask shapes: q16 folded q17 (initially); after the
+        # re-ask the chain bleeds the other way -- q17 ends with q18's text,
+        # q18 ends with q19's text, q19 carries a duplicate of q18's overflow.
+        q16 = {"q_no": "16", "solution_text":
+               "Primary oocytes remain dormant.\nSteps of oogenesis before "
+               "puberty are shown in the image below:\n\nSolution to "
+               "Question 17:\nThe oocyte retrieved after final maturation "
+               "is the secondary oocyte.\nSteps of oogenesis after puberty "
+               "are shown in the image below:",
+               "has_figure": False, "figure_location": None,
+               "source_page_range": [16, 17], "text_confidence": "high",
+               "_qn": 16}
+        q17 = {"q_no": "17", "solution_text":
+               "The oocyte retrieved after final maturation is the secondary "
+               "oocyte.\n\nSolution to Question 18:\nIf the ovum is not "
+               "fertilized, the corpus luteum persists for about 14 days."
+               "\n• Ovum fertilized:",
+               "has_figure": False, "figure_location": None,
+               "source_page_range": [17, 17], "text_confidence": "high",
+               "_qn": 17}
+        q18 = {"q_no": "18", "solution_text":
+               "• Corpus luteum of pregnancy is formed.\n• Regression is "
+               "prevented by hCG.\n• It persists for 3-4 months.\n\n"
+               "Solution to Question 19:\nMeiosis occurs in the adult ovary."
+               "\nOptions A and D: somatic cells.",
+               "has_figure": False, "figure_location": None,
+               "source_page_range": [17, 18], "text_confidence": "high",
+               "_qn": 18}
+        q19 = {"q_no": "19", "solution_text":
+               "Meiosis occurs in the adult ovary.\nOptions A and D: "
+               "somatic cells.",
+               "has_figure": False, "figure_location": None,
+               "source_page_range": [18, 18], "text_confidence": "high",
+               "_qn": 19}
+        out = r._c1_split_solutions([q16, q17, q18, q19])
+        by = {i["_qn"]: i for i in out}
+        self.assertEqual(set(by), {16, 17, 18, 19})
+        # q16 keeps ONLY its own text (never the folded q17 body)
+        self.assertNotIn("Solution to Question 17", by[16]["solution_text"])
+        self.assertIn("Primary oocytes", by[16]["solution_text"])
+        self.assertNotIn("oocyte retrieved", by[16]["solution_text"])
+        # q17 = its own oocyte text only, WITHOUT q18's corpus luteum
+        self.assertIn("oocyte retrieved", by[17]["solution_text"])
+        self.assertNotIn("corpus luteum persists", by[17]["solution_text"])
+        # q18 = corpus luteum (both halves), glued from q17's overflow + own
+        self.assertIn("corpus luteum persists", by[18]["solution_text"])
+        self.assertIn("Corpus luteum of pregnancy", by[18]["solution_text"])
+        # q19 = meiosis text, DUPLICATE deduped (one copy only)
+        self.assertEqual(by[19]["solution_text"].count("Meiosis occurs"), 1)
+        # every involved item is flagged for manual review
+        for q in (16, 17, 18, 19):
+            self.assertTrue(by[q].get("_split_note"), f"q{q} not flagged")
+        self.assertTrue(any("C1" in n for n in r.notes))
+
+    def test_c2_targeted_fix_prompt_carries_page_boundary_proof(self):
+        """C2: the targeted re-ask prompt must carry the printed-header page
+        proof (where each re-asked q_no is PRINTED) + explicit page-split
+        rules, so the model stops folding a bottom-of-page header's body into
+        the previous question (ANAT-001 live loop)."""
+        bnd = {"question_block": {"start_page": 5},
+               "answer_key_block": {"start_page": 10, "end_page": 10},
+               "solution_block": {"start_page": 11, "end_page": 13},
+               "confidence": "high"}
+        qs = [{"q_no": "1", "stem": "S1?", "options": {"A": "a", "B": "b",
+               "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
+               "source_page": 5, "text_confidence": "high"},
+              {"q_no": "2", "stem": "S2?", "options": {"A": "a", "B": "b",
+               "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
+               "source_page": 5, "text_confidence": "high"}]
+        an = [{"q_no": "1", "correct_option": "A", "low_confidence": False},
+              {"q_no": "2", "correct_option": "B", "low_confidence": False}]
+        so = [{"q_no": "1", "solution_text": "Sol1.", "has_figure": False,
+               "figure_location": None, "source_page_range": [11, 11],
+               "text_confidence": "high"}]
+        # verify flags q2 (folded/missing); the fix must be boundary-proofed
+        verify_bad = {"phase": "Solution", "total_entries_checked": 1,
+                      "all_verified": False,
+                      "mismatches": [{"q_no": "2", "issue": "bleed/fold",
+                                      "severity": "genuine"}]}
+        fix = [{"q_no": "2", "solution_text": "Sol2 recovered.",
+                "has_figure": False, "figure_location": None,
+                "source_page_range": [12, 12], "text_confidence": "high"}]
+        ok = {"phase": "Solution", "total_entries_checked": 2,
+              "all_verified": True, "mismatches": []}
+        cross = {"chapter": "OPH-001", "status": "LOCKED",
+                 "total_questions": 2, "issues": []}
+        model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
+                            json.dumps(qs), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
+                            json.dumps(so), json.dumps(verify_bad),
+                            json.dumps(fix), json.dumps(ok),
+                            json.dumps(cross)])
+        r = self._runner(model)
+        r._printed_s_hdrs = {11: {1, 2}, 13: {2}}   # q2 header PRINTS on p11+13
+        res = r.run(5, 13)
+        self.assertTrue(res["locked"])
+        # the re-ask prompt actually carried the boundary proof
+        fix_calls = [c for c in model.calls if "dobara extract" in str(c)]
+        self.assertTrue(fix_calls, "no targeted-fix call seen")
+        self.assertIn("PAGE-BOUNDARY PROOF", str(fix_calls[0]))
+        self.assertIn("q2", str(fix_calls[0]))
+        # content preserved: q1 unchanged, q2 recovered
+        rows = {json.loads(l)["id"]: json.loads(l) for l in
+                (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
+                if l.strip()}
+        self.assertEqual(rows["OPH-001-001"]["solution"]["text"], "Sol1.")
+        self.assertEqual(rows["OPH-001-002"]["solution"]["text"],
+                         "Sol2 recovered.")
+
+    def test_anat_fold_extract_locks_clean_via_c1(self):
+        """ANAT-001 live scenario end-to-end: the FIRST S-extract already
+        folds q17 into q16. C1 splits it at the printed marker BEFORE verify
+        -> verify passes -> LOCK is clean (no phase_unresolved blocker)."""
+        bnd = {"question_block": {"start_page": 5},
+               "answer_key_block": {"start_page": 10, "end_page": 10},
+               "solution_block": {"start_page": 11, "end_page": 13},
+               "confidence": "high"}
+        qs = [{"q_no": "1", "stem": "S1?", "options": {"A": "a", "B": "b",
+               "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
+               "source_page": 5, "text_confidence": "high"},
+              {"q_no": "2", "stem": "S2?", "options": {"A": "a", "B": "b",
+               "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
+               "source_page": 5, "text_confidence": "high"}]
+        an = [{"q_no": "1", "correct_option": "A", "low_confidence": False},
+              {"q_no": "2", "correct_option": "B", "low_confidence": False}]
+        # model's S extract: q1 carries q2's body under a printed marker
+        fold = [{"q_no": "1", "solution_text":
+                 "Sol1 own text.\n\nSolution to Question 2:\nSol2 body.",
+                 "has_figure": False, "figure_location": None,
+                 "source_page_range": [11, 12], "text_confidence": "high"}]
+        ok = {"phase": "Solution", "total_entries_checked": 2,
+              "all_verified": True, "mismatches": []}
+        cross = {"chapter": "OPH-001", "status": "LOCKED",
+                 "total_questions": 2, "issues": []}
+        model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
+                            json.dumps(qs), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
+                            json.dumps(fold), json.dumps(ok),
+                            json.dumps(cross)])
+        r = self._runner(model)
+        r._printed_s_hdrs = {11: {1}, 12: {2}}
+        res = r.run(5, 13)
+        self.assertTrue(res["locked"], "C1-split chapter must lock clean")
+        rows = {json.loads(l)["id"]: json.loads(l) for l in
+                (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
+                if l.strip()}
+        self.assertEqual(rows["OPH-001-001"]["solution"]["text"],
+                         "Sol1 own text.")
+        self.assertEqual(rows["OPH-001-002"]["solution"]["text"],
+                         "Sol2 body.")
+        # no BLOCKER rows (phase must not be unresolved)
+        gate = qp.DATA_DIR / "export_gate.jsonl"
+        if gate.exists():
+            kinds = [json.loads(l)["kind"] for l in
+                     gate.read_text().splitlines() if l.strip()]
+            self.assertNotIn("phase_unresolved", kinds)
+
     def test_quota_pause_is_systemexit_and_saves_state(self):
         model = _FakeModel(self._answers())
         r = self._runner(model)

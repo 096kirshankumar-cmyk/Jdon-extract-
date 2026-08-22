@@ -804,7 +804,14 @@ class ChapterRunner:
                 self._ledger(pass_name, chunk, qp.PASS_STATUS_UNRESOLVED, 0,
                              "phase chunk returned no parseable JSON array "
                              "(1 re-ask also failed)")
-        return self._merge_phase_items(out)
+        merged = self._merge_phase_items(out)
+        # C1 BACKSTOP: solution texts that carry another question's printed
+        # header inside them (page-fold bleed, ANAT-001 live) are split
+        # deterministically BEFORE verify sees them -- this often removes
+        # the need for the fix loop entirely.
+        if label == "Solution":
+            merged = self._c1_split_solutions(merged)
+        return merged
 
     def _ocr_fallback(self, chunk, prompt_tmpl, label, pass_name):
         """Model recitation-blocked the page IMAGEs of `chunk` -> OCR the
@@ -915,6 +922,144 @@ class ChapterRunner:
                 base["_seen_continuation"] = True
         return [by_qn[q] for q in order]
 
+    # -- C1: deterministic split at printed solution headers -------------------
+    _SOL_SPLIT_RE = re.compile(
+        r"(?im)^\s*Solution\s+to\s+Question\s+(\d{1,3})\s*[:.\-–]?\s*")
+
+    def _c1_split_solutions(self, items):
+        """C1 BACKSTOP (user order: C2 first, C1 as the deterministic fallback).
+
+        ANAT-001 live: the model folds the solution whose header sits at a
+        page BOTTOM into the PREVIOUS question (q16 absorbed q17's body;
+        later re-asks chained it again: q17 tail = corpus-luteum text,
+        q18 = q19 text). The printed 'Solution to Question N:' marker inside
+        an item's text is a HARD boundary -- split there. Deterministic, no
+        extra model call, zero inventing: the text after the marker is moved
+        to question N (created if absent). Every affected row is flagged
+        _split_note -> REVIEW_NEEDED so it is never silently trusted.
+
+        Order guarantee: overflow from an EARLIER item joins question M's
+        text BEFORE M's own part (reading order). Duplicates (the same
+        overflow re-dumped inside M's own item) are detected and NOT
+        doubled -- flagged instead."""
+        if not items:
+            return items
+        max_s = None
+        if self._printed_s_hdrs:
+            mx = max((max(v) for v in self._printed_s_hdrs.values()),
+                     default=None)
+            max_s = mx
+        finals = {}      # qn -> {"parts": [str], "it": dict, "created": bool}
+        order = []
+        noqn = []
+
+        def _dup(a, b):
+            a, b = a.strip(), b.strip()
+            if not a or not b:
+                return False
+            return (b.startswith(a[:80]) or a.startswith(b[:80])
+                    or (len(a) > 40 and a[:60] in b[:400]))
+
+        def _append(rec, part, src_it):
+            """Append a text part with duplicate detection: the same segment
+            can legitimately arrive twice (overflow + the item's own copy),
+            it must not be doubled -- flagged instead."""
+            if any(_dup(p, part) for p in rec["parts"]):
+                rec["it"] = rec["it"] or dict(src_it)
+                rec["it"]["_split_note"] = (
+                    (rec["it"].get("_split_note") or "") +
+                    (" | " if rec["it"].get("_split_note") else "") +
+                    "C1: duplicate segment detected, kept one copy only; "
+                    "verify manually")
+                return
+            rec["parts"].append(part)
+
+        for it in items:
+            if not isinstance(it, dict):
+                noqn.append(it)
+                continue
+            qn = it.get("_qn")
+            if qn is None:
+                noqn.append(it)
+                continue
+            text = str(it.get("solution_text") or "")
+            ms = list(self._SOL_SPLIT_RE.finditer(text))
+            targets = []
+            for m in ms:
+                M = int(m.group(1))
+                if M == qn or M < 1:
+                    continue
+                if max_s is not None and M > max_s:
+                    continue
+                targets.append((m.start(), m.end(), M))
+            if not targets:
+                rec = finals.setdefault(qn, {"parts": [], "it": None,
+                                             "created": False})
+                if rec["it"] is None:
+                    rec["it"] = it
+                if text.strip():
+                    _append(rec, text, it)
+                if qn not in order:
+                    order.append(qn)
+                continue
+            own = text[:targets[0][0]].rstrip()
+            rec = finals.setdefault(qn, {"parts": [], "it": None,
+                                         "created": False})
+            if rec["it"] is None:
+                rec["it"] = it
+            if own.strip():
+                _append(rec, own, it)
+            if qn not in order:
+                order.append(qn)
+            it["_split_note"] = (f"C1: solution split at printed 'Solution "
+                                 f"to Question' header(s) inside the text"
+                                 f"{' (own part kept)' if own.strip() else ''}"
+                                 f"; moved segments went to their own "
+                                 f"questions -- verify manually")
+            if rec["it"].get("_split_note") is None and it is not rec["it"]:
+                rec["it"]["_split_note"] = it["_split_note"]
+            for i, (st, en, M) in enumerate(targets):
+                nxt = targets[i + 1][0] if i + 1 < len(targets) else len(text)
+                part = text[en:nxt].strip()
+                if not part:
+                    continue
+                rec2 = finals.setdefault(M, {"parts": [], "it": None,
+                                             "created": True})
+                if rec2["it"] is None:
+                    src = dict(it)
+                    src["_qn"] = M
+                    src["_split_note"] = (
+                        f"C1: q{M} constructed from the text printed after "
+                        f"the 'Solution to Question {M}:' header that was "
+                        f"folded into q{qn}'s answer -- verify manually")
+                    src["_c1_created"] = True
+                    rec2["it"] = src
+                    if M not in order:
+                        order.append(M)
+                else:
+                    prev = rec2["it"].get("_split_note") or ""
+                    rec2["it"]["_split_note"] = (
+                        (prev + " | " if prev else "") +
+                        f"C1: q{M} received the segment folded into q{qn}'s "
+                        f"answer (printed header boundary) -- verify "
+                        f"manually")
+                _append(rec2, part, it)
+        out = [x for x in noqn]
+        for qn in order:
+            rec = finals[qn]
+            it = rec["it"]
+            if it is None:
+                continue
+            joined = "\n\n".join(p for p in rec["parts"] if p.strip()).strip()
+            it["solution_text"] = joined
+            out.append(it)
+        if any(f.get("created") or f["it"].get("_split_note")
+               for f in finals.values()):
+            self.notes.append(
+                "C1: solution text split at printed header boundary(s) "
+                "-- deterministic, rows flagged for manual review")
+        return out
+
     # -- Verify helper (Steps 2/4/6 share this) --------------------------------
     def _verify_phase(self, phase_name, items, pages, dpi=110):
         if not pages:
@@ -959,6 +1104,43 @@ class ChapterRunner:
             items = self._targeted_fix(phase_name, items, genuine)
         return items, ("exceeded attempts", last)
 
+    def _printed_boundary_note(self, phase_name, qns):
+        """C2 (ANAT-001 live): a targeted re-ask keeps failing because the
+        model folds a solution whose header sits at a page BOTTOM into the
+        PREVIOUS question (q16 item absorbed q17's body; then the fix loop
+        re-flags forever). The text layer PROVES where each header is printed
+        -- hand that proof to the model as an explicit page-split rule."""
+        if phase_name == "Solution":
+            hdr_map = getattr(self, "_printed_s_hdrs", None) or {}
+            label = "Solution to Question"
+        elif phase_name == "Question":
+            hdr_map = getattr(self, "_printed_q_hdrs", None) or {}
+            label = "Question"
+        else:
+            return ""
+        lines = []
+        for q in qns:
+            qi = _safe_int(q)
+            if qi is None:
+                continue
+            pages = sorted(p for p, s in hdr_map.items() if qi in s)
+            if pages:
+                lines.append(f"- q{qi}: '{label} {qi}:' header PRINTED on "
+                             f"page(s) {pages}")
+        if not lines:
+            return ""
+        return ("\n\nPAGE-BOUNDARY PROOF (printed headers -- page se liya hai, "
+                "guess nahi):\n" + "\n".join(lines) +
+                "\nRules:"
+                "\n- Ek header kisi page ke BOTTOM me ho sakta hai aur uska "
+                "poora text agle page ke TOP me -- us case me poora text usi "
+                "question ko do."
+                "\n- Agar kisi answer ke ANDAR agla 'Solution to Question N:' "
+                "header dikhe, to wahan text KAT do -- uske baad jo text hai "
+                "wo question N ka hai."
+                "\n- Har answer SIRF apne header ke baad aur agle header se "
+                "PEHLE wala text ho.")
+
     def _targeted_fix(self, phase_name, items, mismatches):
         qns = [str(m.get("q_no")) for m in mismatches if m.get("q_no")]
         if not qns:
@@ -973,6 +1155,7 @@ class ChapterRunner:
         # re-ask that drops the format block shape-drifts (OBG ch2 live: came
         # back {"solutions": [{"question_number": 1, "text": ...}]} which
         # then WIPED 11 good solution_texts on whole-item replacement).
+        boundary = self._printed_boundary_note(phase_name, qns)
         for chunk in _chunk_pages(fix_pages, PAGE_CHUNK):
             if not chunk:
                 continue
@@ -981,7 +1164,7 @@ class ChapterRunner:
                                   start=chunk[0], end=chunk[-1])
                 + f"\n\nNOTE: Ab SIRF in question numbers ko dobara extract "
                   f"karo: {qns}. Baaki sab ignore karo. WAHI JSON array "
-                  f"format use karo jo upar diya hai.")
+                  f"format use karo jo upar diya hai." + boundary)
             try:
                 raw = self._call_pages(chunk, re_prompt)
             except ModelBlocked:
@@ -1258,6 +1441,7 @@ class ChapterRunner:
                      0, f"printed headers prove q{qns} exist; re-asking")
         # FULL prompt (JSON template included): a template-less re-ask
         # shape-drifts (OBG ch2 live: {"solutions": [...], "text": ...}).
+        boundary = self._printed_boundary_note(phase_name, qns)
         for chunk in _chunk_pages(pages, PAGE_CHUNK):
             re_prompt = (
                 prompt_tmpl.format(chapter_name=self.chapter_id,
@@ -1265,7 +1449,7 @@ class ChapterRunner:
                 + f"\n\nNOTE: Ab SIRF in question numbers ko extract karo: "
                   f"{qns}. Baaki sab ignore karo. WAHI JSON array format use "
                   f"karo jo upar diya hai. Ye blocks page par PRINTED hain -- "
-                  f"dhundh kar nikaalo, skip mat karo.")
+                  f"dhundh kar nikaalo, skip mat karo." + boundary)
             try:
                 raw = self._call_pages(chunk, re_prompt, dpi=dpi)
             except ModelBlocked:
@@ -1415,6 +1599,11 @@ class ChapterRunner:
                 reasons.append("question phase marked text_confidence=low")
             if str(srow.get("text_confidence", "")).lower() == "low":
                 reasons.append("solution phase marked text_confidence=low")
+            if srow.get("_split_note"):
+                reasons.append("solution text split at printed 'Solution "
+                               "to Question N:' header boundary (deterministic "
+                               "C1 backstop) -- verify manually: "
+                               + str(srow.get("_split_note"))[:220])
             if qn in a_low:
                 reasons.append("answer-key cell marked low_confidence by model")
             if qn in ocr_q:
@@ -1749,6 +1938,9 @@ class ChapterRunner:
         s_items, s_ok = self._verify_phase("Solution", s_items, s_pages)
         s_items = self._printed_header_reask("Solution", s_items, s_pages,
                                              "_printed_s_hdrs", SOLUTION_PROMPT)
+        # C1 BACKSTOP (idempotent): after any re-ask, re-split at printed
+        # header boundaries -- a fix response can re-introduce the fold.
+        s_items = self._c1_split_solutions(s_items)
         if s_ok is not True:
             self.notes.append(f"solutions phase unresolved: {s_ok}")
         qp.save_state(self.state)
