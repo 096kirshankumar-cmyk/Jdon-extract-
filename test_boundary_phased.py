@@ -60,6 +60,17 @@ class T(unittest.TestCase):
         self.assertIsNone(m2["answer_key_block"])
         self.assertIsNone(m2["solution_block"])
 
+    def test_clamp_solution_cannot_start_before_questions(self):
+        """OBG-002 live: printed S span 31-46 while Q starts at 32.
+        Used S must not start before Q."""
+        r = bph.ChapterRunner("x.pdf", "OBG", 2, "/tmp", model=object(),
+                              state={})
+        r._printed_s_hdrs = {45: {1}, 46: {2}}
+        q, a, s = r._clamp_zone_order(
+            list(range(32, 38)), [37, 38], list(range(31, 47)), 31, 46)
+        self.assertGreaterEqual(min(s), min(q))
+        self.assertGreaterEqual(min(s), 37)  # numbered S headers from 45, floor A
+
     def test_content_lock_static(self):
         """The engine may write extraction output, but must NEVER touch the
         human-edit primitives (flag-don't-fix: content edits are for /review)."""
@@ -799,6 +810,7 @@ class EngineCase(unittest.TestCase):
         r = self._runner(model)
         res = r.run(5, 13)
         self.assertTrue(res["committed"])
+        self.assertFalse(res["locked"])  # BUG 2: gate violation => no lock
         row = [json.loads(l) for l in
                (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
                if l.strip()][0]
@@ -1126,6 +1138,7 @@ class EngineCase(unittest.TestCase):
         r._printed_s_hdrs = {11: {1}, 12: {2}}
         res = r.run(5, 13)
         self.assertTrue(res["committed"])
+        self.assertFalse(res["locked"])  # BUG 2: gate violation => no lock
         gate = qp.DATA_DIR / "export_gate.jsonl"
         kinds = [json.loads(l)["kind"] for l in gate.read_text().splitlines()
                  if l.strip()]

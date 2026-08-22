@@ -2480,13 +2480,28 @@ def download_final():
     if gate["locked"]:
         return (f"🔒 Final zip LOCKED: {gate['why']}. Pehle /review par sab "
                 f"decide karo.", 423)
-    res = review_queue.build_final_zip(out)
+    try:
+        res = review_queue.build_final_zip(out)
+    except FileNotFoundError as e:
+        q = review_queue.collect_review_queue(out)
+        pending = q["counts"]["blocker"] + q["counts"]["review"]
+        return (f"Final zip abhi ready nahi hai "
+                f"({e.filename or e} missing). "
+                f"{pending} issue(s) pending in /review.", 404)
     if not res.get("ok"):
-        return f"final zip build failed: {res}", 500
+        q = review_queue.collect_review_queue(out)
+        pending = q["counts"]["blocker"] + q["counts"]["review"]
+        why = res.get("why") or res
+        return (f"Final zip abhi ready nahi hai: {why}. "
+                f"{pending} issue(s) pending in /review.", 409)
+    zpath = Path(res["path"])
+    if not zpath.exists():
+        return ("Final zip abhi ready nahi hai (build reported ok but "
+                "final_export.zip is missing on disk).", 404)
     log(f"🚀 FINAL zip built: {res['receipt']['chapters']} chapter(s), "
         f"{res['receipt']['images_shipped']} image(s), "
         f"{res['receipt']['human_edits']} human edit(s) -> final_export.zip")
-    return send_file(res["path"], as_attachment=True,
+    return send_file(str(zpath), as_attachment=True,
                      download_name="final_export.zip")
 
 

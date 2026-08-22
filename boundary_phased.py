@@ -1584,7 +1584,11 @@ class ChapterRunner:
             self.notes.append(f"printed-zone probe failed ({e}) -- "
                               "model zones kept")
         if not printed:
-            return m_q, m_a, m_s
+            q_pages, a_pages, s_pages = self._clamp_zone_order(
+                m_q, m_a, m_s, ch_first, ch_last)
+            self._log_zone_audit(bounds, m_q, m_a, m_s, None,
+                                 q_pages, a_pages, s_pages, ch_first, ch_last)
+            return q_pages, a_pages, s_pages
         q_pages = m_q
         if printed["q"]:
             q_pages = list(range(min(printed["q"]),
@@ -1596,12 +1600,86 @@ class ChapterRunner:
         a_pages = m_a
         if printed["keys"]:
             a_pages = sorted(set(printed["keys"]))
+        q_pages, a_pages, s_pages = self._clamp_zone_order(
+            q_pages, a_pages, s_pages, ch_first, ch_last)
         if q_pages != m_q or s_pages != m_s or a_pages != m_a:
             self.notes.append(
                 f"zones corrected by PRINTED headers (model said "
-                f"Q{m_q[0]}-{m_q[-1]}/A{m_a}/S{m_s[0]}-{m_s[-1]}; printed says "
-                f"Q{q_pages[0]}-{q_pages[-1]}/A{a_pages}/S{s_pages[0]}-{s_pages[-1]})")
+                f"Q{m_q[0] if m_q else '?'}-{m_q[-1] if m_q else '?'}/A{m_a}/"
+                f"S{m_s[0] if m_s else '?'}-{m_s[-1] if m_s else '?'}; printed says "
+                f"Q{q_pages[0] if q_pages else '?'}-{q_pages[-1] if q_pages else '?'}/"
+                f"A{a_pages}/S{s_pages[0] if s_pages else '?'}-"
+                f"{s_pages[-1] if s_pages else '?'})")
+        self._log_zone_audit(bounds, m_q, m_a, m_s, printed,
+                             q_pages, a_pages, s_pages, ch_first, ch_last)
         return q_pages, a_pages, s_pages
+
+    def _clamp_zone_order(self, q_pages, a_pages, s_pages, ch_first, ch_last):
+        """Solution cannot start before the question block.
+
+        Printed-header overrides can pick a false-positive on the chapter
+        TITLE page (OBG-002 live: S used 31-46 while Q started at 32).
+        Drop S pages before Q start; prefer S pages at/after the answer-key
+        (or last Q page). Numbered 'Solution to Question N' headers win
+        over a bare 'Detailed Explanations' hit on an earlier page.
+        """
+        q_pages = list(q_pages or [])
+        a_pages = list(a_pages or [])
+        s_pages = list(s_pages or [])
+        if not q_pages or not s_pages:
+            return q_pages, a_pages, s_pages
+        q_lo = min(q_pages)
+        floor = q_lo
+        if a_pages:
+            floor = max(floor, min(a_pages))
+        elif q_pages:
+            floor = max(floor, max(q_pages))
+        numbered = []
+        for pg, qs in (getattr(self, "_printed_s_hdrs", None) or {}).items():
+            if qs and pg >= q_lo:
+                numbered.append(pg)
+        if numbered:
+            valid = [pg for pg in s_pages if pg >= min(numbered)]
+        else:
+            valid = [pg for pg in s_pages if pg >= q_lo]
+            after_floor = [pg for pg in valid if pg >= floor]
+            if after_floor:
+                valid = after_floor
+        if valid:
+            s_pages = list(range(min(valid),
+                                 min(max(valid) + 1, ch_last) + 1))
+        return q_pages, a_pages, s_pages
+
+    def _log_zone_audit(self, bounds, m_q, m_a, m_s, printed,
+                        q_pages, a_pages, s_pages, ch_first, ch_last):
+        """Always print RAW model JSON vs model-derived vs printed vs USED
+        so a silent mismatch cannot hide (BUG 1)."""
+        raw = json.dumps(bounds, ensure_ascii=False)
+        print(f"[BPH] {self.chapter_id}: RAW boundary JSON: {raw}")
+        print(f"[BPH] {self.chapter_id}: model-derived zones "
+              f"Q {self._fmt_span(m_q)} | A {m_a or '-'} | S {self._fmt_span(m_s)}")
+        if printed:
+            print(f"[BPH] {self.chapter_id}: printed-header probe "
+                  f"Q pages {sorted(printed.get('q') or [])} | "
+                  f"keys {printed.get('keys') or []} | "
+                  f"S hits {sorted(printed.get('s') or [])}")
+        else:
+            print(f"[BPH] {self.chapter_id}: printed-header probe: none "
+                  f"(scanned / empty text layer) -- model zones stand")
+        print(f"[BPH] {self.chapter_id}: USED zones "
+              f"Q {self._fmt_span(q_pages)} | A {a_pages or '-'} | "
+              f"S {self._fmt_span(s_pages)} "
+              f"(chapter file pages {ch_first}-{ch_last})")
+        if s_pages and q_pages and min(s_pages) < min(q_pages):
+            print(f"[BPH] {self.chapter_id}: IMPOSSIBLE zone leftover: "
+                  f"S starts at {min(s_pages)} before Q {min(q_pages)}")
+
+    @staticmethod
+    def _fmt_span(pages):
+        pages = list(pages or [])
+        if not pages:
+            return "-"
+        return f"{pages[0]}-{pages[-1]}"
 
     # -- Record assembly ------------------------------------------------------
     def _build_records(self, q_items, a_items, s_items):
@@ -1880,6 +1958,12 @@ class ChapterRunner:
                   f"violation(s) -- NOT a clean export")
             for kind, qn, detail in violations[:25]:
                 print(f"    - {kind} {qn}: {detail}")
+            # BUG 2: a non-empty gate must NEVER lock. Cross-check LOCKED
+            # while missing_solution/INCOMPLETE shipped as lock=True (OBG-001).
+            if locked:
+                print(f"  [GATE] {self.chapter_id}: forcing lock=False "
+                      f"(export-gate violations present)")
+                locked = False
         else:
             print(f"  [GATE] {self.chapter_id}: export gate CLEAN "
                   f"(stems/options/answers/solutions/images/assets all "
@@ -1950,7 +2034,7 @@ class ChapterRunner:
               f"| lock={'yes' if locked else 'NO (flagged for review)'}")
         qp.clear_render_cache()
         gc.collect()
-        return chapter_rows
+        return chapter_rows, locked
 
     # -- Steps 0-8 -------------------------------------------------------------
     def run(self, ch_first, ch_last):
@@ -2062,12 +2146,49 @@ class ChapterRunner:
         print(f"[BPH] {self.chapter_id}: final cross-check lock={locked}")
 
         page_section = {p: "S" for p in s_pages}
-        rows = self._commit(ch_first, ch_last, page_section,
+        rows, locked = self._commit(ch_first, ch_last, page_section,
                             q_items, a_items, s_items, locked, pre_rows)
         return {"locked": locked, "committed": True,
                 "chapter_id": self.chapter_id, "questions": len(q_items),
                 "answers": len(a_items), "solutions": len(s_items),
                 "rows_written": len(rows), "notes": self.notes}
+
+
+def unlock_gated_chapters(state):
+    """BUG 2 backfill: a chapter that shipped lock=True despite export-gate
+    violations (OBG-001 missing_solution) must leave chapters_done so the
+    next run re-extracts it into review instead of treating it as clean."""
+    gate = qp.DATA_DIR / "export_gate.jsonl"
+    if not gate.exists() or not state:
+        return
+    dirty = set()
+    try:
+        for line in gate.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            cid = row.get("chapter_id")
+            kind = row.get("kind") or ""
+            if cid and kind in (
+                    "missing_solution", "missing_answer", "missing_stem",
+                    "bad_options", "duplicate_solution"):
+                dirty.add(cid)
+    except Exception:
+        return
+    if not dirty:
+        return
+    progress = state.get("pdf_progress") or {}
+    n = 0
+    for subj, rec in progress.items():
+        done = rec.get("chapters_done") or []
+        keep = [c for c in done if c not in dirty]
+        if len(keep) != len(done):
+            rec["chapters_done"] = keep
+            n += len(done) - len(keep)
+    if n:
+        qp.save_state(state)
+        print(f"[BPH] unlocked {n} chapter(s) that had export-gate "
+              f"violations -- they will re-extract on this run")
 
 
 def run_chapter(pdf_path, subject, chapter_no, out_root=None, page_offset=0,
@@ -2093,6 +2214,7 @@ def run_all(pdf_cfgs=None, state=None):
     qp.DATA_DIR.mkdir(parents=True, exist_ok=True)
     qp.ASSETS_DIR.mkdir(parents=True, exist_ok=True)
     state = state if state is not None else qp.load_state()
+    unlock_gated_chapters(state)
     gemini_keys.init(state, qp.MAX_CALLS_PER_DAY)
     model = gemini_keys.track(genai.GenerativeModel(qp.GEMINI_MODEL))
     qp.reset_daily_counter_if_needed(state)

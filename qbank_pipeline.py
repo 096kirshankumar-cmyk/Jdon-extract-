@@ -2191,9 +2191,12 @@ def _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q,
             cap = max(cap, min(len(entry["question"]) + 1,
                                IMAGE_CAP_CEILING_QUESTION))
         if len(entry["question"]) >= cap:
-            print(f"  [WARN] over-attribution guard: {qid} already has "
-                  f"{len(entry['question'])} question images (cap {cap}, "
-                  f"source {claim_source}) -- refusing {rel}; left for review")
+            _warn_key = ("overattr", qid, "question", rel)
+            if _warn_key not in _UNION_DROP_LOGGED:
+                _UNION_DROP_LOGGED.add(_warn_key)
+                print(f"  [WARN] over-attribution guard: {qid} already has "
+                      f"{len(entry['question'])} question images (cap {cap}, "
+                      f"source {claim_source}) -- refusing {rel}; left for review")
             _record_image_ownership(subject, chapter_id, src_page, rel, qid,
                                     kind, claim_source,
                                     evidence or f"cap {cap} reached "
@@ -2217,9 +2220,12 @@ def _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q,
             cap = max(cap, min(len(entry["solution"]) + 1,
                                IMAGE_CAP_CEILING_SOLUTION))
         if len(entry["solution"]) >= cap:
-            print(f"  [WARN] over-attribution guard: {qid} already has "
-                  f"{len(entry['solution'])} solution images (cap {cap}, "
-                  f"source {claim_source}) -- refusing {rel}; left for review")
+            _warn_key = ("overattr", qid, "solution", rel)
+            if _warn_key not in _UNION_DROP_LOGGED:
+                _UNION_DROP_LOGGED.add(_warn_key)
+                print(f"  [WARN] over-attribution guard: {qid} already has "
+                      f"{len(entry['solution'])} solution images (cap {cap}, "
+                      f"source {claim_source}) -- refusing {rel}; left for review")
             _record_image_ownership(subject, chapter_id, src_page, rel, qid,
                                     kind, claim_source,
                                     evidence or f"cap {cap} reached "
@@ -2579,6 +2585,8 @@ def clear_render_cache():
     a 300+ page book. Also drops the OCR anchor cache (same lifecycle)."""
     _RENDER_CACHE.clear()
     _OCR_ANCHOR_CACHE.clear()
+    _UNION_HEADER_CACHE.clear()
+    _UNION_DROP_LOGGED.clear()
 
 
 def render_page_png(pdf_path, file_page, dpi=150):
@@ -3164,6 +3172,8 @@ def claim_page_images(imgs, pdf_path, file_page, subject, chapter_no,
 _OCR_ANCHOR_CACHE = {}          # (pdf, page, dpi) -> [(kind, qn, y_pt)]
 _OCR_ANCHOR_XY = {}             # same key -> [(kind, qn, y, x, strong)]
 _OCR_ANCHOR_CACHE_MAX = 64      # tiny tuples; covers several chapters
+_UNION_HEADER_CACHE = {}        # (pdf, page, dpi, section, rec_sig) -> headers
+_UNION_DROP_LOGGED = set()      # (pdf, page, kind, qn, y) already printed
 
 
 def _ocr_anchors_for_page(pdf_path, file_page, dpi=150):
@@ -3300,6 +3310,23 @@ def _plausible_qn_for_chapter(qn, chapter_records):
 
 def union_block_headers_on_page(pdf_path, file_page, chapter_records, dpi=150,
                                 section=None):
+    recs = [q for q in (chapter_records or {}) if isinstance(q, int)]
+    rec_sig = (min(recs) if recs else None, max(recs) if recs else None,
+               len(recs))
+    ukey = (str(pdf_path), int(file_page), int(dpi), section, rec_sig)
+    hit = _UNION_HEADER_CACHE.get(ukey)
+    if hit is not None:
+        return hit
+    headers = _union_block_headers_on_page_uncached(
+        pdf_path, file_page, chapter_records, dpi=dpi, section=section)
+    _UNION_HEADER_CACHE[ukey] = headers
+    if len(_UNION_HEADER_CACHE) > 256:
+        _UNION_HEADER_CACHE.pop(next(iter(_UNION_HEADER_CACHE)))
+    return headers
+
+
+def _union_block_headers_on_page_uncached(pdf_path, file_page, chapter_records,
+                                          dpi=150, section=None):
     """[(kind, q_no, y)] block anchors for one page = text layer UNION OCR,
     sorted top-first (largest y first) -- the SAME consumer contract as
     block_headers_on_page.
@@ -3374,6 +3401,10 @@ def union_block_headers_on_page(pdf_path, file_page, chapter_records, dpi=150,
                         continue
                 kept.append(a)
             for k, q, y in dropped:
+                dkey = (str(pdf_path), int(file_page), k, q, int(round(y)))
+                if dkey in _UNION_DROP_LOGGED:
+                    continue
+                _UNION_DROP_LOGGED.add(dkey)
                 print(f"  [IMG] page {file_page}: dropping uncorroborated weak "
                       f"OCR anchor ({k} q{q} @y{y:.0f}) -- bare token with no "
                       f"text-layer line at that height (figure texture / "
