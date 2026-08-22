@@ -68,8 +68,8 @@ BLOCKER_KINDS = {
     "incomplete_records",       # completeness.json says records missing
     # boundary engine (the one extraction method): a chapter that could not
     # prove itself LOCKED must hold the Final zip shut until a human looks.
-    "chapter_not_locked",       # cross-check/count guards refused, or the
-                                # chapter failed before any commit
+    # chapter_not_locked is NOT a zip BLOCKER when some rows are READY
+    # (chapter PARTIAL). Only a zero-commit / block-fail holds the zip.
     "phase_unresolved",         # a verify loop exhausted its fix attempts
     "duplicate_solution",       # two questions shipped near-identical solution
                                 # text (label misassignment) -- needs a human

@@ -65,9 +65,11 @@ import gemini_keys
 import qbank_pipeline as qp
 import review_queue as rq
 import split_outputs
+import header_index
+import crop_parse
 
 MAX_FIX_ATTEMPTS = 3
-PAGE_CHUNK = 7            # pages per extraction call (small = accurate)
+PAGE_CHUNK = 7            # boundary detect only; Q/S extract uses crops
 
 # Tests flip this off; production paces every Gemini request through
 # qp._pace_gemini_call (free tier ~15 RPM).
@@ -109,6 +111,41 @@ def _png_bytes(pdf_path, page, dpi=110):
                    capture_output=True, timeout=45)
     out = pre.with_suffix(".png")
     return out.read_bytes() if out.exists() else None
+
+
+def _crop_strip_png(pdf_path, page, y_hi, y_lo, dpi=130):
+    """Render one page and crop [y_hi .. y_lo] (PDF-ish y, larger=higher).
+
+    Isolated evidence for Gemini: one question/solution strip, not 7 pages.
+    """
+    try:
+        png, scale, ph = qp.render_page_png(pdf_path, page, dpi=dpi)
+    except Exception:
+        png = None
+        scale, ph = 1.0, None
+    if png is None:
+        raw = _png_bytes(pdf_path, page, dpi=dpi)
+        if not raw:
+            return None
+        try:
+            from PIL import Image
+            import io
+            png = Image.open(io.BytesIO(raw)).convert("RGB")
+            scale = png.height / float(ph or 792)
+        except Exception:
+            return raw
+    w, h = png.size
+    scale = scale or (h / 792.0)
+    # PDF y -> image y from top
+    top = int(max(0, h - (float(y_hi) * scale)))
+    bot = int(min(h, h - (float(y_lo) * scale)))
+    if bot <= top + 8:
+        bot = min(h, top + 40)
+    crop = png.crop((0, top, w, bot))
+    import io
+    buf = io.BytesIO()
+    crop.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def _chunk_pages(pages, n):
@@ -681,6 +718,9 @@ class ChapterRunner:
                                        # chapter (FIX B phantom-q_no guard)
         self._printed_s_hdrs = {}      # page -> {qn}: printed Solution headers
         self._printed_key = {}         # qn -> letter from printed key grid
+        self._visual_headers = []      # pixel/OCR header index (not pdftotext)
+        self._key_evidence = {}        # qn -> {letter, method, pages}
+        self._key_evidence_required = False
 
     # ------------------------------------------------------------------
     # THE model-call choke point
@@ -737,6 +777,32 @@ class ChapterRunner:
         files.append(prompt)
         return self._gen(files)
 
+    def _call_crops(self, ivals, prompt, dpi=130):
+        """Gemini on isolated header-interval crops only (not 7-page windows)."""
+        pages = [iv["start_page"] for iv in ivals]
+        files = [f"ISOLATED CROPS (one strip per printed header; file pages "
+                 f"{pages}). Transcribe ONLY what is in each crop. Do not "
+                 f"invent from chapter context."]
+        for iv in ivals:
+            for st in iv.get("strips") or []:
+                b = _crop_strip_png(self.pdf, st["page"], st["y_hi"],
+                                    st["y_lo"], dpi=dpi)
+                if b:
+                    files.append({"mime_type": "image/png", "data":
+                                  base64.b64encode(b).decode()})
+        files.append(prompt)
+        return self._gen(files)
+
+    def _visual_intervals(self, label):
+        recs = self._visual_headers or []
+        if not recs:
+            return []
+        if label == "Question":
+            return header_index.intervals(recs, header_index.T_QUESTION)
+        if label == "Solution":
+            return header_index.intervals(recs, header_index.T_SOLUTION)
+        return []
+
     def _ledger(self, pass_name, pages, status, n_items, note=""):
         row = qp._ledger_pass(self.chapter_id, self.subject, self.chapter_no,
                               pass_name, pages or [], status, n_items, note)
@@ -745,6 +811,35 @@ class ChapterRunner:
 
     # -- Step 0 --------------------------------------------------------------
     def detect_boundaries(self, ch_first, ch_last):
+        """Gemini boundary only if visual header index is empty."""
+        try:
+            self._visual_headers = header_index.scan_chapter(
+                self.pdf, ch_first, ch_last)
+        except Exception as e:
+            self.notes.append(f"visual header index failed ({e})")
+            self._visual_headers = []
+        vis = header_index.index_sets(self._visual_headers)
+        if vis["q_ns"] and vis["s_ns"]:
+            q_lo = min(vis["q_pages"])
+            s_lo = min(vis["s_pages"]) if vis["s_pages"] else None
+            k_lo = min(vis["key_pages"]) if vis["key_pages"] else None
+            print(f"[BPH] {self.chapter_id}: skip Gemini BOUNDARY "
+                  f"(visual Q{sorted(vis['q_ns'])} "
+                  f"S{sorted(vis['s_ns'])} key={sorted(vis['key_pages'])})")
+            return {
+                "confidence": "high",
+                "notes": "zones from visual header index; no Gemini boundary",
+                "question_block": {"start_page": q_lo,
+                                   "start_position": "top"},
+                "answer_key_block": (
+                    {"start_page": k_lo, "start_position": "middle",
+                     "end_page": max(vis["key_pages"]),
+                     "end_position": "bottom"} if k_lo else None),
+                "solution_block": {"start_page": s_lo,
+                                   "start_position": "top",
+                                   "end_page": ch_last,
+                                   "end_position": "bottom"} if s_lo else None,
+            }
         pages = list(range(ch_first, ch_last + 1))
         res = None
         for attempt in range(2):                    # spec: low conf -> re-check
@@ -777,7 +872,113 @@ class ChapterRunner:
         return res
 
     # -- Phase extraction helper ---------------------------------------------
+    def _geom_item_from_interval(self, iv, label):
+        """CLEAN text-layer parse of one header interval. None if not usable."""
+        blobs = []
+        for st in iv.get("strips") or []:
+            try:
+                txt = qp.pdftotext_page(self.pdf, st["page"]) or ""
+            except Exception:
+                txt = ""
+            h = header_index.text_layer_health(txt)
+            if h in ("EMPTY", "GARBLED"):
+                return None
+            blobs.append(txt)
+        blob = "\n".join(blobs)
+        if header_index.text_layer_health(blob) != "CLEAN":
+            return None
+        if label == "Question":
+            return crop_parse.parse_question_text(blob, iv["n"])
+        if label == "Solution":
+            return crop_parse.parse_solution_text(blob, iv["n"])
+        return None
+
+    def _extract_from_crops(self, ivals, prompt_tmpl, label, pass_name, dpi=130):
+        """Geometric CLEAN parse first; Gemini only leftover crops (max 4)."""
+        out = []
+        leftover = []
+        for iv in ivals:
+            it = self._geom_item_from_interval(iv, label)
+            if it and (
+                    (label == "Question" and it.get("stem")
+                     and len(_norm_options(it.get("options"))[0]) >= 4)
+                    or (label == "Solution" and it.get("solution_text"))):
+                it["source_page"] = iv["start_page"]
+                it["source_page_range"] = [iv["start_page"], iv["end_page"]]
+                out.append(it)
+            else:
+                leftover.append(iv)
+        if leftover:
+            print(f"[BPH] {self.chapter_id}: {pass_name} geom ok={len(out)} "
+                  f"gemini_crops={len(leftover)}")
+        for batch in _chunk_pages(leftover, 4):
+            lo = batch[0]["start_page"]
+            hi = batch[-1]["end_page"]
+            p = prompt_tmpl.format(chapter_name=self.chapter_id,
+                                   start=lo, end=hi)
+            p = (p + "\n\nNOTE: Images are CROPS of a single printed item "
+                 "(header → next header). Extract THAT item only. "
+                 f"Expected q_nos in this batch: "
+                 f"{[iv['n'] for iv in batch]}.")
+            items = None
+            for reask in range(2):
+                try:
+                    raw = self._call_crops(batch, p, dpi=dpi)
+                except ModelBlocked:
+                    self._ledger(pass_name, [iv["start_page"] for iv in batch],
+                                 qp.PASS_STATUS_UNRESOLVED, 0,
+                                 "model blocked on crop")
+                    self.notes.append(f"{pass_name} crop unresolved (blocked)")
+                    break
+                items = _unwrap_items(_parse_json(raw))
+                if isinstance(items, list):
+                    break
+            if not isinstance(items, list):
+                self._ledger(pass_name, [iv["start_page"] for iv in batch],
+                             qp.PASS_STATUS_UNRESOLVED, 0,
+                             "crop batch unparsable")
+                continue
+            expect = {iv["n"] for iv in batch}
+            kept = []
+            for it in items:
+                qn0 = _item_qn(it)
+                if not isinstance(it, dict) or qn0 is None:
+                    continue
+                _normalize_phase_item(label, it)
+                it["_qn"] = qn0
+                it["_header_n"] = qn0 if qn0 in expect else None
+                it["_continuation"] = _is_continuation_marker(_item_qno_raw(it))
+                if pass_name == "Q" and self._printed_q_max is not None \
+                        and qn0 > self._printed_q_max:
+                    continue
+                # stamp source from the matching interval
+                for iv in batch:
+                    if iv["n"] == qn0:
+                        it["source_page"] = iv["start_page"]
+                        it["source_page_range"] = [iv["start_page"],
+                                                   iv["end_page"]]
+                        break
+                kept.append(it)
+            out.extend(kept)
+            self._ledger(pass_name, [iv["start_page"] for iv in batch],
+                         qp.PASS_STATUS_SUCCESS if kept
+                         else qp.PASS_STATUS_PARTIAL, len(kept),
+                         "crop extract")
+        return self._merge_phase_items(out)
+
     def _extract_phase(self, pages, prompt_tmpl, label, pass_name, dpi=110):
+        ivals = self._visual_intervals(label)
+        if ivals and label in ("Question", "Solution"):
+            # Final rule: stem/options/solution from THAT crop only.
+            # No 7-page fallback — empty crop stays empty + flagged.
+            cropped = self._extract_from_crops(
+                ivals, prompt_tmpl, label, pass_name, dpi=max(dpi, 130))
+            if label == "Solution":
+                cropped = self._c1_split_solutions(cropped or [])
+            if not cropped:
+                self.notes.append(
+                    f"{pass_name}: crop extract empty (no 7-page fallback)")
+            return cropped or []
         out = []
         for chunk in _phase_chunks(pages):
             p = prompt_tmpl.format(chapter_name=self.chapter_id,
@@ -940,12 +1141,26 @@ class ChapterRunner:
         return kept
 
     @staticmethod
+    def _item_completeness(it):
+        """Higher is more complete. Used to pick a winner instead of first-seen."""
+        opts, _ = _norm_options(it.get("options") if it else None)
+        stem = str((it or {}).get("stem") or (it or {}).get("solution_text") or "")
+        conf = str((it or {}).get("text_confidence") or "").lower()
+        score = 0
+        score += min(len(opts), 8) * 10          # 4 options >> 3
+        score += 3 if len(stem) > 40 else (1 if stem.strip() else 0)
+        score += 2 if conf == "high" else (1 if conf == "medium" else 0)
+        score += 4 if it and it.get("_header_n") else 0
+        return score
+
+    @staticmethod
     def _merge_phase_items(items):
-        """Duplicate/continuation safety at intake: two chunks (or an honest
-        '4 (cont.)' spill) can name the same q_no. MERGE them fill-only --
-        existing non-empty fields win, options extend, pages union. No value
-        is ever silently overwritten (conflicts go to the verify loop via
-        text_confidence); nothing is dropped."""
+        """Duplicate/continuation merge by COMPLETENESS, not first-seen.
+
+        Fill-only (old) made a 3-option first chunk permanently beat a later
+        4-option crop (Q24 option D on the next page). Winner is now the
+        more complete item; the loser only fills holes the winner still has.
+        """
         by_qn = {}
         order = []
         for it in items:
@@ -956,28 +1171,32 @@ class ChapterRunner:
                 by_qn[qn] = dict(it)
                 order.append(qn)
                 continue
-            base = by_qn[qn]
-            for k, v in it.items():
+            a, b = by_qn[qn], dict(it)
+            if ChapterRunner._item_completeness(b) > ChapterRunner._item_completeness(a):
+                a, b = b, a
+            # a is winner; b fills holes only
+            for k, v in b.items():
                 if k in ("_qn", "_continuation"):
                     continue
                 if k == "options":
-                    merged, _ = _norm_options(base.get("options"))
+                    merged, _ = _norm_options(a.get("options"))
                     for letter, text in _norm_options(v)[0].items():
                         if not merged.get(letter):
                             merged[letter] = text
-                    base["options"] = merged
+                    a["options"] = merged
                 elif k == "source_page_range":
-                    lo = (base.get("source_page_range") or [None])[0]
-                    hi = (base.get("source_page_range") or [None, None])[-1]
-                    for p in (v or []):
-                        lo = p if lo is None else min(lo, p)
-                        hi = p if hi is None else max(hi, p)
-                    base["source_page_range"] = [x for x in (lo, hi)
-                                                 if x is not None]
-                elif not base.get(k) and v not in (None, "", [], {}):
-                    base[k] = v                     # fill-only
-            if it.get("_continuation"):
-                base["_seen_continuation"] = True
+                    lo = (a.get("source_page_range") or [None])[0]
+                    hi = (a.get("source_page_range") or [None, None])[-1]
+                    for pg in (v or []):
+                        lo = pg if lo is None else min(lo, pg)
+                        hi = pg if hi is None else max(hi, pg)
+                    a["source_page_range"] = [x for x in (lo, hi)
+                                              if x is not None]
+                elif not a.get(k) and v not in (None, "", [], {}):
+                    a[k] = v
+            if b.get("_continuation") or a.get("_continuation"):
+                a["_seen_continuation"] = True
+            by_qn[qn] = a
         return [by_qn[q] for q in order]
 
     # -- C1: deterministic split at printed solution headers -------------------
@@ -1431,6 +1650,10 @@ class ChapterRunner:
                 txt = ""
             if not txt.strip():
                 continue                      # scanned page: no opinion
+            health = header_index.text_layer_health(txt)
+            if health in ("EMPTY", "GARBLED"):
+                self.notes.append(f"p{p} text-layer {health} -- not printed")
+                continue                      # pdftotext is not printed
             read_pages += 1
             qh = {int(m.group(1)) for m in self._QH_TXT.finditer(txt)}
             sh = {int(m.group(1)) for m in self._SH_TXT.finditer(txt)
@@ -1518,6 +1741,8 @@ class ChapterRunner:
             except Exception:
                 txt = ""
             if not txt.strip():
+                continue
+            if header_index.text_layer_health(txt) in ("EMPTY", "GARBLED"):
                 continue
             for m in self._KEYROW_TXT.finditer(txt):
                 printed_key[int(m.group(1))] = m.group(2).upper()
@@ -1721,6 +1946,29 @@ class ChapterRunner:
         except Exception as e:
             self.notes.append(f"printed-zone probe failed ({e}) -- "
                               "model zones kept")
+        # Visual header index (RENDER + OCR). pdftotext is never authoritative
+        # when this index sees Question/Solution/Answer-Key bands.
+        try:
+            if not self._visual_headers:
+                self._visual_headers = header_index.scan_chapter(
+                    self.pdf, ch_first, ch_last)
+            vis = header_index.index_sets(self._visual_headers)
+            if vis["q_ns"]:
+                self._printed_q_hdrs = vis["q_hdrs"] or self._printed_q_hdrs
+                self._printed_s_hdrs = vis["s_hdrs"] or self._printed_s_hdrs
+                self._printed_q_max = max(vis["q_ns"])
+                if printed is None:
+                    printed = {"q": set(), "s": set(), "keys": []}
+                printed["q"] = vis["q_pages"] or printed.get("q") or set()
+                printed["s"] = vis["s_pages"] or printed.get("s") or set()
+                if vis["key_pages"]:
+                    printed["keys"] = sorted(vis["key_pages"])
+                print(f"[BPH] {self.chapter_id}: VISUAL header index "
+                      f"Q{sorted(vis['q_ns'])} S{sorted(vis['s_ns'])} "
+                      f"key_pages={sorted(vis['key_pages'])} "
+                      f"n={len(self._visual_headers)}")
+        except Exception as e:
+            self.notes.append(f"visual header index failed ({e})")
         if not printed:
             q_pages, a_pages, s_pages = self._clamp_zone_order(
                 m_q, m_a, m_s, ch_first, ch_last)
@@ -1819,7 +2067,126 @@ class ChapterRunner:
             return "-"
         return f"{pages[0]}-{pages[-1]}"
 
-    # -- Record assembly ------------------------------------------------------
+    def _attach_key_evidence(self, a_pages):
+        """Answers are READY only with key-TABLE evidence (pixels/OCR of the
+        table pages). pdftotext _printed_key is a hint, never enough alone
+        on a garbled page. Gemini table letters must cite this map."""
+        ev = {}
+        if a_pages:
+            try:
+                ocr_map = header_index.ocr_key_table(self.pdf, a_pages)
+            except Exception:
+                ocr_map = {}
+            for n, let in ocr_map.items():
+                ev[n] = {"letter": let, "method": "key_table_ocr",
+                         "pages": list(a_pages)}
+        # Dual independent read: CLEAN text-layer on KEY PAGES only.
+        # Disagree with OCR → flag, do not pick a winner (flag-don't-fix).
+        layer = {}
+        for p in (a_pages or []):
+            try:
+                txt = qp.pdftotext_page(self.pdf, p) or ""
+            except Exception:
+                txt = ""
+            if header_index.text_layer_health(txt) != "CLEAN":
+                continue
+            layer.update(header_index.parse_key_rows_from_ocr_text(txt))
+        for n, let in layer.items():
+            if n in ev and ev[n].get("letter") and ev[n]["letter"] != let:
+                ev[n]["conflict"] = let
+                ev[n]["method"] = "key_conflict"
+                self.notes.append(
+                    f"key dual-read conflict q{n}: "
+                    f"ocr={ev[n].get('letter')} layer={let}")
+            elif n not in ev:
+                ev[n] = {"letter": let, "method": "text_layer_hint",
+                         "pages": list(a_pages or [])}
+        self._key_evidence = ev
+        # Only *require* evidence when we actually OCR'd a table. Tests /
+        # scanned-empty pages must not make every answer REVIEW_NEEDED.
+        self._key_evidence_required = any(
+            v.get("method") == "key_table_ocr" for v in ev.values())
+        if ev:
+            print(f"[BPH] {self.chapter_id}: key evidence for "
+                  f"{len(ev)} row(s) ({','.join(sorted({v['method'] for v in ev.values()}))})")
+        return ev
+
+    def _write_audit_artifacts(self, ch_first, ch_last, q_items, a_items, s_items):
+        """Sidecar audit files. Never changes questions.jsonl / zip schema."""
+        root = qp.DATA_DIR / "audit" / self.chapter_id
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            (root / "header_index.json").write_text(
+                json.dumps(self._visual_headers or [], indent=2,
+                           ensure_ascii=False), encoding="utf-8")
+            health = {}
+            for p in range(int(ch_first), int(ch_last) + 1):
+                try:
+                    t = qp.pdftotext_page(self.pdf, p) or ""
+                except Exception:
+                    t = ""
+                health[str(p)] = header_index.text_layer_health(t)
+            (root / "health_map.json").write_text(
+                json.dumps(health, indent=2), encoding="utf-8")
+            zones = {k: list(v) if not isinstance(v, list) else v
+                     for k, v in (self._zones or {}).items()}
+            (root / "zone_regions.json").write_text(
+                json.dumps(zones, indent=2), encoding="utf-8")
+            (root / "answer_key.json").write_text(
+                json.dumps(self._key_evidence or {}, indent=2),
+                encoding="utf-8")
+            (root / "ledger.json").write_text(
+                json.dumps({
+                    "q": sorted({i.get("_qn") for i in q_items
+                                 if i.get("_qn") is not None}),
+                    "a": sorted({i.get("_qn") for i in a_items
+                                 if i.get("_qn") is not None}),
+                    "s": sorted({i.get("_qn") for i in s_items
+                                 if i.get("_qn") is not None}),
+                    "visual_q": sorted({r["n"] for r in (self._visual_headers or [])
+                                        if r.get("type") == header_index.T_QUESTION
+                                        and r.get("n")}),
+                    "visual_s": sorted({r["n"] for r in (self._visual_headers or [])
+                                        if r.get("type") == header_index.T_SOLUTION
+                                        and r.get("n")}),
+                }, indent=2), encoding="utf-8")
+        except Exception as e:
+            self.notes.append(f"audit artifacts write failed: {e}")
+
+    def _ledger_lock(self, q_items, a_items, s_items):
+        """Chapter LOCK from identity sets — never from Gemini 'LOCKED'."""
+        q = {i.get("_qn") for i in q_items if i.get("_qn") is not None}
+        a = {i.get("_qn") for i in a_items if i.get("_qn") is not None}
+        s = {i.get("_qn") for i in s_items if i.get("_qn") is not None}
+        if any("unresolved" in n for n in self.notes):
+            return False, "phase_unresolved in notes"
+        if not q:
+            return False, "no extracted questions"
+        vis_q = set()
+        vis_s = set()
+        for r in (self._visual_headers or []):
+            if r.get("type") == header_index.T_QUESTION and r.get("n"):
+                vis_q.add(r["n"])
+            if r.get("type") == header_index.T_SOLUTION and r.get("n"):
+                vis_s.add(r["n"])
+        if vis_q and q != vis_q:
+            return False, f"extracted Q {sorted(q)} != visual headers {sorted(vis_q)}"
+        if vis_s and s != vis_s:
+            return False, f"extracted S {sorted(s)} != visual headers {sorted(vis_s)}"
+        key_ns = set(self._key_evidence or {})
+        if key_ns and q != key_ns:
+            return False, f"extracted Q {sorted(q)} != key rows {sorted(key_ns)}"
+        if a and q != a:
+            return False, f"Q {sorted(q)} != A {sorted(a)}"
+        if s and q != s:
+            return False, f"Q {sorted(q)} != S {sorted(s)}"
+        if not a:
+            return False, "no answer-key rows"
+        if not s:
+            return False, "no solutions"
+        return True, "sets equal"
+
+        # -- Record assembly ------------------------------------------------------
     def _build_records(self, q_items, a_items, s_items):
         """phase JSON -> the canonical chapter_records shape the final-row /
         split writers consume. The answer comes ONLY from the answer-key
@@ -1910,6 +2277,17 @@ class ChapterRunner:
             if opt_issue:
                 records[qn]["_options_suspect_reason"] = (
                     "options shape/letters flagged: " + opt_issue)
+            ev = (self._key_evidence or {}).get(qn)
+            if ev:
+                records[qn]["_key_evidence"] = ev
+                if ev.get("method") == "key_conflict":
+                    records[qn]["_review_reasons"].append(
+                        f"dual key read conflict "
+                        f"{ev.get('letter')} vs {ev.get('conflict')}")
+            elif records[qn].get("correct_option") and self._key_evidence_required:
+                records[qn]["_review_reasons"].append(
+                    "answer has no key-table evidence (not READY)")
+            records[qn]["_key_evidence_required"] = self._key_evidence_required
         n_no_ans = sum(1 for r in records.values() if not r["correct_option"])
         n_no_sol = sum(1 for r in records.values() if not r["solution_text"])
         if n_no_ans:
@@ -1934,6 +2312,16 @@ class ChapterRunner:
         unresolved = []
         active_block = None
         pages = list(range(ch_first, ch_last + 1))
+        vis_by_page = {}
+        for r in (self._visual_headers or []):
+            vis_by_page.setdefault(int(r["page"]), []).append(
+                header_index.block_headers_for_page([r], r["page"])[0]
+                if header_index.block_headers_for_page([r], r["page"])
+                else None)
+        vis_clean = {}
+        for p, lst in vis_by_page.items():
+            vis_clean[p] = [x for x in lst if x]
+        qp._VISUAL_HEADERS_BY_PAGE = vis_clean
         # Carry seed: a figure at the very top of the chapter's first imaged
         # page can belong to a block opened earlier. Seed from the nearest
         # printed heading before the first page -- CLAMPED at the chapter's
@@ -1960,6 +2348,11 @@ class ChapterRunner:
                                           self.subject,
                                           qp.ASSETS_DIR / "questions",
                                           skip_hashes=chapter_owned_hashes)
+            if not imgs:
+                qp.share_reprint_obj_ids(
+                    self.pdf, page, True, chapter_records,
+                    image_files_by_q, self.subject, self.chapter_no,
+                    visual_recs=self._visual_headers)
             if imgs:
                 pos = qp.image_positions_on_page(self.pdf, page)
                 ordered = qp._order_imgs_by_position(imgs, pos)
@@ -1998,6 +2391,7 @@ class ChapterRunner:
             if last is not None and qp._plausible_qn_for_chapter(
                     last[1], chapter_records):
                 active_block = (last[0], last[1], page)
+        qp._VISUAL_HEADERS_BY_PAGE = {}
         return unresolved
 
     # -- Previously-open flags for this chapter -------------------------------
@@ -2222,6 +2616,15 @@ class ChapterRunner:
                               "answers stay empty + flagged (never guessed)")
         if a_ok is not True:
             self.notes.append(f"answer-key phase unresolved: {a_ok}")
+        self._attach_key_evidence(a_pages if a_pages else q_pages)
+        # Prefer key-table OCR letter when it exists (pixels). Gemini A
+        # letters are transcription of that table, not a second opinion.
+        for it in a_items:
+            qn = it.get("_qn")
+            ev = (self._key_evidence or {}).get(qn)
+            if ev and ev.get("letter") and ev.get("method") == "key_table_ocr":
+                it["correct_option"] = ev["letter"]
+                it["_key_evidence"] = ev
         s_items = self._extract_phase(s_pages, SOLUTION_PROMPT, "Solution", "S")
         s_items, s_ok = self._verify_phase("Solution", s_items, s_pages)
         s_items = self._printed_header_reask("Solution", s_items, s_pages,
@@ -2258,30 +2661,13 @@ class ChapterRunner:
                     "answers": len(a_items), "solutions": len(s_items),
                     "notes": self.notes}
 
-        same_pages = sorted(set(q_pages) | set(a_pages) | set(s_pages))
-        locked = self._cross_check(q_items, a_items, s_items, same_pages)
-        # deterministic count guards ON TOP of the AI cross-check (spec: 'any
-        # genuine mismatch -> NEEDS_FIX'): the AI can't be trusted with
-        # counts. A phase that produced NOTHING can't ever lock an
-        # item-bearing one.
-        if locked and s_items and len(s_items) > len(q_items) * 2:
-            locked = False
-            self.notes.append(f"count weirdness: {len(q_items)} questions vs "
-                              f"{len(s_items)} solutions")
-        if locked and q_items and (not a_items or len(a_items) * 2 < len(q_items)):
-            locked = False
-            self.notes.append(f"answer-key sparse: {len(q_items)} questions but "
-                              f"only {len(a_items)} keyed rows -- 'inline answer' "
-                              "chapters must attach per question, not lock")
-        if locked and q_items and not s_items:
-            locked = False
-            self.notes.append("solutions phase produced nothing -- "
-                              "never lock a question-only chapter")
-        if locked and a_items and len(a_items) != len(q_items):
-            locked = False
-            self.notes.append(f"count mismatch: {len(q_items)} questions vs "
-                              f"{len(a_items)} answers")
-        print(f"[BPH] {self.chapter_id}: final cross-check lock={locked}")
+        # LOCK is a LEDGER, not a Gemini token (final rule).
+        # header_q_nos == extracted == key_rows == solution_headers.
+        self._write_audit_artifacts(ch_first, ch_last, q_items, a_items, s_items)
+        locked, lock_why = self._ledger_lock(q_items, a_items, s_items)
+        if not locked:
+            self.notes.append("ledger lock refused: " + lock_why)
+        print(f"[BPH] {self.chapter_id}: ledger lock={locked} ({lock_why})")
 
         page_section = {p: "S" for p in s_pages}
         rows, locked = self._commit(ch_first, ch_last, page_section,

@@ -1841,6 +1841,11 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
 
     status_reasons.extend(_build_flags)
 
+    # READY answers must cite a key-table cell (pixels/OCR). A letter
+    # without evidence is REVIEW_NEEDED even if structurally complete.
+    ev = rec.get("_key_evidence")
+    if rec.get("_key_evidence_required") and rec.get("correct_option") and not ev:
+        status_reasons.append("answer missing key-table evidence")
     if structural_missing:
         qa_status = "INCOMPLETE"
     elif status_reasons:
@@ -1891,6 +1896,7 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
         # REVIEW_NEEDED rows are distinguishable and reviewable manually.
         "qa_status": qa_status,
         "qa_reasons": status_reasons or [],
+        "key_evidence": rec.get("_key_evidence"),
     }
 
 
@@ -3195,6 +3201,8 @@ _OCR_ANCHOR_XY = {}             # same key -> [(kind, qn, y, x, strong)]
 _OCR_ANCHOR_CACHE_MAX = 64      # tiny tuples; covers several chapters
 _UNION_HEADER_CACHE = {}        # (pdf, page, dpi, section, rec_sig) -> headers
 _UNION_DROP_LOGGED = set()      # (pdf, page, kind, qn, y) already printed
+# ChapterRunner injects visual (render+OCR) headers: page -> [(kind, n, y)]
+_VISUAL_HEADERS_BY_PAGE = {}
 
 
 def _ocr_anchors_for_page(pdf_path, file_page, dpi=150):
@@ -3371,6 +3379,11 @@ def _union_block_headers_on_page_uncached(pdf_path, file_page, chapter_records,
     text_full = [(k, q, y, kw) for k, q, y, kw in
                  _raw_text_headers_on_page(pdf_path, file_page)
                  if _plausible_qn_for_chapter(q, chapter_records)]
+    for k, q, y in (_VISUAL_HEADERS_BY_PAGE or {}).get(int(file_page), []):
+        if _plausible_qn_for_chapter(q, chapter_records):
+            if not any(k == tk and abs(ty - y) <= 10.0
+                       for tk, _q, ty, _ in text_full):
+                text_full.append((k, q, y, True))
     ocr_full = [(k, q, y, st) for k, q, y, st in
                 [(a[0], a[1], a[2], a[4] if len(a) > 4 else 2)
                  for a in _OCR_ANCHOR_XY.get(
@@ -3460,6 +3473,102 @@ def chapter_anchor_pages(pdf_path, page_numbers, chapter_records, dpi=150,
         except Exception:
             continue
     return idx
+
+
+def share_reprint_obj_ids(pdf_path, page, imgs_empty, chapter_records,
+                          image_files_by_q, subject, chapter_no,
+                          visual_recs=None):
+    """Same XObject id drawn again (OBG obj 2222 p29+p30) is ONE figure.
+
+    extract_real_images skips byte-identical files, so the second page has
+    no leftover to claim. Attach the already-owned final file to the
+    interval owner of THIS draw. Never Gemini.
+    """
+    if not imgs_empty:
+        return 0
+    try:
+        pos = image_positions_on_page(pdf_path, page) or {}
+    except Exception:
+        return 0
+    owned = _owned_files_by_obj(subject)
+    if not owned:
+        return 0
+    n = 0
+    for oid, info in pos.items():
+        if isinstance(oid, str) and "@d" in oid:
+            try:
+                oid_n = int(str(oid).split("@")[0])
+            except ValueError:
+                continue
+        else:
+            try:
+                oid_n = int(oid)
+            except (TypeError, ValueError):
+                continue
+        final = owned.get(oid_n)
+        if not final:
+            continue
+        y_img = info[0]
+        h = info[4] if len(info) > 4 else 0
+        if h and y_img + h < y_img:
+            y_img = y_img + h
+        owner = None
+        if visual_recs:
+            import header_index as hi
+            owner = hi.owner_of_point(visual_recs, page, y_img)
+        if owner is None:
+            headers = union_block_headers_on_page(
+                pdf_path, page, chapter_records)
+            owner = next(((k, q) for k, q, yh in reversed(headers)
+                          if yh > y_img), None)
+        if owner is None:
+            continue
+        kind, qn = owner
+        if qn not in chapter_records:
+            continue
+        entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
+        if final in (entry.get(kind) or []):
+            continue
+        entry.setdefault(kind, []).append(final)
+        print(f"  [IMG] reprint share: obj {oid_n} on page {page} -> "
+              f"q{qn} {kind} (same figure, not a new extract)")
+        _record_image_ownership(
+            subject, f"{subject}-{chapter_no:03d}", page, final,
+            f"{subject}-{chapter_no:03d}-{qn:03d}", kind,
+            "reprint_obj_id",
+            f"same XObject {oid_n} redrawn on page {page}; shared file",
+            confidence="high", outcome="shared", obj_id=oid_n,
+            final_file=final)
+        n += 1
+    return n
+
+
+def _owned_files_by_obj(subject):
+    """obj_id -> final_file from this subject's claimed ledger rows."""
+    out = {}
+    path = DATA_DIR / "image_ownership.jsonl"
+    if not path.exists():
+        return out
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("subject") != subject:
+            continue
+        if row.get("outcome") not in ("claimed", "shared"):
+            continue
+        oid = row.get("obj_id")
+        fn = row.get("final_file") or row.get("file")
+        if oid is not None and fn:
+            out[int(oid) if str(oid).isdigit() else oid] = fn
+    return out
 
 
 def last_block_on_page(pdf_path, file_page, dpi=150, chapter_records=None,
