@@ -388,6 +388,97 @@ class EngineCase(unittest.TestCase):
         self.assertIn("unlettered", row.get("options_suspect") or "")
         self.assertEqual(row["qa_status"], "REVIEW_NEEDED")
 
+    def test_phase_item_alias_intake(self):
+        """OBG ch2 live drift: re-asks came back with 'question_number' +
+        'text' (+ wrapped in {"solutions": [...]}, which _parse_json extracts
+        as the inner array). The spec key must win; aliases are re-keyed --
+        never invented, never dropped."""
+        it = {"question_number": "1", "text": "Recovered.",
+              "image_description": "diagram", "q_no": None}
+        bph._normalize_phase_item("Solution", it)
+        self.assertEqual(it["solution_text"], "Recovered.")
+        self.assertNotIn("text", it)
+        # spec key already present wins; alias removed
+        it2 = {"q_no": "2", "solution_text": "SPEC", "text": "alias"}
+        bph._normalize_phase_item("Solution", it2)
+        self.assertEqual(it2["solution_text"], "SPEC")
+        self.assertNotIn("text", it2)
+        # Question phase: stem aliases
+        it3 = {"q_no": "3", "text": "Stem?", "options": {"A": "a"}}
+        bph._normalize_phase_item("Question", it3)
+        self.assertEqual(it3["stem"], "Stem?")
+        # Answer-key phase: answer aliases
+        it4 = {"q_no": "4", "answer": "B"}
+        bph._normalize_phase_item("Answer-key", it4)
+        self.assertEqual(it4["correct_option"], "B")
+        # no alias keys -> untouched
+        it5 = {"q_no": "5", "solution_text": "x"}
+        bph._normalize_phase_item("Solution", it5)
+        self.assertEqual(it5["solution_text"], "x")
+
+    def test_targeted_fix_drift_keeps_solution_text(self):
+        """OBG ch2 live failure chain: S extract is GOOD -> verify flags a
+        mismatch -> the template-less targeted fix re-ask drifts to
+        {"solutions": [{"question_number": "1", "text": ...}]} -> the old
+        code REPLACED the good item with the drifted one and 11 rows lost
+        their solution_text. Now the fix response is re-keyed, so the row
+        keeps (the corrected) text -- never wiped empty."""
+        bnd = {"question_block": {"start_page": 5},
+               "answer_key_block": {"start_page": 10, "end_page": 10},
+               "solution_block": {"start_page": 11, "end_page": 13},
+               "confidence": "high"}
+        qs = [{"q_no": "1", "stem": "S?", "options": {"A": "a", "B": "b",
+               "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
+               "source_page": 5, "text_confidence": "high"}]
+        an = [{"q_no": "1", "correct_option": "A", "low_confidence": False}]
+        so = [{"q_no": "1", "solution_text": "Good sol.", "has_figure": False,
+               "figure_location": None, "source_page_range": [11, 11],
+               "text_confidence": "high"}]
+        ok = {"phase": "Solution", "total_entries_checked": 1,
+              "all_verified": True, "mismatches": []}
+        verify_bad = {"phase": "Solution", "total_entries_checked": 1,
+                      "all_verified": False,
+                      "mismatches": [{"q_no": "1", "issue": "x",
+                                      "block": "solution"}]}
+        drifted_fix = '{"solutions": [{"question_number": "1", ' \
+                      '"text": "Corrected by fix.", "image_description": null}]}'
+        cross = {"chapter": "OPH-001", "status": "LOCKED",
+                 "total_questions": 1, "issues": []}
+        model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
+                            json.dumps(qs), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
+                            json.dumps(so), json.dumps(verify_bad),
+                            drifted_fix,                  # drifted re-ask
+                            json.dumps(ok),               # re-verify passes
+                            json.dumps(cross)])
+        r = self._runner(model)
+        res = r.run(5, 13)
+        self.assertTrue(res["committed"])
+        self.assertTrue(res["locked"])
+        row = [json.loads(l) for l in
+               (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
+               if l.strip()][0]
+        self.assertEqual(row["solution"]["text"], "Corrected by fix.")
+        self.assertEqual(row["qa_status"], "READY")
+
+    def test_printed_key_grid_continuation_page(self):
+        """OBG ch2 live: key grid rows 1-14 print on p37; the grid's last row
+        ('15 b') prints at the TOP of p38 before 'Detailed Explanations'.
+        Without that page the answer phase returned only 14 answers and the
+        chapter could never LOCK. A lone next-page row numbered max+1 is the
+        grid's continuation."""
+        r = self._runner(_FakeModel([]))
+        orig = qp.pdftotext_page
+        grid = "\n".join(f"{i} {chr(96 + (i % 5 + 1))}" for i in range(1, 15))
+        qp.pdftotext_page = lambda pdf, p: {
+            37: grid, 38: "15 b\n\nDetailed Explanations\nSolution to Question 1:"
+        }.get(p, "")
+        try:
+            zones = r._printed_zones(37, 38)
+        finally:
+            qp.pdftotext_page = orig
+        self.assertEqual(zones["keys"], [37, 38])
+
     def test_printed_header_reask_recovers_dropped_block(self):
         """OPH-001 live finding: the model silently dropped q15's solution
         although the page PRINTS 'Solution to Question 15'. The text-layer

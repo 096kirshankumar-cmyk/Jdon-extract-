@@ -221,6 +221,55 @@ def _norm_options(raw):
 
 
 # ---------------------------------------------------------------------------
+# CONTENT-FIELD ALIAS INTAKE (per phase)
+# ---------------------------------------------------------------------------
+# LIVE finding (OBG ch2, 2026-08-22): a targeted-fix re-ask came back as
+# {"solutions": [{"question_number": "1", "text": "...",
+# "image_description": ...}]} -- q_no ALIAS + content under "text" instead of
+# "solution_text". Whole-item replacement then WIPED the good solution_text
+# from 11 rows (INCOMPLETE + no LOCK). Values are the model's own words under
+# a different key; we re-key only -- never rewrite, never invent. The SPEC
+# key always wins when both exist.
+
+_SOL_TEXT_ALIASES = ("solution_text", "text", "explanation", "solution",
+                     "answer_explanation", "explanation_text",
+                     "detailed_solution", "content", "answer_text")
+_Q_STEM_ALIASES = ("stem", "question_text", "text", "question")
+_A_ANS_ALIASES = ("correct_option", "answer", "correct_answer", "option",
+                  "answer_letter", "correct_letter")
+_HAS_FIG_ALIASES = ("has_figure", "has_image", "figure_present")
+_FIG_LOC_ALIASES = ("figure_location", "image_location")
+
+
+def _alias_field(it, aliases, canon):
+    """Move the first alias value into `canon` when canon is empty; the
+    alias keys are then removed so downstream never double-reads them."""
+    for k in aliases[1:]:
+        if k in it:
+            if not it.get(canon):
+                it[canon] = it[k]
+            del it[k]
+
+
+def _normalize_phase_item(phase_name, it):
+    """Re-key model content into the spec's field names per phase. Leaves
+    everything else untouched; unknown junk keys survive (harmless)."""
+    if not isinstance(it, dict):
+        return it
+    if phase_name == "Solution":
+        _alias_field(it, _SOL_TEXT_ALIASES, "solution_text")
+        _alias_field(it, _HAS_FIG_ALIASES, "has_figure")
+        _alias_field(it, _FIG_LOC_ALIASES, "figure_location")
+    elif phase_name == "Question":
+        _alias_field(it, _Q_STEM_ALIASES, "stem")
+        _alias_field(it, _HAS_FIG_ALIASES, "has_figure")
+        _alias_field(it, _FIG_LOC_ALIASES, "figure_location")
+    elif phase_name == "Answer-key":
+        _alias_field(it, _A_ANS_ALIASES, "correct_option")
+    return it
+
+
+# ---------------------------------------------------------------------------
 # THE EXACT PROMPTS FROM THE SPEC (do not paraphrase)
 # ---------------------------------------------------------------------------
 BOUNDARY_PROMPT = """Tumhe ek textbook chapter ke consecutive pages diye jayenge (images).
@@ -408,6 +457,24 @@ def _parse_json(text):
         return json.loads(m.group(0))
     except Exception:
         return None
+
+
+_WRAPPER_KEYS = ("solutions", "items", "results", "questions", "answers",
+                 "entries")
+
+
+def _unwrap_items(v):
+    """Phase responses must be a JSON ARRAY. The model sometimes wraps them
+    (OBG ch2 live: {"solutions": [{"question_number": ...}]}). _parse_json
+    returns the whole dict in that case; here we extract the array from
+    known wrapper keys -- structural only, zero guessing."""
+    if isinstance(v, list):
+        return v
+    if isinstance(v, dict):
+        for k in _WRAPPER_KEYS:
+            if isinstance(v.get(k), list):
+                return v[k]
+    return None
 
 
 def _safe_int(v):
@@ -603,7 +670,7 @@ class ChapterRunner:
             items = None
             for reask in range(2):          # one bounded re-ask on bad JSON
                 raw = self._call_pages(chunk, p, dpi=dpi)
-                items = _parse_json(raw)
+                items = _unwrap_items(_parse_json(raw))
                 if isinstance(items, list):
                     break
                 self.notes.append(f"{pass_name} chunk {chunk[0]}-{chunk[-1]}: "
@@ -613,6 +680,7 @@ class ChapterRunner:
                 for it in items:
                     qn0 = _item_qn(it)
                     if isinstance(it, dict) and qn0 is not None:
+                        _normalize_phase_item(label, it)
                         it["_qn"] = qn0
                         it["_continuation"] = _is_continuation_marker(
                             _item_qno_raw(it))
@@ -663,8 +731,8 @@ class ChapterRunner:
                 if k in ("_qn", "_continuation"):
                     continue
                 if k == "options":
-                    merged = dict(base.get("options") or {})
-                    for letter, text in (v or {}).items():
+                    merged, _ = _norm_options(base.get("options"))
+                    for letter, text in _norm_options(v)[0].items():
                         if not merged.get(letter):
                             merged[letter] = text
                     base["options"] = merged
@@ -736,21 +804,27 @@ class ChapterRunner:
         phase_hint = {"Question": QUESTION_PROMPT, "Answer-key": ANSWER_KEY_PROMPT,
                       "Solution": SOLUTION_PROMPT}.get(phase_name, "")
         fix_pages = sorted(self._phase_pages_of(phase_name, items))
+        # FULL original prompt stays in view -- JSON template included. A
+        # re-ask that drops the format block shape-drifts (OBG ch2 live: came
+        # back {"solutions": [{"question_number": 1, "text": ...}]} which
+        # then WIPED 11 good solution_texts on whole-item replacement).
         for chunk in _chunk_pages(fix_pages, PAGE_CHUNK):
             if not chunk:
                 continue
-            rules = phase_hint.split("ONLY respond")[0].format(
-                chapter_name=self.chapter_id, start=chunk[0], end=chunk[-1])
-            re_prompt = (rules
-                         + f"\n\nAb SIRF in question numbers ko dobara extract karo: "
-                           f"{qns}. Same JSON format, sirf unhi ke liye.")
+            re_prompt = (
+                phase_hint.format(chapter_name=self.chapter_id,
+                                  start=chunk[0], end=chunk[-1])
+                + f"\n\nNOTE: Ab SIRF in question numbers ko dobara extract "
+                  f"karo: {qns}. Baaki sab ignore karo. WAHI JSON array "
+                  f"format use karo jo upar diya hai.")
             raw = self._call_pages(chunk, re_prompt)
-            items_fixed = _parse_json(raw)
+            items_fixed = _unwrap_items(_parse_json(raw))
             if isinstance(items_fixed, list):
                 by_no = {str(i.get("_qn")): i for i in items}
                 for it in items_fixed:
                     if not isinstance(it, dict):
                         continue
+                    _normalize_phase_item(phase_name, it)
                     it["_qn"] = _item_qn(it)
                     if it["_qn"] is None:
                         continue
@@ -853,6 +927,7 @@ class ChapterRunner:
 
     def _printed_zones(self, ch_first, ch_last):
         q_pages, s_pages, key_cands = set(), set(), []
+        key_max = {}
         # per-QUESTION printed headers too: page -> {qn}. This is what makes a
         # model DROPPED block recoverable deterministically (the page PROVES
         # 'Solution to Question 15' exists even when the model skipped q15).
@@ -883,6 +958,24 @@ class ChapterRunner:
             if len(rows) >= 6 and len(set(nums)) >= 6 \
                     and max(nums) - min(nums) <= 3 * len(nums):
                 key_cands.append(p)
+                key_max[p] = max(nums)
+        # OBG ch2 live: the key grid's rows 1-14 sit on p37 and its last row
+        # "15 b" prints at the TOP of the NEXT page (p38) before 'Detailed
+        # Explanations'. One lone row is not a grid -- but a row numbered
+        # EXACTLY max(grid)+1 as the next page's first content line is the
+        # grid's continuation; include that page.
+        if key_cands and key_cands[-1] < ch_last:
+            nxt = key_cands[-1] + 1
+            try:
+                nxt_txt = qp.pdftotext_page(self.pdf, nxt) or ""
+            except Exception:
+                nxt_txt = ""
+            first = next((ln.strip() for ln in nxt_txt.splitlines()
+                          if ln.strip()), "")
+            m = self._KEYROW_TXT.match(first) if first else None
+            if m is not None and int(m.group(1)) == key_max.get(
+                    key_cands[-1], -1) + 1:
+                key_cands.append(nxt)
         if read_pages == 0:
             return None                       # scanned book: no printed signal
         self._printed_q_hdrs = q_hdrs
@@ -916,15 +1009,18 @@ class ChapterRunner:
                           f"block(s) q{qns} -- targeted re-ask on {pages}")
         self._ledger(f"REASK_{phase_name[0]}", pages, qp.PASS_STATUS_PARTIAL,
                      0, f"printed headers prove q{qns} exist; re-asking")
+        # FULL prompt (JSON template included): a template-less re-ask
+        # shape-drifts (OBG ch2 live: {"solutions": [...], "text": ...}).
         for chunk in _chunk_pages(pages, PAGE_CHUNK):
-            rules = prompt_tmpl.split("ONLY respond")[0].format(
-                chapter_name=self.chapter_id, start=chunk[0], end=chunk[-1])
-            re_prompt = (rules + f"\n\nAb SIRF in question numbers ko extract "
-                                 f"karo: {qns}. Same JSON format, sirf unhi ke "
-                                 f"liye. Ye blocks page par PRINTED hain -- "
-                                 f"dhundh kar nikaalo, skip mat karo.")
+            re_prompt = (
+                prompt_tmpl.format(chapter_name=self.chapter_id,
+                                   start=chunk[0], end=chunk[-1])
+                + f"\n\nNOTE: Ab SIRF in question numbers ko extract karo: "
+                  f"{qns}. Baaki sab ignore karo. WAHI JSON array format use "
+                  f"karo jo upar diya hai. Ye blocks page par PRINTED hain -- "
+                  f"dhundh kar nikaalo, skip mat karo.")
             raw = self._call_pages(chunk, re_prompt, dpi=dpi)
-            fixed = _parse_json(raw)
+            fixed = _unwrap_items(_parse_json(raw))
             if not isinstance(fixed, list):
                 self._ledger(f"REASK_{phase_name[0]}", chunk,
                              qp.PASS_STATUS_UNRESOLVED, 0,
@@ -939,6 +1035,7 @@ class ChapterRunner:
                         "reason": "reask_item_unparseable_qno (schema drift)",
                         "pass": f"REASK_{phase_name[0]}", "item": it})
                     continue
+                _normalize_phase_item(phase_name, it)
                 it["_qn"] = qn0
                 if qn0 in have:
                     continue
