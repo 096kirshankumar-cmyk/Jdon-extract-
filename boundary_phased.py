@@ -620,6 +620,8 @@ class ChapterRunner:
         self.watermark_ids = None      # driver computes once per book
         self._zones = None             # set by run(): {"q":[], "a":[], "s":[]}
         self._printed_q_hdrs = {}      # page -> {qn}: printed Question headers
+        self._printed_q_max = None     # highest PRINTED 'Question N:' of this
+                                       # chapter (FIX B phantom-q_no guard)
         self._printed_s_hdrs = {}      # page -> {qn}: printed Solution headers
 
     # ------------------------------------------------------------------
@@ -756,6 +758,29 @@ class ChapterRunner:
                         it["_qn"] = qn0
                         it["_continuation"] = _is_continuation_marker(
                             _item_qno_raw(it))
+                        # FIX B: phantom q_no (RAD-002-026 live -- page number
+                        # misread as a question number). Only applies when the
+                        # text layer PROVED the chapter's printed question
+                        # ceiling. Never silently dropped: orphaned + noted.
+                        if pass_name == "Q" \
+                                and self._printed_q_max is not None \
+                                and qn0 > self._printed_q_max:
+                            dropped += 1
+                            self.orphan_items.append({
+                                "chapter_id": self.chapter_id,
+                                "batch_start": chunk[0],
+                                "pdf_pages": list(chunk),
+                                "reason": f"phantom_q_no {qn0} > printed "
+                                          f"question max "
+                                          f"{self._printed_q_max}",
+                                "pass": "Q_PHANTOM_FILTER",
+                                "item": it})
+                            self.notes.append(
+                                f"Q phase: dropped phantom q_no {qn0} "
+                                f"(chapter prints only up to "
+                                f"{self._printed_q_max}) -- moved to "
+                                f"orphans for review")
+                            continue
                         kept.append(it)
                     else:
                         dropped += 1
@@ -1074,6 +1099,12 @@ class ChapterRunner:
                          r"|^\s*detailed\s+explanations")
     _KEYROW_TXT = re.compile(r"(?im)^\s*(\d{1,3})\s*[\.\)\:\-]?\s*"
                              r"\(?([A-Ea-e])\)?\s*$")
+    # the answer-key table's printed header lines -- required proof before a
+    # LONE row on the previous page is trusted as the grid's start (FIX A).
+    # NOTE: books print 'Question No.   Correct Option' on ONE line, so the
+    # 'correct option' probe must not be anchored to a line start.
+    _KEYHEAD_QNO_TXT = re.compile(r"(?i)\bquestion\s+no\.?")
+    _KEYHEAD_COR_TXT = re.compile(r"(?i)\bcorrect\s+option\b")
     _INLINE_ANS_TXT = re.compile(r"(?im)\bans(?:wer)?\b\s*[:\-\.]?\s*"
                                  r"\(?([A-Ea-e])\)?\b")
 
@@ -1134,6 +1165,11 @@ class ChapterRunner:
         # consecutive rows 1..k whose next number k+1 is the FIRST row of the
         # big grid page is the grid's start page -- include it or the first
         # k questions lose their answers.
+        # FIX A (RAD-002 / ANAT-001 live): k can be as small as ONE -- the
+        # header + row '1 <letter>' sits at the foot of the last question
+        # page, rows 2..N on the next page. A lone row is only trusted when
+        # that page also prints the key-table header line (Question No. /
+        # Correct Option), so an unrelated '1 a' line can't be misread.
         if key_cands:
             first_grid = key_cands[0]
             prev = first_grid - 1
@@ -1145,7 +1181,12 @@ class ChapterRunner:
                 prow = sorted({int(m.group(1)) for m in
                                self._KEYROW_TXT.finditer(prev_txt)})
                 if prow and prow == list(range(1, len(prow) + 1)) \
-                        and len(prow) >= 3:
+                        and len(prow) >= 1:
+                    if len(prow) == 1 and not (
+                            self._KEYHEAD_QNO_TXT.search(prev_txt)
+                            and self._KEYHEAD_COR_TXT.search(prev_txt)):
+                        prow = []          # lone row without table header: no
+                                           # opinion (avoid false positives)
                     try:
                         cur_txt = qp.pdftotext_page(self.pdf,
                                                     first_grid) or ""
@@ -1153,13 +1194,20 @@ class ChapterRunner:
                         cur_txt = ""
                     cnums = [int(m.group(1)) for m in
                              self._KEYROW_TXT.finditer(cur_txt)]
-                    if cnums and min(cnums) == max(prow) + 1:
+                    if prow and cnums and min(cnums) == max(prow) + 1:
                         key_cands.insert(0, prev)
                         key_max[prev] = max(prow)
         if read_pages == 0:
             return None                       # scanned book: no printed signal
         self._printed_q_hdrs = q_hdrs
         self._printed_s_hdrs = s_hdrs
+        # FIX B phantom-q_no guard: the highest number this chapter actually
+        # prints as a 'Question N:' header is the ceiling of the real
+        # question set. Anything the model reports ABOVE it (RAD-002-026
+        # live: the page number '26' read as a question number) cannot
+        # exist in the chapter and is orphaned at intake, never shipped.
+        self._printed_q_max = max((max(v) for v in q_hdrs.values()),
+                                  default=None) if q_hdrs else None
         return {"q": q_pages, "s": s_pages, "keys": key_cands}
 
     def _printed_header_reask(self, phase_name, items, zone_pages, hdr_attr,

@@ -520,6 +520,97 @@ class EngineCase(unittest.TestCase):
             qp.pdftotext_page = orig
         self.assertEqual(zones["keys"], [149, 150])
 
+    def test_printed_key_grid_single_row_start_on_prev_page(self):
+        """FIX A (RAD-002 / ANAT-001 live): the key grid starts with only
+        ONE row -- 'Answer Key / Question No. Correct Option' + row
+        '1 a' at the foot of the last question page; rows 2..N on the next
+        page. The backward rule must now accept a 1-row page when it prints
+        the key-table header (and the next page starts at row 2)."""
+        r = self._runner(_FakeModel([]))
+        orig = qp.pdftotext_page
+        grid_tail = ("Question 21:\n\na) x\nb) y\nc) z\nd) w\n"
+                     "Answer Key\n"
+                     "Question No.      Correct Option\n"
+                     "1      a")
+        grid_main = "\n".join(f"{i} {chr(96 + (i % 5 + 1))}"
+                              for i in range(2, 22))     # rows 2-21
+        qp.pdftotext_page = lambda pdf, p: {
+            26: grid_tail,
+            27: grid_main + "\nDetailed Explanations\n"
+                 "Solution to Question 1:\nSol text.",
+        }.get(p, "")
+        try:
+            zones = r._printed_zones(19, 43)
+        finally:
+            qp.pdftotext_page = orig
+        self.assertEqual(zones["keys"], [26, 27])
+
+    def test_printed_key_grid_lone_row_without_header_rejected(self):
+        """FIX A negative: a lone '1 a' line on the page before the grid is
+        NOT a grid start unless that page prints the key-table header --
+        otherwise an option/figure artifact would widen the A zone wrongly."""
+        r = self._runner(_FakeModel([]))
+        orig = qp.pdftotext_page
+        grid_main = "\n".join(f"{i} {chr(96 + (i % 5 + 1))}"
+                              for i in range(2, 16))     # rows 2-15
+        qp.pdftotext_page = lambda pdf, p: {
+            26: "Question 21:\n\na) x\nb) y\nc) z\nd) w\n1      a",
+            27: grid_main + "\nDetailed Explanations\n"
+                 "Solution to Question 1:\nSol text.",
+        }.get(p, "")
+        try:
+            zones = r._printed_zones(19, 43)
+        finally:
+            qp.pdftotext_page = orig
+        self.assertEqual(zones["keys"], [27])      # NOT [26, 27]
+
+    def test_phantom_q_no_beyond_printed_max_orphaned_not_shipped(self):
+        """FIX B (RAD-002-026 live): the model read the page number '26' as
+        a question number. The chapter's printed 'Question N:' headers cap
+        the real set -- anything above the printed max is dropped at
+        intake, orphaned + noted, never shipped as a row (and never
+        silently lost)."""
+        bnd = {"question_block": {"start_page": 5},
+               "answer_key_block": {"start_page": 10, "end_page": 10},
+               "solution_block": {"start_page": 11, "end_page": 13},
+               "confidence": "high"}
+        qs = [{"q_no": "1", "stem": "S?", "options": {"A": "a", "B": "b",
+               "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
+               "source_page": 5, "text_confidence": "high"},
+              {"q_no": "26", "stem": "PHANTOM stem?", "options": {"A": "a",
+               "B": "b", "C": "c", "D": "d"}, "has_figure": False,
+               "figure_location": None, "source_page": 5,
+               "text_confidence": "high"}]
+        an = [{"q_no": "1", "correct_option": "A", "low_confidence": False}]
+        so = [{"q_no": "1", "solution_text": "Sol.", "has_figure": False,
+               "figure_location": None, "source_page_range": [11, 11],
+               "text_confidence": "high"}]
+        ok = {"phase": "Question", "total_entries_checked": 2,
+              "all_verified": True, "mismatches": []}
+        cross = {"chapter": "OPH-001", "status": "LOCKED",
+                 "total_questions": 1, "issues": []}
+        model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
+                            json.dumps(qs), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
+                            json.dumps(so), json.dumps(ok),
+                            json.dumps(cross)])
+        r = self._runner(model)
+        r._printed_q_max = 2        # chapter provably prints only Q1-2
+        res = r.run(5, 13)
+        self.assertTrue(res["committed"])
+        self.assertTrue(res["locked"])
+        rows = [json.loads(l) for l in
+                (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
+                if l.strip()]
+        self.assertEqual([x["id"] for x in rows], ["OPH-001-001"])
+        # phantom went to orphans, not silently dropped
+        orph = [json.loads(l) for l in
+                (qp.DATA_DIR / "orphans.jsonl").read_text().splitlines()
+                if l.strip()]
+        self.assertTrue(any("phantom_q_no 26" in (o.get("reason") or "")
+                            for o in orph), orph)
+        self.assertTrue(any("phantom" in n for n in r.notes))
+
     def test_printed_header_reask_recovers_dropped_block(self):
         """OPH-001 live finding: the model silently dropped q15's solution
         although the page PRINTS 'Solution to Question 15'. The text-layer
