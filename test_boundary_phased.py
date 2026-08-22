@@ -679,6 +679,91 @@ class EngineCase(unittest.TestCase):
                  if l.strip()]
         self.assertIn("chapter_not_locked", kinds)
 
+    def test_header_only_solution_is_incomplete_not_ready(self):
+        """OBG-010-021 live: model returned ONLY 'Solution to Question 21:'
+        for q21's solution; sanitize strips it to '' but the old status check
+        looked at the RAW rec text and shipped READY with an empty solution.
+        The structural/status check now uses the sanitized (shipped) text."""
+        bnd = {"question_block": {"start_page": 5},
+               "answer_key_block": {"start_page": 10, "end_page": 10},
+               "solution_block": {"start_page": 11, "end_page": 13},
+               "confidence": "high"}
+        qs = [{"q_no": "1", "stem": "S?", "options": {"A": "a", "B": "b",
+               "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
+               "source_page": 5, "text_confidence": "high"}]
+        an = [{"q_no": "1", "correct_option": "A", "low_confidence": False}]
+        so = [{"q_no": "1", "solution_text": "Solution to Question 1:",
+               "has_figure": False, "figure_location": None,
+               "source_page_range": [11, 11], "text_confidence": "high"}]
+        ok = {"phase": "Solution", "total_entries_checked": 1,
+              "all_verified": True, "mismatches": []}
+        cross = {"chapter": "OPH-001", "status": "LOCKED",
+                 "total_questions": 1, "issues": []}
+        model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
+                            json.dumps(qs), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
+                            json.dumps(so), json.dumps(ok),
+                            json.dumps(cross)])
+        r = self._runner(model)
+        res = r.run(5, 13)
+        self.assertTrue(res["committed"])
+        row = [json.loads(l) for l in
+               (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
+               if l.strip()][0]
+        self.assertEqual(row["solution"]["text"], "")
+        self.assertEqual(row["qa_status"], "INCOMPLETE")   # never READY
+        kinds = [json.loads(l)["kind"] for l in
+                 (qp.DATA_DIR / "export_gate.jsonl").read_text().splitlines()
+                 if l.strip()]
+        self.assertIn("missing_solution", kinds)
+
+    def test_printed_header_reask_replaces_header_only_solution(self):
+        """OBG-010-021 live root fix: the item existed but held ONLY the
+        printed header ('Solution to Question 21:'). _printed_header_reask
+        now treats empty-content items as missing and REPLACES them with the
+        recovered block (same q_no; the printed header is the proof)."""
+        bnd = {"question_block": {"start_page": 5},
+               "answer_key_block": {"start_page": 10, "end_page": 10},
+               "solution_block": {"start_page": 11, "end_page": 13},
+               "confidence": "high"}
+        qs = [{"q_no": "1", "stem": "S1?", "options": {"A": "a", "B": "b",
+               "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
+               "source_page": 5, "text_confidence": "high"},
+              {"q_no": "2", "stem": "S2?", "options": {"A": "a", "B": "b",
+               "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
+               "source_page": 5, "text_confidence": "high"}]
+        an = [{"q_no": "1", "correct_option": "A", "low_confidence": False},
+              {"q_no": "2", "correct_option": "B", "low_confidence": False}]
+        so = [{"q_no": "1", "solution_text": "Sol1.", "has_figure": False,
+               "figure_location": None, "source_page_range": [11, 11],
+               "text_confidence": "high"},
+              {"q_no": "2", "solution_text": "Solution to Question 2:",
+               "has_figure": False, "figure_location": None,
+               "source_page_range": [12, 12], "text_confidence": "high"}]
+        ok = {"phase": "Solution", "total_entries_checked": 2,
+              "all_verified": True, "mismatches": []}
+        reasked = [{"q_no": "2", "solution_text": "Sol2 recovered.",
+                    "has_figure": False, "figure_location": None,
+                    "source_page_range": [12, 12], "text_confidence": "high"}]
+        cross = {"chapter": "OPH-001", "status": "LOCKED",
+                 "total_questions": 2, "issues": []}
+        model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
+                            json.dumps(qs), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
+                            json.dumps(so), json.dumps(ok),
+                            json.dumps(reasked),         # empty-content re-ask
+                            json.dumps(cross)])
+        r = self._runner(model)
+        r._printed_s_hdrs = {12: {1, 2}}
+        res = r.run(5, 13)
+        self.assertTrue(res["locked"])
+        rows = {json.loads(l)["id"]: json.loads(l) for l in
+                (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
+                if l.strip()}
+        self.assertEqual(rows["OPH-001-002"]["solution"]["text"],
+                         "Sol2 recovered.")
+        self.assertEqual(rows["OPH-001-002"]["qa_status"], "READY")
+
     def test_quota_pause_is_systemexit_and_saves_state(self):
         model = _FakeModel(self._answers())
         r = self._runner(model)

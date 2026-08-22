@@ -1172,7 +1172,25 @@ class ChapterRunner:
         hdrs = getattr(self, hdr_attr, None)
         if not hdrs:
             return items
-        have = {i.get("_qn") for i in items}
+        # OBG-010-021 live: the model returned ONLY the printed header
+        # ("Solution to Question 21:"), which sanitize strips to '' -- the
+        # row shipped READY with no solution. So a header-printed q_no whose
+        # item content is EMPTY is also "missing" and gets the same re-ask.
+        content_key = {"Solution": "solution_text",
+                       "Question": "stem"}.get(phase_name)
+
+        def _content_ok(it):
+            if content_key is None:
+                return True          # answer-key re-ask: existence is enough
+            val = str(it.get(content_key) or "").strip()
+            if content_key == "solution_text":
+                # emptiness appears only AFTER sanitize: a header-only answer
+                # ('Solution to Question 21:') is non-empty raw but ships ''
+                val, _ = qp.sanitize_solution_text(val, own_qn=it.get("_qn"))
+                val = val.strip()
+            return bool(val)
+
+        have = {i.get("_qn") for i in items if _content_ok(i)}
         missing_pages = {}
         for p in zone_pages:
             for qn in (hdrs.get(p) or set()):
@@ -1185,8 +1203,9 @@ class ChapterRunner:
                         for p in range(missing_pages[qn],
                                        min(missing_pages[qn] + 1,
                                            max(zone_pages)) + 1)})
-        self.notes.append(f"{phase_name}: printed headers prove missing "
-                          f"block(s) q{qns} -- targeted re-ask on {pages}")
+        self.notes.append(f"{phase_name}: printed headers prove missing/"
+                          f"empty block(s) q{qns} -- targeted re-ask on "
+                          f"{pages}")
         self._ledger(f"REASK_{phase_name[0]}", pages, qp.PASS_STATUS_PARTIAL,
                      0, f"printed headers prove q{qns} exist; re-asking")
         # FULL prompt (JSON template included): a template-less re-ask
@@ -1225,10 +1244,17 @@ class ChapterRunner:
                     continue
                 _normalize_phase_item(phase_name, it)
                 it["_qn"] = qn0
-                if qn0 in have:
+                existing = next((i for i in items if i.get("_qn") == qn0),
+                                None)
+                if existing is not None and _content_ok(existing):
                     continue
                 it["_reasked"] = True
-                items = list(items) + [it]
+                if existing is None:
+                    items = list(items) + [it]
+                else:
+                    # replace the EMPTY item with the recovered one: same
+                    # q_no, same phase, printed header is the proof
+                    items = [it if i.get("_qn") == qn0 else i for i in items]
                 have.add(qn0)
         return self._merge_phase_items(items)
 

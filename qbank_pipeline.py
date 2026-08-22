@@ -1791,7 +1791,10 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
         structural_missing.append("options")
     if not rec.get("correct_option"):
         structural_missing.append("correct_option")
-    if not (rec.get("solution_text") or "").strip():
+    # the SHIPPED text is the sanitized one: a header-only model answer
+    # ("Solution to Question 21:") strips to "" -- that must be INCOMPLETE,
+    # never READY (OBG-010-021 live: shipped READY with empty solution).
+    if not sol_text.strip():
         structural_missing.append("solution_text")
     if structural_missing:
         status_reasons.append(f"missing structural fields: {structural_missing}")
@@ -3624,8 +3627,15 @@ def _export_gate_violations(chapter_records, image_files_by_q, unresolved_ledger
             violations.append(("bad_options", qn, f"options={sorted(opts)}"))
         if not rec.get("correct_option"):
             violations.append(("missing_answer", qn, "no correct_option"))
-        if not (rec.get("solution_text") or "").strip():
-            violations.append(("missing_solution", qn, "no solution_text"))
+        # shipped text = sanitized text (OBG-010-021 live: model returned only
+        # 'Solution to Question 21:' -> sanitize strips it to '' but the raw
+        # rec check passed, silently shipping a READY row with no solution).
+        sol_check, _ = sanitize_solution_text(rec.get("solution_text"),
+                                              own_qn=qn)
+        if not sol_check.strip():
+            violations.append(("missing_solution", qn,
+                               "no solution_text (header-only model answer "
+                               "stripped by sanitize)"))
         if rec.get("_stem_suspect_reason"):
             # run-13: quarantined suspect stem (kept for review, not deleted)
             # is still a violation -- the chapter must not look clean while a
