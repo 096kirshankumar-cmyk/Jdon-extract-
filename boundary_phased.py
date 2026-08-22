@@ -976,6 +976,34 @@ class ChapterRunner:
             if m is not None and int(m.group(1)) == key_max.get(
                     key_cands[-1], -1) + 1:
                 key_cands.append(nxt)
+        # BACKWARD: a grid can also START mid-page on the page just BEFORE
+        # the first "big" grid page (OBG ch8 live: p149 = Question 15 + grid
+        # header + rows 1-4; p150 = rows 5-15 then solutions). P-1 holding
+        # consecutive rows 1..k whose next number k+1 is the FIRST row of the
+        # big grid page is the grid's start page -- include it or the first
+        # k questions lose their answers.
+        if key_cands:
+            first_grid = key_cands[0]
+            prev = first_grid - 1
+            if prev >= ch_first:
+                try:
+                    prev_txt = qp.pdftotext_page(self.pdf, prev) or ""
+                except Exception:
+                    prev_txt = ""
+                prow = sorted({int(m.group(1)) for m in
+                               self._KEYROW_TXT.finditer(prev_txt)})
+                if prow and prow == list(range(1, len(prow) + 1)) \
+                        and len(prow) >= 3:
+                    try:
+                        cur_txt = qp.pdftotext_page(self.pdf,
+                                                    first_grid) or ""
+                    except Exception:
+                        cur_txt = ""
+                    cnums = [int(m.group(1)) for m in
+                             self._KEYROW_TXT.finditer(cur_txt)]
+                    if cnums and min(cnums) == max(prow) + 1:
+                        key_cands.insert(0, prev)
+                        key_max[prev] = max(prow)
         if read_pages == 0:
             return None                       # scanned book: no printed signal
         self._printed_q_hdrs = q_hdrs

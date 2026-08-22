@@ -479,6 +479,30 @@ class EngineCase(unittest.TestCase):
             qp.pdftotext_page = orig
         self.assertEqual(zones["keys"], [37, 38])
 
+    def test_printed_key_grid_starts_on_prev_page(self):
+        """OBG ch8 live layout (found by layout scan, 2026-08-22): the key
+        grid STARTS mid-page on the LAST QUESTION page -- p149 = Question 15
+        + grid header + rows 1-4, then p150 = rows 5-15 + solutions. Only
+        p150 qualifies as '>=6 rows', so without the backward rule rows 1-4
+        are lost and q1-4 extract with no answer (gate refuses LOCK)."""
+        r = self._runner(_FakeModel([]))
+        orig = qp.pdftotext_page
+        grid_tail = "\n".join(f"{i} {chr(96 + (i % 5 + 1))}"
+                              for i in range(1, 5))       # rows 1-4
+        grid_main = "\n".join(f"{i} {chr(96 + (i % 5 + 1))}"
+                              for i in range(5, 16))      # rows 5-15
+        qp.pdftotext_page = lambda pdf, p: {
+            149: "Question 15:\n\na) x\nb) y\nc) z\nd) w\n"
+                 "Question No.   Correct Option\n" + grid_tail,
+            150: grid_main + "\nDetailed Explanations\n"
+                 "Solution to Question 1:\nSol text.",
+        }.get(p, "")
+        try:
+            zones = r._printed_zones(145, 158)
+        finally:
+            qp.pdftotext_page = orig
+        self.assertEqual(zones["keys"], [149, 150])
+
     def test_printed_header_reask_recovers_dropped_block(self):
         """OPH-001 live finding: the model silently dropped q15's solution
         although the page PRINTS 'Solution to Question 15'. The text-layer
