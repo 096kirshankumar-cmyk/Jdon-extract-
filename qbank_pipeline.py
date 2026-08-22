@@ -1281,7 +1281,7 @@ def _option_for_image_in_block(pdf_path, file_page, headers, owner, x_img, y_img
     the option-label anchors inside that block, and applies the conservative
     geometry rule. Solution blocks and cross-page carried blocks (no header
     on this page) return None -> the image stays a question-level figure."""
-    kind, qn = owner
+    kind, qn = owner[0], owner[1]
     if kind != "question":
         return None
     idx = next((i for i, (k, q, _y) in enumerate(headers)
@@ -1429,6 +1429,9 @@ CARRY_SEED_LOOKBACK_PAGES = 3
 # Carry claims may reach the model ceiling; plain same-page positional claims
 # still stop at the strict cap.
 CARRY_CLAIM_SOURCE = "positional_carry"
+# BUG 7B: a carry that crossed more than this many pages without a new
+# printed heading is too weak to auto-attach (image-heavy books).
+MAX_CARRY_PAGES = 1
 MODEL_CLAIM_SOURCES = frozenset((
     "figure_map",            # model's window-level figure map (exact-count guarded)
     "full_page_vision",      # L3: red-boxed page render, printed-anchor evidence
@@ -2180,14 +2183,12 @@ def _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q,
     # question CAN cite 4-6 figures and refusing those was losing content.
     if kind == "question":
         cap = image_cap_for(subject, chapter_no, qn, "question")
-        # AUDIT-FIX (carry cap parity): a CARRY claim is the WEAKEST
-        # deterministic evidence (nearest block across one page edge, often
-        # OCR-derived) -- it must obey the SAME flat cap as plain positional
-        # claims. The old code let carries lift the cap to the model ceiling
-        # (CARRY_CLAIM_SOURCE), so one stale carry could stack a whole page
-        # of neighbour figures onto the wrong question. Overflow now flows
-        # to the model/manual passes like every other weak claim.
-        if claim_source in MODEL_CLAIM_SOURCES:
+        # BUG 7C: a same-page positional heading is high-confidence -- allow
+        # up to the ceiling (genuine 5-6 figure solutions). Carry stays at
+        # the flat cap (weak guess). Model claims may still lift to ceiling.
+        if claim_source == "positional":
+            cap = IMAGE_CAP_CEILING_QUESTION
+        elif claim_source in MODEL_CLAIM_SOURCES:
             cap = max(cap, min(len(entry["question"]) + 1,
                                IMAGE_CAP_CEILING_QUESTION))
         if len(entry["question"]) >= cap:
@@ -2216,7 +2217,9 @@ def _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q,
     # figures -- refuse and let the model/manual pass decide on content.
     if kind == "solution":
         cap = image_cap_for(subject, chapter_no, qn, "solution")
-        if claim_source in MODEL_CLAIM_SOURCES:   # carry obeys the flat cap too
+        if claim_source == "positional":
+            cap = IMAGE_CAP_CEILING_SOLUTION
+        elif claim_source in MODEL_CLAIM_SOURCES:
             cap = max(cap, min(len(entry["solution"]) + 1,
                                IMAGE_CAP_CEILING_SOLUTION))
         if len(entry["solution"]) >= cap:
@@ -2429,7 +2432,16 @@ def claim_block_images(imgs, pdf_path, file_page, subject, chapter_no,
             else:
                 leftover.append(rel)          # no block starts above -> unclaimed
                 continue
-        kind, qn = owner
+        if owner is active_block and active_block is not None \
+                and len(active_block) >= 3:
+            gap = int(file_page) - int(active_block[2])
+            if gap > MAX_CARRY_PAGES:
+                print(f"  [IMG] page {file_page}: refusing long positional_carry "
+                      f"({gap} pages from heading on p{active_block[2]}) "
+                      f"-- left for review")
+                leftover.append(rel)
+                continue
+        kind, qn = owner[0], owner[1]
         if qn not in chapter_records:
             leftover.append(rel)
             continue
@@ -3090,7 +3102,16 @@ def claim_block_images_ocr(imgs, pdf_path, file_page, subject, chapter_no,
             else:
                 leftover.append(rel)
                 continue
-        kind, qn = owner
+        if owner is active_block and active_block is not None \
+                and len(active_block) >= 3:
+            gap = int(file_page) - int(active_block[2])
+            if gap > MAX_CARRY_PAGES:
+                print(f"  [IMG] page {file_page}: refusing long positional_carry "
+                      f"({gap} pages from heading on p{active_block[2]}) "
+                      f"-- left for review")
+                leftover.append(rel)
+                continue
+        kind, qn = owner[0], owner[1]
         if qn not in chapter_records:
             leftover.append(rel)
             continue

@@ -424,6 +424,15 @@ Task: Start se end tak line-by-line compare karo:
 
 Sirf mismatches report karo, sahi wale ke liye kuch mat likho.
 
+VERIFY RULES (OBG-001 live):
+- FINAL verdict only. Chain-of-thought / "wait / let's check / but image shows"
+  mat likho. issue = ONE short factual sentence.
+- severity "minor" = spelling/punctuation only (does NOT block LOCK).
+- severity "genuine" = missing item, wrong q_no, wrong letter vs printed
+  answer-key GRID, or text that is actually absent from the JSON.
+- Printed answer-key table / text-layer jeetega visual re-read pe.
+  Image se "mujhe B dikha" tabhi genuine hai jab GRID bhi B bole.
+
 ONLY respond in this JSON format:
 {{
   "phase": "{phase_name}",
@@ -593,6 +602,37 @@ def _render_chapter_jpgs(pdf_path, ch_first, ch_last, subject, chapter_no):
     return page_files, page_numbers
 
 
+_QUOTE_RE = re.compile(r"['\"]([^'\"]{3,80})['\"]")
+_LETTER_CLAIM_RE = re.compile(
+    r"(?:shows?|says?|lists?|image\s+(?:shows?|says?)|correct option\s+(?:is|as))\s+"
+    r"(?:option\s+)?['\"]?([A-Ea-e])['\"]?\b",
+    re.I)
+_CONTRA_MARKERS = re.compile(
+    r"\b(wait|but |however|let's check|contradict)\b", re.I)
+
+
+def _quoted_snippets(issue):
+    return [m.group(1).strip() for m in _QUOTE_RE.finditer(issue or "")]
+
+
+def _visual_letter_claim(issue):
+    ms = list(_LETTER_CLAIM_RE.finditer(issue or ""))
+    if not ms:
+        return None
+    return ms[-1].group(1).upper()
+
+
+def _issue_self_contradicts(issue):
+    """True when the issue text argues two different letters / flips mid-way
+    (OBG-001-025: 'so Sampson's won't be affected' then 'image shows b')."""
+    t = issue or ""
+    if not _CONTRA_MARKERS.search(t):
+        return False
+    letters = re.findall(r"\b(?:option\s+)?([A-Ea-e])\b", t)
+    letters = [x.upper() for x in letters]
+    return len(set(letters)) >= 2
+
+
 class ChapterRunner:
     """One chapter through Steps 0-8, then a real commit into the pipeline's
     normal output (Step 8 is WRITE-THROUGH, not a dry run).
@@ -623,6 +663,7 @@ class ChapterRunner:
         self._printed_q_max = None     # highest PRINTED 'Question N:' of this
                                        # chapter (FIX B phantom-q_no guard)
         self._printed_s_hdrs = {}      # page -> {qn}: printed Solution headers
+        self._printed_key = {}         # qn -> letter from printed key grid
 
     # ------------------------------------------------------------------
     # THE model-call choke point
@@ -1066,7 +1107,20 @@ class ChapterRunner:
             return items, True
         bleed_line = BLEED_LINE if phase_name == "Solution" else ""
         prompt = VERIFY_PROMPT.format(phase_name=phase_name, bleed_line=bleed_line)
-        payload = json.dumps(items, ensure_ascii=False, default=str)
+        # BUG 6: verify the SAME text we will ship (normalized options /
+        # sanitized solutions), never a pre-sanitize draft.
+        payload_items = []
+        for it in items:
+            it2 = dict(it)
+            if phase_name == "Question":
+                opts, _ = _norm_options(it.get("options"))
+                it2["options"] = opts
+            elif phase_name == "Solution":
+                st, _ = qp.sanitize_solution_text(
+                    it.get("solution_text"), own_qn=it.get("_qn"))
+                it2["solution_text"] = st
+            payload_items.append(it2)
+        payload = json.dumps(payload_items, ensure_ascii=False, default=str)
         last = None
         for attempt in range(MAX_FIX_ATTEMPTS):
             files = [payload]
@@ -1095,14 +1149,68 @@ class ChapterRunner:
                              f"attempt {attempt + 1}")
                 return items, True
             mism = v.get("mismatches") or []
-            genuine = [m for m in mism if isinstance(m, dict)]
+            genuine = self._filter_verify_mismatches(phase_name, items, mism)
             if not genuine:
                 self._ledger(f"VERIFY_{phase_name[0]}", pages,
                              qp.PASS_STATUS_SUCCESS, len(items),
-                             "no specific mismatches")
-                return items, True             # nothing specific -> treat clean
+                             "no genuine mismatches (minor/phantom dropped)")
+                return items, True
             items = self._targeted_fix(phase_name, items, genuine)
         return items, ("exceeded attempts", last)
+
+    def _filter_verify_mismatches(self, phase_name, items, mism):
+        """BUG 6 (OBG-001 live): verify hallucinated Q1 'Lobia' (not in JSON)
+        and Q25 visual 'image says B' while printed grid + extract are C.
+        Drop: non-genuine severity, quotes absent from the item, visual
+        letter-flips that contradict the printed key, self-contradictory
+        chain-of-thought. Never rewrite content here -- only ignore phantom
+        flags so the retry loop cannot lock a clean chapter forever.
+        """
+        by_qn = {}
+        for it in items or []:
+            qn = it.get("_qn")
+            if qn is not None:
+                by_qn[qn] = it
+        kept = []
+        for m in mism or []:
+            if not isinstance(m, dict):
+                continue
+            sev = str(m.get("severity") or "genuine").strip().lower()
+            issue = str(m.get("issue") or "")
+            qn = _norm_q_no(m.get("q_no"))
+            if sev and sev != "genuine":
+                self.notes.append(
+                    f"verify drop q{qn}: severity={sev} (not genuine)")
+                continue
+            if _issue_self_contradicts(issue):
+                self.notes.append(
+                    f"verify drop q{qn}: self-contradictory issue text")
+                continue
+            it = by_qn.get(qn) if qn is not None else None
+            quoted = _quoted_snippets(issue)
+            if it is not None and quoted:
+                blob = json.dumps(it, ensure_ascii=False, default=str).lower()
+                missing = [q for q in quoted if q.lower() not in blob
+                           and len(q) >= 4]
+                if missing:
+                    self.notes.append(
+                        f"verify drop q{qn}: quoted {missing!r} not in "
+                        f"current item (stale/hallucinated)")
+                    continue
+            if it is not None and phase_name in ("Answer-key", "Question"):
+                extracted = None
+                if phase_name == "Answer-key":
+                    extracted = (str(it.get("correct_option") or "")
+                                 .strip().upper() or None)
+                printed = (getattr(self, "_printed_key", None) or {}).get(qn)
+                vis = _visual_letter_claim(issue)
+                if printed and extracted and printed == extracted and vis                         and vis != printed:
+                    self.notes.append(
+                        f"verify drop q{qn}: visual '{vis}' loses to printed "
+                        f"key '{printed}' (matches extract)")
+                    continue
+            kept.append(m)
+        return kept
 
     def _printed_boundary_note(self, phase_name, qns):
         """C2 (ANAT-001 live): a targeted re-ask keeps failing because the
@@ -1384,6 +1492,19 @@ class ChapterRunner:
             return None                       # scanned book: no printed signal
         self._printed_q_hdrs = q_hdrs
         self._printed_s_hdrs = s_hdrs
+        # printed answer-key letters (text layer) -- verify visual re-reads
+        # lose to this map (BUG 6 / OBG-001-025).
+        printed_key = {}
+        for p in range(ch_first, ch_last + 1):
+            try:
+                txt = qp.pdftotext_page(self.pdf, p) or ""
+            except Exception:
+                txt = ""
+            if not txt.strip():
+                continue
+            for m in self._KEYROW_TXT.finditer(txt):
+                printed_key[int(m.group(1))] = m.group(2).upper()
+        self._printed_key = printed_key
         # FIX B phantom-q_no guard: the highest number this chapter actually
         # prints as a 'Question N:' header is the ceiling of the real
         # question set. Anything the model reports ABOVE it (RAD-002-026
@@ -1815,7 +1936,7 @@ class ChapterRunner:
                     seed[1], chapter_records):
                 continue
             if seed is not None:
-                active_block = seed
+                active_block = (seed[0], seed[1], prev)
                 break
         for page in pages:
             imgs = qp.extract_real_images(self.pdf, page, watermark_ids,
@@ -1859,7 +1980,7 @@ class ChapterRunner:
                 last = None
             if last is not None and qp._plausible_qn_for_chapter(
                     last[1], chapter_records):
-                active_block = last
+                active_block = (last[0], last[1], page)
         return unresolved
 
     # -- Previously-open flags for this chapter -------------------------------

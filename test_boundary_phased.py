@@ -71,6 +71,31 @@ class T(unittest.TestCase):
         self.assertGreaterEqual(min(s), min(q))
         self.assertGreaterEqual(min(s), 37)  # numbered S headers from 45, floor A
 
+    def test_verify_filter_drops_phantom_and_minor(self):
+        """BUG 6: Q1 'Lobia' not in JSON + minor spelling + Q25 visual vs
+        printed C must not count as genuine."""
+        r = bph.ChapterRunner("x.pdf", "OBG", 1, "/tmp", model=object(),
+                              state={})
+        r._printed_key = {25: "C"}
+        items = [
+            {"_qn": 1, "stem": "vulva?", "options": {
+                "A": "Labia majora", "B": "Vestibule", "C": "glands",
+                "D": "Cervix"}},
+            {"_qn": 25, "correct_option": "C", "stem": "embolization"},
+        ]
+        mism = [
+            {"q_no": "1", "issue": "Option A text 'Lobia majora' should be "
+             "'Labia majora'", "severity": "minor"},
+            {"q_no": "1", "issue": "Option A text 'Lobia majora' is wrong",
+             "severity": "genuine"},
+            {"q_no": "25", "issue": "JSON says 'c', but wait page 12 image "
+             "shows correct option as 'b'", "severity": "genuine"},
+            {"q_no": "2", "issue": "stem missing entirely",
+             "severity": "genuine"},
+        ]
+        kept = r._filter_verify_mismatches("Question", items, mism)
+        self.assertEqual([m["q_no"] for m in kept], ["2"])
+
     def test_content_lock_static(self):
         """The engine may write extraction output, but must NEVER touch the
         human-edit primitives (flag-don't-fix: content edits are for /review)."""
