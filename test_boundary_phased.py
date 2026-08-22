@@ -631,6 +631,54 @@ class EngineCase(unittest.TestCase):
         self.assertIn(qp.PASS_STATUS_UNRESOLVED,
                       [lr["status"] for lr in r.ledger_rows])
 
+    def test_model_block_ocr_fallback_commits_flagged(self):
+        """OBG ch7 live ROOT FIX: Gemini blocked page 127's IMAGE at every dpi
+        and every prompt variant (finish_reason 4); OCR text of the same page
+        worked. The engine now OCR-falls-back, marks the items _ocr, and the
+        rows ship REVIEW_NEEDED -- chapter commits, but never locks on
+        unverifiable content."""
+        bnd = {"question_block": {"start_page": 5},
+               "answer_key_block": {"start_page": 10, "end_page": 10},
+               "solution_block": {"start_page": 11, "end_page": 13},
+               "confidence": "high"}
+        qs = [{"q_no": "1", "stem": "S? (OCR)", "options": {"A": "a", "B": "b",
+               "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
+               "source_page": 5, "text_confidence": "high"}]
+        an = [{"q_no": "1", "correct_option": "A", "low_confidence": False}]
+        so = [{"q_no": "1", "solution_text": "Sol (OCR).", "has_figure": False,
+               "figure_location": None, "source_page_range": [11, 11],
+               "text_confidence": "high"}]
+        ok = {"phase": "Question", "total_entries_checked": 1,
+              "all_verified": True, "mismatches": []}
+        model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
+                            _BlockedResp(), _BlockedResp(),  # Q image blocked
+                            json.dumps(qs),                  # OCR fallback OK
+                            json.dumps(ok),                  # Q verify
+                            json.dumps(an), json.dumps(ok),  # A + verify
+                            json.dumps(so), json.dumps(ok),  # S + verify
+                            _BlockedResp(), _BlockedResp(), _BlockedResp()])
+        r = self._runner(model)
+        orig_ocr = bph._ocr_page_text
+        bph._ocr_page_text = lambda pdf, page: (
+            "Question 1:\nS? (OCR)\na) a\nb) b\nc) c\nd) d")
+        try:
+            res = r.run(5, 13)                    # must NOT raise
+        finally:
+            bph._ocr_page_text = orig_ocr
+        self.assertTrue(res["committed"])
+        self.assertFalse(res["locked"])           # blocked images -> no lock
+        row = [json.loads(l) for l in
+               (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
+               if l.strip()][0]
+        self.assertEqual(row["qa_status"], "REVIEW_NEEDED")
+        self.assertTrue(any("OCR fallback" in (rr or "")
+                            for rr in (row.get("review_reasons") or [])),
+                        row.get("review_reasons"))
+        kinds = [json.loads(l)["kind"] for l in
+                 (qp.DATA_DIR / "export_gate.jsonl").read_text().splitlines()
+                 if l.strip()]
+        self.assertIn("chapter_not_locked", kinds)
+
     def test_quota_pause_is_systemexit_and_saves_state(self):
         model = _FakeModel(self._answers())
         r = self._runner(model)

@@ -115,6 +115,26 @@ def _chunk_pages(pages, n):
     return [pages[i:i + n] for i in range(0, len(pages), n)]
 
 
+def _ocr_page_text(pdf_path, page, dpi=300):
+    """Deterministic OCR of one PDF page (tesseract). Used when the model's
+    recitation filter blocks the page IMAGE (finish_reason 4): the printed
+    TEXT is still available and can be structured -- every such item is
+    flagged REVIEW_NEEDED downstream, never silently trusted."""
+    pre = Path(tempfile.mkdtemp(prefix="bph_ocr_")) / "p"
+    subprocess.run(["pdftoppm", "-f", str(page), "-l", str(page), "-r",
+                    str(dpi), "-png", "-singlefile", str(pdf_path), str(pre)],
+                   capture_output=True, timeout=90)
+    png = pre.with_suffix(".png")
+    if not png.exists():
+        return None
+    try:
+        r = subprocess.run(["tesseract", str(png), "-", "--psm", "6"],
+                           capture_output=True, text=True, timeout=120)
+        return r.stdout or None
+    except Exception:
+        return None
+
+
 def _phase_chunks(pages, size=PAGE_CHUNK, overlap=1):
     """Phase-extraction chunking with a 1-page overlap. A printed header at
     the BOTTOM of a chunk's last page otherwise loses its body (OPH-001 live:
@@ -712,6 +732,15 @@ class ChapterRunner:
                                     "retried once")
                     self.notes.append(f"{pass_name} phase unresolved: model "
                                       f"blocked chunk {chunk[0]}-{chunk[-1]}")
+                    # ROOT FIX (OBG ch7 live): the block is on the page IMAGE,
+                    # not the content. OCR the same pages (deterministic) and
+                    # structure the text with the same phase rules. Items are
+                    # marked _ocr -> REVIEW_NEEDED rows, never trusted silent.
+                    ocr_kept = self._ocr_fallback(chunk, prompt_tmpl, label,
+                                                  pass_name)
+                    if ocr_kept:
+                        out.extend(ocr_kept)
+                        items = ocr_kept
                     break
                 items = _unwrap_items(_parse_json(raw))
                 if isinstance(items, list):
@@ -751,6 +780,74 @@ class ChapterRunner:
                              "phase chunk returned no parseable JSON array "
                              "(1 re-ask also failed)")
         return self._merge_phase_items(out)
+
+    def _ocr_fallback(self, chunk, prompt_tmpl, label, pass_name):
+        """Model recitation-blocked the page IMAGEs of `chunk` -> OCR the
+        pages with tesseract (deterministic, no model) and structure the OCR
+        TEXT with the SAME phase rules + JSON format. Every item is marked
+        `_ocr`; `_build_records` turns that into a review reason so the row
+        is REVIEW_NEEDED and the chapter never silently trusts OCR text.
+        Returns [] when nothing usable came out (page left unresolved)."""
+        texts = {}
+        for p in chunk:
+            t = _ocr_page_text(self.pdf, p)
+            if t and t.strip():
+                texts[p] = t.strip()
+        if not texts:
+            self.notes.append(f"{label} OCR fallback produced no text for "
+                              f"pages {chunk[0]}-{chunk[-1]}")
+            return []
+        pages = sorted(texts)
+        if "ONLY respond" in prompt_tmpl:
+            rules, fmt = prompt_tmpl.split("ONLY respond", 1)
+        else:
+            rules, fmt = prompt_tmpl, ""
+        ocr_prompt = (
+            f"NOTE: Pages {pages[0]}-{pages[-1]} ke images is call me NAHI "
+            f"hain (model content-filter ne block kiya) -- neeche unka OCR "
+            f"text diya hai. Task wahi hai. OCR galat letter/word de sakta "
+            f"hai: jo clearly sahi nahi lagta hai usko "
+            f"\"text_confidence\": \"low\" mark karo, skip mat karo.\n\n"
+            + rules.strip()
+            + f"\n\nOCR TEXT (pages {pages[0]}-{pages[-1]}):\n"
+            + "\n\n".join(f"--- page {p} ---\n{texts[p]}" for p in pages)
+            + "\n\nONLY respond" + fmt)
+        try:
+            raw = self._gen([ocr_prompt])
+        except ModelBlocked:
+            self.notes.append(f"{label} OCR fallback ALSO blocked for pages "
+                              f"{chunk[0]}-{chunk[-1]} -- left unresolved")
+            return []
+        items = _unwrap_items(_parse_json(raw))
+        if not isinstance(items, list):
+            self.notes.append(f"{label} OCR fallback unparsable for pages "
+                              f"{chunk[0]}-{chunk[-1]}")
+            return []
+        kept = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            qn0 = _item_qn(it)
+            if qn0 is None:
+                self.orphan_items.append({
+                    "chapter_id": self.chapter_id, "batch_start": chunk[0],
+                    "pdf_pages": list(chunk),
+                    "reason": "ocr_fallback_item_no_q_no",
+                    "pass": f"OCR_{pass_name}", "item": it})
+                continue
+            _normalize_phase_item(label, it)
+            it["_qn"] = qn0
+            it["_ocr"] = True
+            it["_continuation"] = _is_continuation_marker(_item_qno_raw(it))
+            kept.append(it)
+        self._ledger(f"OCR_{pass_name}", pages, qp.PASS_STATUS_PARTIAL,
+                     len(kept),
+                     "image blocked (recitation filter); structured from "
+                     "OCR text -- rows flagged for manual review")
+        self.notes.append(f"{label} phase: images blocked on {pages} -> OCR "
+                          f"fallback used ({len(kept)} item(s)); verify "
+                          f"text manually")
+        return kept
 
     @staticmethod
     def _merge_phase_items(items):
@@ -1218,6 +1315,11 @@ class ChapterRunner:
                 smap[qn] = s
         records = {}
         qn_source_pages = {}
+        # OCR fallback markers (model recitation-blocked the page IMAGE; rows
+        # stay REVIEW_NEEDED so nobody silently trusts OCR text)
+        ocr_q = {i.get("_qn") for i in q_items if i.get("_ocr")}
+        ocr_s = {i.get("_qn") for i in s_items if i.get("_ocr")}
+        ocr_a = {i.get("_qn") for i in a_items if i.get("_ocr")}
         for q in q_items:
             qn = q.get("_qn") if q.get("_qn") is not None else _norm_q_no(q.get("q_no"))
             if qn is None:
@@ -1241,6 +1343,18 @@ class ChapterRunner:
                 reasons.append("solution phase marked text_confidence=low")
             if qn in a_low:
                 reasons.append("answer-key cell marked low_confidence by model")
+            if qn in ocr_q:
+                reasons.append("question phase: page image blocked by model "
+                               "filter -> OCR fallback used; verify text "
+                               "manually (OCR may misread)")
+            if qn in ocr_s:
+                reasons.append("solution phase: page image blocked by model "
+                               "filter -> OCR fallback used; verify text "
+                               "manually (OCR may misread)")
+            if qn in ocr_a:
+                reasons.append("answer-key phase: page image blocked by model "
+                               "filter -> OCR fallback used; verify letter "
+                               "manually (OCR may misread)")
             opts, opt_issue = _norm_options(q.get("options"))
             if opt_issue:
                 # shape/letter drift must NEVER crash the chapter and must
