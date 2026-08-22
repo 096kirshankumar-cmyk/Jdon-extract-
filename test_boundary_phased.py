@@ -10,6 +10,7 @@ from pathlib import Path
 
 import boundary_phased as bph
 import qbank_pipeline as qp
+import review_queue as rq
 
 
 class T(unittest.TestCase):
@@ -1017,6 +1018,130 @@ class EngineCase(unittest.TestCase):
             kinds = [json.loads(l)["kind"] for l in
                      gate.read_text().splitlines() if l.strip()]
             self.assertNotIn("phase_unresolved", kinds)
+
+    def test_duplicate_solution_forces_reask_and_can_recover(self):
+        """ANAT-001 live (2026-08-22): model wrote q18's body INTO q17 with
+        NO embedded marker (so C1 cannot split) and BOTH verify and
+        cross-check passed silently -> 19 READY rows with q17=q18 content,
+        no flag. New deterministic guard: near-identical solution texts for
+        two DIFFERENT questions force a boundary-proof re-ask of both."""
+        bnd = {"question_block": {"start_page": 5},
+               "answer_key_block": {"start_page": 10, "end_page": 10},
+               "solution_block": {"start_page": 11, "end_page": 13},
+               "confidence": "high"}
+        qs = [{"q_no": "1", "stem": "S1?", "options": {"A": "a", "B": "b",
+               "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
+               "source_page": 5, "text_confidence": "high"},
+              {"q_no": "2", "stem": "S2?", "options": {"A": "a", "B": "b",
+               "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
+               "source_page": 5, "text_confidence": "high"}]
+        an = [{"q_no": "1", "correct_option": "A", "low_confidence": False},
+              {"q_no": "2", "correct_option": "B", "low_confidence": False}]
+        corpus = ("If the ovum is not fertilized, the corpus luteum persists "
+                  "for about 14 days i.e., 2 weeks. The fate of the corpus "
+                  "luteum depends on the fertilization of the ovum: No "
+                  "fertilization: Corpus luteum of menstruation remains "
+                  "small and secretes progesterone. This progesterone "
+                  "prepares the uterine endometrium to enter the "
+                  "progestational or secretory phase.")
+        # model mislabels: q1 AND q2 both carry the SAME corpus luteum text
+        dups = [{"q_no": "1", "solution_text": corpus, "has_figure": False,
+                 "figure_location": None, "source_page_range": [11, 12],
+                 "text_confidence": "high"},
+                {"q_no": "2", "solution_text": corpus + " duplicate.",
+                 "has_figure": False, "figure_location": None,
+                 "source_page_range": [11, 12], "text_confidence": "high"}]
+        ok = {"phase": "Solution", "total_entries_checked": 2,
+              "all_verified": True, "mismatches": []}
+        recovered = [{"q_no": "1", "solution_text": "Sol1 own text.",
+                      "has_figure": False, "figure_location": None,
+                      "source_page_range": [11, 11],
+                      "text_confidence": "high"},
+                     {"q_no": "2", "solution_text": "Sol2 own text.",
+                      "has_figure": False, "figure_location": None,
+                      "source_page_range": [12, 12],
+                      "text_confidence": "high"}]
+        cross = {"chapter": "OPH-001", "status": "LOCKED",
+                 "total_questions": 2, "issues": []}
+        model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
+                            json.dumps(qs), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
+                            json.dumps(dups), json.dumps(ok),
+                            json.dumps(recovered),
+                            json.dumps(cross)])
+        r = self._runner(model)
+        r._printed_s_hdrs = {11: {1}, 12: {2}}
+        res = r.run(5, 13)
+        self.assertTrue(res["locked"])
+        self.assertTrue(any("near-duplicates" in n for n in r.notes))
+        rows = {json.loads(l)["id"]: json.loads(l) for l in
+                (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
+                if l.strip()}
+        self.assertEqual(rows["OPH-001-001"]["solution"]["text"],
+                         "Sol1 own text.")
+        self.assertEqual(rows["OPH-001-002"]["solution"]["text"],
+                         "Sol2 own text.")
+
+    def test_duplicate_solution_persistent_flags_blocker(self):
+        """If the re-ask KEEPS the duplicate (model undeterred), the commit
+        gate must add duplicate_solution (BLOCKER) rows -- never a clean
+        ship of mislabelled content."""
+        bnd = {"question_block": {"start_page": 5},
+               "answer_key_block": {"start_page": 10, "end_page": 10},
+               "solution_block": {"start_page": 11, "end_page": 13},
+               "confidence": "high"}
+        qs = [{"q_no": "1", "stem": "S1?", "options": {"A": "a", "B": "b",
+               "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
+               "source_page": 5, "text_confidence": "high"},
+              {"q_no": "2", "stem": "S2?", "options": {"A": "a", "B": "b",
+               "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
+               "source_page": 5, "text_confidence": "high"}]
+        an = [{"q_no": "1", "correct_option": "A", "low_confidence": False},
+              {"q_no": "2", "correct_option": "B", "low_confidence": False}]
+        corpus = ("If the ovum is not fertilized, the corpus luteum persists "
+                  "for about 14 days i.e., 2 weeks. The fate of the corpus "
+                  "luteum depends on the fertilization of the ovum: No "
+                  "fertilization: Corpus luteum of menstruation remains "
+                  "small and secretes progesterone. This progesterone "
+                  "prepares the uterine endometrium to enter the "
+                  "progestational or secretory phase.")
+        dups = [{"q_no": "1", "solution_text": corpus, "has_figure": False,
+                 "figure_location": None, "source_page_range": [11, 12],
+                 "text_confidence": "high"},
+                {"q_no": "2", "solution_text": corpus, "has_figure": False,
+                 "figure_location": None, "source_page_range": [11, 12],
+                 "text_confidence": "high"}]
+        ok = {"phase": "Solution", "total_entries_checked": 2,
+              "all_verified": True, "mismatches": []}
+        cross = {"chapter": "OPH-001", "status": "LOCKED",
+                 "total_questions": 2, "issues": []}
+        # re-ask returns the SAME duplicates -> gate must flag
+        model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
+                            json.dumps(qs), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
+                            json.dumps(dups), json.dumps(ok),
+                            json.dumps(dups),       # re-ask: STILL duplicates
+                            json.dumps(cross)])
+        r = self._runner(model)
+        r._printed_s_hdrs = {11: {1}, 12: {2}}
+        res = r.run(5, 13)
+        self.assertTrue(res["committed"])
+        gate = qp.DATA_DIR / "export_gate.jsonl"
+        kinds = [json.loads(l)["kind"] for l in gate.read_text().splitlines()
+                 if l.strip()]
+        self.assertIn("duplicate_solution", kinds)
+        self.assertIn("duplicate_solution",
+                      rq.BLOCKER_KINDS)           # zip stays shut
+        rows = [json.loads(l) for l in
+                (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
+                if l.strip()]
+        self.assertTrue(any(r.get("qa_status") == "REVIEW_NEEDED"
+                            for r in rows), "flagged rows expected")
+        all_reasons = [x for r in rows
+                       for x in list(r.get("review_reasons") or [])
+                       + list(r.get("qa_reasons") or [])]
+        self.assertTrue(any("duplicate" in x for x in all_reasons),
+                        all_reasons)
 
     def test_quota_pause_is_systemexit_and_saves_state(self):
         model = _FakeModel(self._answers())

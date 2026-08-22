@@ -71,6 +71,8 @@ BLOCKER_KINDS = {
     "chapter_not_locked",       # cross-check/count guards refused, or the
                                 # chapter failed before any commit
     "phase_unresolved",         # a verify loop exhausted its fix attempts
+    "duplicate_solution",       # two questions shipped near-identical solution
+                                # text (label misassignment) -- needs a human
 }
 
 HUMAN_EDIT_LEDGER = "human_edit_ledger.jsonl"

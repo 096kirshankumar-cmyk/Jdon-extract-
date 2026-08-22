@@ -1393,6 +1393,33 @@ class ChapterRunner:
                                   default=None) if q_hdrs else None
         return {"q": q_pages, "s": s_pages, "keys": key_cands}
 
+    @staticmethod
+    def _solution_dup_pairs(items, thresh=0.85):
+        """Deterministic label-misassignment detector (ANAT-001 live, C3
+        hardening): two DIFFERENT questions can never legitimately carry
+        near-identical solution text. Returns [(q_a, q_b, sim)]."""
+        import difflib as _d
+        norm = lambda t: re.sub(r"\s+", " ", str(t or "")).strip().lower()
+        by_qn = {}
+        for it in items:
+            qn = it.get("_qn")
+            if qn is None:
+                continue
+            t = norm(it.get("solution_text"))
+            if len(t) < 80:
+                continue
+            by_qn.setdefault(qn, t)
+        keys = sorted(by_qn)
+        out = []
+        for i in range(len(keys)):
+            for j in range(i + 1, len(keys)):
+                a, b = keys[i], keys[j]
+                sim = _d.SequenceMatcher(None, by_qn[a][:400],
+                                         by_qn[b][:400]).ratio()
+                if sim >= thresh:
+                    out.append((a, b, sim))
+        return out
+
     def _printed_header_reask(self, phase_name, items, zone_pages, hdr_attr,
                               prompt_tmpl, dpi=110):
         """A phase's model read can silently DROP a question/solution whose
@@ -1427,6 +1454,30 @@ class ChapterRunner:
             for qn in (hdrs.get(p) or set()):
                 if qn not in have:
                     missing_pages.setdefault(qn, p)
+        # LABEL-MISASSIGNMENT GUARD (ANAT-001 live): two DIFFERENT questions
+        # can never legitimately carry near-identical solution text -- the
+        # model wrote q18's body into q17 (no embedded marker, so C1 cannot
+        # split) and BOTH verify and cross-check passed silently. Force a
+        # boundary-proof re-ask of BOTH q_nos; if it persists the commit
+        # gate flags duplicate_solution (BLOCKER) and the zip stays shut.
+        dup_force = set()
+        if phase_name == "Solution":
+            for a, b, sim in self._solution_dup_pairs(items):
+                self.notes.append(
+                    f"Solution: q{a} and q{b} solution texts are near-"
+                    f"duplicates ({int(sim * 100)}%) -- forced re-ask "
+                    f"(label misassignment suspect)")
+                for qn in (a, b):
+                    dup_force.add(qn)
+                    if qn not in have:
+                        continue
+                    pg = next((p for p, s in hdrs.items() if qn in s), None)
+                    if pg is None:
+                        it = next((i for i in items
+                                   if i.get("_qn") == qn), None)
+                        spr = (it or {}).get("source_page_range") or []
+                        pg = _safe_int(spr[0]) if spr else None
+                    missing_pages.setdefault(qn, pg or zone_pages[0])
         if not missing_pages:
             return items
         qns = sorted(missing_pages)
@@ -1478,7 +1529,8 @@ class ChapterRunner:
                 it["_qn"] = qn0
                 existing = next((i for i in items if i.get("_qn") == qn0),
                                 None)
-                if existing is not None and _content_ok(existing):
+                if existing is not None and _content_ok(existing) \
+                        and qn0 not in dup_force:
                     continue
                 it["_reasked"] = True
                 if existing is None:
@@ -1796,6 +1848,20 @@ class ChapterRunner:
             chapter_records, image_files_by_q, unresolved_ledger,
             self.chapter_id, chapter_unresolved_images, [],
             anchor_pages=chapter_anchor_idx, ownership_pages=ownership_pages)
+        # LABEL-MISASSIGNMENT GATE (ANAT-001 live): if two questions still
+        # ship near-identical solution text (the model re-ask keeps
+        # mislabelling), the chapter must NOT look clean -- BLOCKER + zip
+        # shut until a human decides. Never silent.
+        dup_pairs = self._solution_dup_pairs(
+            [{"_qn": qn, "solution_text": rec.get("solution_text")}
+             for qn, rec in chapter_records.items()])
+        if dup_pairs:
+            for a, b, sim in dup_pairs:
+                violations.append(
+                    ("duplicate_solution", a,
+                     f"q{a} and q{b} solution texts are near-duplicates "
+                     f"({int(sim * 100)}%) -- one answer's explanation is "
+                     f"mislabelled; manual review required"))
         if not locked:
             reasons = "; ".join(self.notes[-6:]) or "cross-check refused LOCK"
             violations.append(("chapter_not_locked", None,
