@@ -136,6 +136,91 @@ def _item_qno_raw(it):
 
 
 # ---------------------------------------------------------------------------
+# OPTIONS SHAPE NORMALIZATION
+# ---------------------------------------------------------------------------
+# LIVE finding (OBG ch2, 2026-08-22): the model answered the question phase
+# with "options" as a LIST (e.g. ["a) ...", "b) ..."]) instead of the spec's
+# {"A": ..., "B": ...} object. _build_records did {}.items() on it and the
+# WHOLE CHAPTER died with AttributeError 'list' object has no attribute
+# 'items'. Options are now normalized here; letters are taken from the model's
+# own output when present, and position-assigned ONLY with an explicit
+# suspect flag -- content is never dropped and never silently trusted.
+
+_OPT_LETTER_RE = re.compile(
+    r"^[\(（\[]?\s*([A-Ha-h])\s*[\)\]\.、:：\-–—>]\s*(.*)$", re.S)
+_OPT_TEXT_KEYS = ("text", "value", "content", "option_text", "label_text",
+                  "description", "option")
+
+
+def _norm_options(raw):
+    """-> (opts_dict {LETTER: text}, issue_note).
+
+    issue_note is "" when the shape was the spec dict (or a fully lettered
+    list). Non-empty notes mean the row MUST be flagged (options_suspect /
+    review_reasons) -- this function never invents letters silently.
+    """
+    if raw is None:
+        return {}, "options field missing"
+    if isinstance(raw, dict):
+        opts, issues = {}, []
+        for k, v in raw.items():
+            letter = str(k).strip().upper()
+            if re.fullmatch(r"[A-H]", letter):
+                opts.setdefault(letter, str(v or "").strip())
+            else:
+                issues.append(f"non-letter key {str(k)[:14]!r} ignored")
+        if not opts:
+            return {}, "options dict has no A-H keys"
+        return opts, "; ".join(issues)
+    if isinstance(raw, list):
+        opts, issues = {}, []
+        for i, item in enumerate(raw):
+            letter, text = None, None
+            if isinstance(item, str):
+                m = _OPT_LETTER_RE.match(item.strip())
+                if m:
+                    letter, text = m.group(1).upper(), m.group(2).strip()
+                else:
+                    text = item.strip()
+                    issues.append(f"option {i + 1} has no leading letter")
+            elif isinstance(item, dict):
+                for k in ("letter", "label", "option", "key", "id"):
+                    if item.get(k) is not None:
+                        mv = _OPT_LETTER_RE.match(str(item[k]).strip())
+                        if mv:
+                            letter = mv.group(1).upper()
+                        elif re.fullmatch(r"[A-Ha-h]",
+                                          str(item[k]).strip()):
+                            letter = str(item[k]).strip().upper()
+                        break
+                for k in _OPT_TEXT_KEYS:
+                    if item.get(k):
+                        text = str(item[k]).strip()
+                        break
+                if text is None:
+                    for k, v in item.items():
+                        if re.fullmatch(r"[A-Ha-h]", str(k).strip()):
+                            letter = str(k).strip().upper()
+                            text = str(v or "").strip()
+                            break
+                if text is None:
+                    issues.append(f"option {i + 1} dict has no text field")
+                    continue
+            else:
+                issues.append(f"option {i + 1} is {type(item).__name__} "
+                              f"(not str/dict)")
+                continue
+            if letter is None:
+                letter = chr(ord("A") + i) if i < 8 else f"X{i}"
+                issues.append(f"option {i + 1} unlettered -> position {letter}")
+            if letter in opts and opts[letter] and opts[letter] != text:
+                issues.append(f"duplicate option letter {letter}")
+            opts[letter] = text or ""
+        return opts, "; ".join(issues)
+    return {}, f"options field is {type(raw).__name__} (unexpected)"
+
+
+# ---------------------------------------------------------------------------
 # THE EXACT PROMPTS FROM THE SPEC (do not paraphrase)
 # ---------------------------------------------------------------------------
 BOUNDARY_PROMPT = """Tumhe ek textbook chapter ke consecutive pages diye jayenge (images).
@@ -176,6 +261,9 @@ Rules:
 - Figure/diagram ho to location note karo (page + position), "has_figure: true" 
   mark karo.
 - Numbering exactly page ke jaisa follow karo, skip/merge mat karo.
+- options hamesha OBJECT (map) me do: {{"A": "...", "B": "...", "C": "...", 
+  "D": "..."}} — LIST kabhi nahi. Printed letters lowercase (a/b/c/d) hain to 
+  bhi unhe uppercase letter keys me daalo.
 - Text unclear ho to best-guess do, "text_confidence: low" mark karo.
 
 ONLY respond in this JSON format (array):
@@ -965,11 +1053,11 @@ class ChapterRunner:
                 reasons.append("solution phase marked text_confidence=low")
             if qn in a_low:
                 reasons.append("answer-key cell marked low_confidence by model")
-            opts = {}
-            for k, v in (q.get("options") or {}).items():
-                letter = str(k).strip().upper()
-                if letter:
-                    opts[letter] = str(v or "").strip()
+            opts, opt_issue = _norm_options(q.get("options"))
+            if opt_issue:
+                # shape/letter drift must NEVER crash the chapter and must
+                # NEVER pass silently: flag the row for human review.
+                reasons.append("options shape flagged: " + opt_issue)
             records[qn] = {
                 "q_no": qn,
                 "question_text": str(q.get("stem") or "").strip(),
@@ -986,6 +1074,9 @@ class ChapterRunner:
                     "solution_text": "BOUNDARY_PHASED"}},
                 "_prov_expected": True,
             }
+            if opt_issue:
+                records[qn]["_options_suspect_reason"] = (
+                    "options shape/letters flagged: " + opt_issue)
         n_no_ans = sum(1 for r in records.values() if not r["correct_option"])
         n_no_sol = sum(1 for r in records.values() if not r["solution_text"])
         if n_no_ans:

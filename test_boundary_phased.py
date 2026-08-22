@@ -66,6 +66,46 @@ class T(unittest.TestCase):
         for banned in ("apply_edit(", "apply_image_op(", "apply_orphan_merge("):
             self.assertNotIn(banned, src)
 
+    def test_norm_options_shapes_never_crash(self):
+        """OBG ch2 live finding (2026-08-22): 'options' came back as a LIST
+        and _build_records died with AttributeError, killing the chapter.
+        _norm_options must accept every plausible shape; letters are taken
+        from the model's own text, position-assignment is always flagged."""
+        # spec dict (lowercase keys) -> uppercase keys, no issue
+        d, note = bph._norm_options(
+            {"a": "one", "b": "two", "c": "three", "d": "four"})
+        self.assertEqual(d, {"A": "one", "B": "two", "C": "three", "D": "four"})
+        self.assertEqual(note, "")
+        # lettered list (book prints 'a) ...') -> clean, no issue
+        d, note = bph._norm_options(
+            ["a) one", "b) two", "c) three", "d) four"])
+        self.assertEqual(d, {"A": "one", "B": "two", "C": "three", "D": "four"})
+        self.assertEqual(note, "")
+        d, note = bph._norm_options(
+            ["(A) one", "B) two", "C. three", "D: four"])
+        self.assertEqual(d, {"A": "one", "B": "two", "C": "three", "D": "four"})
+        self.assertEqual(note, "")
+        # list of {letter, text} dicts
+        d, note = bph._norm_options(
+            [{"letter": "A", "text": "one"}, {"letter": "b", "text": "two"},
+             {"letter": "C", "text": "three"}, {"letter": "D", "text": "four"}])
+        self.assertEqual(d, {"A": "one", "B": "two", "C": "three", "D": "four"})
+        self.assertEqual(note, "")
+        # list of single-key dicts
+        d, note = bph._norm_options(
+            [{"A": "one"}, {"B": "two"}, {"C": "three"}, {"D": "four"}])
+        self.assertEqual(d, {"A": "one", "B": "two", "C": "three", "D": "four"})
+        self.assertEqual(note, "")
+        # unlettered list -> position-assigned BUT flagged, never silent
+        d, note = bph._norm_options(["one", "two", "three", "four"])
+        self.assertEqual(d, {"A": "one", "B": "two", "C": "three", "D": "four"})
+        self.assertIn("unlettered", note)
+        # garbage shapes degrade to {} + issue note, never raise
+        for bad in (None, 42, "nope", [1, 2], {"x": "y"}):
+            d, note = bph._norm_options(bad)
+            self.assertIsInstance(d, dict)
+            self.assertTrue(note)
+
 
 class _FakeModel:
     """Returns per-phase canned answers; drives a full run() end to end."""
@@ -274,6 +314,79 @@ class EngineCase(unittest.TestCase):
         self.assertEqual(row["correct_options"], ["B"])   # key table wins
         # 2 options < 4 -> structural INCOMPLETE (flagged for human, not fixed)
         self.assertEqual(row["qa_status"], "INCOMPLETE")
+
+    def test_options_list_shape_commits_no_crash(self):
+        """OBG ch2 live failure (2026-08-22): model returned 'options' as a
+        lettered LIST ('a) ...'); the old code called .items() on it and the
+        whole chapter died. Now: lettered list -> spec dict, commit proceeds,
+        letters explicit => READY, no suspect flag."""
+        bnd = {"question_block": {"start_page": 5},
+               "answer_key_block": {"start_page": 10, "end_page": 10},
+               "solution_block": {"start_page": 11, "end_page": 13},
+               "confidence": "high"}
+        qs = [{"q_no": "1", "stem": "S?", "options": ["a) alpha", "b) beta",
+               "c) gamma", "d) delta"], "has_figure": False,
+               "figure_location": None, "source_page": 5,
+               "text_confidence": "high"}]
+        an = [{"q_no": "1", "correct_option": "b", "low_confidence": False}]
+        so = [{"q_no": "1", "solution_text": "Sol.", "has_figure": False,
+               "figure_location": None, "source_page_range": [11, 11],
+               "text_confidence": "high"}]
+        ok = {"phase": "Question", "total_entries_checked": 1,
+              "all_verified": True, "mismatches": []}
+        cross = {"chapter": "OPH-001", "status": "LOCKED",
+                 "total_questions": 1, "issues": []}
+        model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
+                            json.dumps(qs), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
+                            json.dumps(so), json.dumps(ok),
+                            json.dumps(cross)])
+        r = self._runner(model)
+        res = r.run(5, 13)
+        self.assertTrue(res["committed"])              # NO AttributeError
+        self.assertTrue(res["locked"])
+        row = [json.loads(l) for l in
+               (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
+               if l.strip()][0]
+        self.assertEqual({o["id"]: o["text"] for o in row["options"]},
+                         {"A": "alpha", "B": "beta", "C": "gamma",
+                          "D": "delta"})
+        self.assertEqual(row["correct_options"], ["B"])   # lowercase intake
+        self.assertIsNone(row["options_suspect"])         # letters explicit
+        self.assertEqual(row["qa_status"], "READY")
+
+    def test_options_unlettered_list_flagged_not_silent(self):
+        """Same drift WITHOUT letters: position-assigned but the row MUST
+        carry options_suspect + REVIEW_NEEDED (flag-don't-fix doctrine)."""
+        bnd = {"question_block": {"start_page": 5},
+               "answer_key_block": {"start_page": 10, "end_page": 10},
+               "solution_block": {"start_page": 11, "end_page": 13},
+               "confidence": "high"}
+        qs = [{"q_no": "1", "stem": "S?", "options": ["alpha", "beta",
+               "gamma", "delta"], "has_figure": False,
+               "figure_location": None, "source_page": 5,
+               "text_confidence": "high"}]
+        an = [{"q_no": "1", "correct_option": "B", "low_confidence": False}]
+        so = [{"q_no": "1", "solution_text": "Sol.", "has_figure": False,
+               "figure_location": None, "source_page_range": [11, 11],
+               "text_confidence": "high"}]
+        ok = {"phase": "Question", "total_entries_checked": 1,
+              "all_verified": True, "mismatches": []}
+        cross = {"chapter": "OPH-001", "status": "LOCKED",
+                 "total_questions": 1, "issues": []}
+        model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
+                            json.dumps(qs), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
+                            json.dumps(so), json.dumps(ok),
+                            json.dumps(cross)])
+        r = self._runner(model)
+        res = r.run(5, 13)
+        self.assertTrue(res["committed"])
+        row = [json.loads(l) for l in
+               (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
+               if l.strip()][0]
+        self.assertIn("unlettered", row.get("options_suspect") or "")
+        self.assertEqual(row["qa_status"], "REVIEW_NEEDED")
 
     def test_printed_header_reask_recovers_dropped_block(self):
         """OPH-001 live finding: the model silently dropped q15's solution
