@@ -117,12 +117,26 @@ class _FakeModel:
                          safety_settings=None):
         prompt = files[-1]
         self.calls.append(str(prompt))
-        return _Resp(self.answers.pop(0) if self.answers else "{}")
+        ans = self.answers.pop(0) if self.answers else "{}"
+        if isinstance(ans, _BlockedResp):      # pass the block-through shape
+            return ans                         # through unwrapped
+        return _Resp(ans)
 
 
 class _Resp:
     def __init__(self, text):
         self.text = text
+
+
+class _BlockedResp:
+    """Gemini finish_reason=4 shape: the candidate has NO parts, so
+    response.text raises ValueError ('reciting from copyrighted material')."""
+    @property
+    def text(self):
+        raise ValueError("Invalid operation: The `response.text` quick "
+                         "accessor requires the response to contain a valid "
+                         "`Part`, but none were returned. The candidate's "
+                         "[finish_reason] is 4.")
 
 
 class EngineCase(unittest.TestCase):
@@ -141,6 +155,8 @@ class EngineCase(unittest.TestCase):
         qp.ASSETS_DIR.mkdir(parents=True)
         self._pace = bph.PACE_CALLS
         bph.PACE_CALLS = False
+        self._mblock = bph.MODEL_BLOCK_SLEEP
+        bph.MODEL_BLOCK_SLEEP = 0        # no real backoff in tests
         self._png = bph._png_bytes
         bph._png_bytes = lambda *_a, **_k: b"png"
         self._render = bph._render_chapter_jpgs
@@ -153,6 +169,7 @@ class EngineCase(unittest.TestCase):
     def tearDown(self):
         (qp.OUTPUT_ROOT, qp.DATA_DIR, qp.ASSETS_DIR, qp.STATE_FILE) = self._orig
         bph.PACE_CALLS = self._pace
+        bph.MODEL_BLOCK_SLEEP = self._mblock
         bph._png_bytes = self._png
         bph._render_chapter_jpgs = self._render
 
@@ -546,6 +563,73 @@ class EngineCase(unittest.TestCase):
                          "Sol2 recovered.")
         self.assertIn("REASK_S", [lr["pass"] for lr in
                                   r.ledger_rows])
+
+    def test_model_block_retries_once_then_commits(self):
+        """OBG-007 live: Gemini answered finish_reason=4 ('reciting from
+        copyrighted material') and resp.text's ValueError KILLED the whole
+        chapter. _gen must retry a block ONCE; a clean second answer commits
+        the chapter normally."""
+        bnd = {"question_block": {"start_page": 5},
+               "answer_key_block": {"start_page": 10, "end_page": 10},
+               "solution_block": {"start_page": 11, "end_page": 13},
+               "confidence": "high"}
+        qs = [{"q_no": "1", "stem": "S?", "options": {"A": "a", "B": "b",
+               "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
+               "source_page": 5, "text_confidence": "high"}]
+        an = [{"q_no": "1", "correct_option": "A", "low_confidence": False}]
+        so = [{"q_no": "1", "solution_text": "Sol.", "has_figure": False,
+               "figure_location": None, "source_page_range": [11, 11],
+               "text_confidence": "high"}]
+        ok = {"phase": "Question", "total_entries_checked": 1,
+              "all_verified": True, "mismatches": []}
+        cross = {"chapter": "OPH-001", "status": "LOCKED",
+                 "total_questions": 1, "issues": []}
+        model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
+                            _BlockedResp(),               # Q call blocked...
+                            json.dumps(qs),               # ...retry succeeds
+                            json.dumps(ok), json.dumps(an), json.dumps(ok),
+                            json.dumps(so), json.dumps(ok), json.dumps(cross)])
+        r = self._runner(model)
+        res = r.run(5, 13)                       # must NOT raise
+        self.assertTrue(res["committed"])
+        self.assertTrue(res["locked"])
+        row = [json.loads(l) for l in
+               (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
+               if l.strip()][0]
+        self.assertEqual(row["qa_status"], "READY")
+
+    def test_model_block_persistent_flags_not_crash(self):
+        """If the block persists (retry also blocked), the phase is UNRESOLVED
+        -> BLOCK-FAIL: nothing committed, chapter left undone, blocker row
+        written. Never a crash, never a silent half-shell."""
+        bnd = {"question_block": {"start_page": 5},
+               "answer_key_block": {"start_page": 10, "end_page": 10},
+               "solution_block": {"start_page": 11, "end_page": 13},
+               "confidence": "high"}
+        ok = {"phase": "Question", "total_entries_checked": 0,
+              "all_verified": True, "mismatches": []}
+        model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
+                            _BlockedResp(), _BlockedResp(),  # blocked+retry
+                            json.dumps(ok),                  # Q verify
+                            json.dumps([]), json.dumps(ok),  # A extract+verify
+                            json.dumps([]), json.dumps(ok)]) # S extract+verify
+        r = self._runner(model)
+        res = r.run(5, 13)                        # must NOT raise
+        self.assertFalse(res["committed"])
+        self.assertFalse(res["locked"])
+        self.assertFalse((qp.DATA_DIR / "questions.jsonl").exists())
+        st = json.loads(qp.STATE_FILE.read_text())
+        self.assertNotIn("OPH-001",
+                         st.get("pdf_progress", {}).get("OPH", {})
+                         .get("chapters_done", []))
+        kinds = [json.loads(l)["kind"] for l in
+                 (qp.DATA_DIR / "export_gate.jsonl").read_text().splitlines()
+                 if l.strip()]
+        self.assertIn("chapter_not_locked", kinds)
+        self.assertTrue(any("unresolved" in n for n in r.notes))
+        # the block itself is ledgered honestly
+        self.assertIn(qp.PASS_STATUS_UNRESOLVED,
+                      [lr["status"] for lr in r.ledger_rows])
 
     def test_quota_pause_is_systemexit_and_saves_state(self):
         model = _FakeModel(self._answers())

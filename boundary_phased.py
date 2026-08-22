@@ -81,6 +81,27 @@ class QuotaPaused(SystemExit):
     keeps marking the run 'paused' with zero app-side changes."""
 
 
+class ModelBlocked(Exception):
+    """Gemini returned NO usable content (finish_reason 4: 'reciting from
+    copyrighted material' / prohibited-content refusal). _gen retries once,
+    then raises this typed exception; every caller converts it into a ledger
+    UNRESOLVED row + a 'phase_unresolved' note so the chapter FLAGS instead
+    of dying (OBG-007 live: a raw ValueError from resp.text killed the whole
+    chapter mid-question-phase)."""
+
+
+MODEL_BLOCK_SLEEP = 15      # backoff before the one bounded re-ask of a block
+
+
+def _resp_text(resp):
+    """resp.text raises ValueError when the candidate carries no Part
+    (finish_reason 4). Normalize that shape to the typed ModelBlocked."""
+    try:
+        return resp.text
+    except ValueError:
+        raise ModelBlocked()
+
+
 def _png_bytes(pdf_path, page, dpi=110):
     pre = Path(tempfile.mkdtemp(prefix="bph_")) / "p"
     subprocess.run(["pdftoppm", "-f", str(page), "-l", str(page), "-r",
@@ -596,7 +617,13 @@ class ChapterRunner:
             resp = self.model.generate_content(
                 files, safety_settings=qp.SAFETY_SETTINGS)
             qp.note_call(self.state)
-            return resp.text
+            return _resp_text(resp)
+        except ModelBlocked:
+            time.sleep(MODEL_BLOCK_SLEEP)      # one bounded retry: a
+            resp = self.model.generate_content(   # recitation/safety block
+                files, safety_settings=qp.SAFETY_SETTINGS)  # is prompt-roll bound
+            qp.note_call(self.state)
+            return _resp_text(resp)            # still blocked -> raise through
         except Exception as e:
             err = str(e)
             if "429" in err or "quota" in err.lower():
@@ -611,7 +638,7 @@ class ChapterRunner:
                 resp = self.model.generate_content(
                     files, safety_settings=qp.SAFETY_SETTINGS)
                 qp.note_call(self.state)
-                return resp.text
+                return _resp_text(resp)
             raise
 
     def _call_pages(self, pages, prompt, dpi=110):
@@ -644,7 +671,15 @@ class ChapterRunner:
             cands = []
             chunks = _chunk_pages(pages, min(PAGE_CHUNK, 12))
             for chunk in chunks:
-                raw = self._call_pages(chunk, BOUNDARY_PROMPT)
+                try:
+                    raw = self._call_pages(chunk, BOUNDARY_PROMPT)
+                except ModelBlocked:
+                    self._ledger("BOUNDARY", chunk, qp.PASS_STATUS_UNRESOLVED,
+                                 0, "model blocked (recitation/safety), "
+                                    "retried once")
+                    self.notes.append(f"boundary detect unresolved: model "
+                                      f"blocked pages {chunk[0]}-{chunk[-1]}")
+                    continue
                 cand = _parse_json(raw)
                 if isinstance(cand, dict) and cand.get("question_block"):
                     cands.append(cand)
@@ -669,7 +704,15 @@ class ChapterRunner:
                                    start=chunk[0], end=chunk[-1])
             items = None
             for reask in range(2):          # one bounded re-ask on bad JSON
-                raw = self._call_pages(chunk, p, dpi=dpi)
+                try:
+                    raw = self._call_pages(chunk, p, dpi=dpi)
+                except ModelBlocked:
+                    self._ledger(pass_name, chunk, qp.PASS_STATUS_UNRESOLVED,
+                                 0, "model blocked (recitation/safety), "
+                                    "retried once")
+                    self.notes.append(f"{pass_name} phase unresolved: model "
+                                      f"blocked chunk {chunk[0]}-{chunk[-1]}")
+                    break
                 items = _unwrap_items(_parse_json(raw))
                 if isinstance(items, list):
                     break
@@ -817,7 +860,12 @@ class ChapterRunner:
                 + f"\n\nNOTE: Ab SIRF in question numbers ko dobara extract "
                   f"karo: {qns}. Baaki sab ignore karo. WAHI JSON array "
                   f"format use karo jo upar diya hai.")
-            raw = self._call_pages(chunk, re_prompt)
+            try:
+                raw = self._call_pages(chunk, re_prompt)
+            except ModelBlocked:
+                self.notes.append(f"{phase_name} targeted-fix unresolved: "
+                                  f"model blocked pages {chunk[0]}-{chunk[-1]}")
+                continue                 # keep pre-fix items; flag wins later
             items_fixed = _unwrap_items(_parse_json(raw))
             if isinstance(items_fixed, list):
                 by_no = {str(i.get("_qn")): i for i in items}
@@ -874,7 +922,14 @@ class ChapterRunner:
                         files.append({"mime_type": "image/png", "data":
                                       base64.b64encode(b).decode()})
                 files.append(CHAPTER_FINAL_PROMPT.format(chapter_name=self.chapter_id))
-                raw = self._gen(files)
+                try:
+                    raw = self._gen(files)
+                except ModelBlocked:
+                    self.notes.append(f"cross-check unresolved: model blocked "
+                                      f"(recitation/safety) on pages "
+                                      f"{half[0]}-{half[-1]}")
+                    all_locked = False
+                    continue
                 v = _parse_json(raw)
                 # STRICT: ONLY an explicit "LOCKED" counts. A parse failure,
                 # an empty dict, or any missing/other status are all NO-VOTE
@@ -1047,7 +1102,15 @@ class ChapterRunner:
                   f"{qns}. Baaki sab ignore karo. WAHI JSON array format use "
                   f"karo jo upar diya hai. Ye blocks page par PRINTED hain -- "
                   f"dhundh kar nikaalo, skip mat karo.")
-            raw = self._call_pages(chunk, re_prompt, dpi=dpi)
+            try:
+                raw = self._call_pages(chunk, re_prompt, dpi=dpi)
+            except ModelBlocked:
+                self._ledger(f"REASK_{phase_name[0]}", chunk,
+                             qp.PASS_STATUS_UNRESOLVED, 0,
+                             "model blocked (recitation/safety), retried once")
+                self.notes.append(f"{phase_name} re-ask unresolved: model "
+                                  f"blocked pages {chunk[0]}-{chunk[-1]}")
+                continue
             fixed = _unwrap_items(_parse_json(raw))
             if not isinstance(fixed, list):
                 self._ledger(f"REASK_{phase_name[0]}", chunk,
