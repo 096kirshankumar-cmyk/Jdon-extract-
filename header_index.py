@@ -31,6 +31,8 @@ _S = re.compile(r"(?i)solution\s+to\s+question\s+(\d{1,3})")
 _AK = re.compile(r"(?i)\banswer[\s-]*key\b")
 _DE = re.compile(r"(?i)\bdetailed\s+explanations\b")
 _KEYROW = re.compile(r"(?im)^\s*(\d{1,3})\s*[.\)\:\-]?\s*\(?([A-Ea-e])\)?\s*$")
+_KEYROW_LOOSE = re.compile(
+    r"(?im)(?:^|\s)(\d{1,3})\s*[.\)\:\-]?\s*\(?([A-Ea-e])\)?(?:\s|$)")
 
 
 def _ocr_lines(png, scale):
