@@ -27,8 +27,10 @@ T_DETAILED = "detailed_explanations"
 T_SOLUTION = "solution"
 
 _Q = re.compile(r"(?i)\bquestion\s+(\d{1,3})\s*[:.]")
-_S = re.compile(r"(?i)solution\s+to\s+question\s+(\d{1,3})")
-_AK = re.compile(r"(?i)\banswer[\s-]*key\b")
+# OCR drops the leading S: "olution to Question 1"
+_S = re.compile(r"(?i)s?olution\s+to\s+question\s+(\d{1,3})")
+# OCR: Answer Koy / Answor Key / Answer-Key
+_AK = re.compile(r"(?i)\bansw[e3o]r[\s\-]*k[e3o]y\b")
 _DE = re.compile(r"(?i)\bdetailed\s+explanations\b")
 _KEYROW = re.compile(r"(?im)^\s*(\d{1,3})\s*[.\)\:\-]?\s*\(?([A-Ea-e])\)?\s*$")
 _KEYROW_LOOSE = re.compile(
@@ -289,6 +291,85 @@ def key_region_pages(recs):
         return [int(start["page"])]
     end = min(stops, key=lambda r: (r["page"], -float(r["y"])))
     return list(range(int(start["page"]), int(end["page"]) + 1))
+
+
+def infer_missing_answer_key(recs):
+    """If OCR missed 'Answer Key' but Detailed/Sol1 exists after last Q.
+
+    ANA-002 / ANA-007 live: last Question then Detailed Explanations on the
+    same or next page; the printed key table sits in that Y-interval. Inject
+    a synthetic answer_key header so key_region_pages is non-empty. Never
+    Gemini. Does nothing when an Answer Key header is already present.
+    """
+    recs = list(recs or [])
+    if any(r.get("type") == T_ANSWER_KEY for r in recs):
+        return recs
+    qs = [r for r in recs if r.get("type") == T_QUESTION and r.get("n")]
+    stops = [r for r in recs
+             if r.get("type") in (T_DETAILED, T_SOLUTION)]
+    if not qs or not stops:
+        return recs
+    last_q = max(qs, key=lambda r: (r["page"], -float(r["y"])))
+    stop = min(stops, key=lambda r: (r["page"], -float(r["y"])))
+    if (stop["page"] < last_q["page"]
+            or (stop["page"] == last_q["page"]
+                and float(stop["y"]) >= float(last_q["y"]))):
+        return recs
+    if stop["page"] == last_q["page"]:
+        y = (float(last_q["y"]) + float(stop["y"])) / 2.0
+        page = last_q["page"]
+    else:
+        page = last_q["page"]
+        y = max(0.0, float(last_q["y"]) - 18.0)
+    recs.append({
+        "page": int(page), "y": float(y), "type": T_ANSWER_KEY, "n": None,
+        "bbox": [0.0, float(y), 200.0, float(y) + 12],
+        "conf": 35.0, "snippet": "inferred Answer Key (OCR miss)",
+        "method": "infer_answer_key",
+    })
+    recs.sort(key=lambda r: (r["page"], -r["y"]))
+    return recs
+
+
+def inject_missing_first_solution(recs):
+    """S2..N seen but S1 missed (ANA-001 p10, ANA-006 p95/96).
+
+    inject_gap_headers cannot invent n=1 (no prev). Place S1 just below
+    Detailed Explanations, else just above S2, else below a low Answer Key
+    on the next page. Never Gemini.
+    """
+    recs = list(recs or [])
+    s_ns = {r["n"] for r in recs if r.get("type") == T_SOLUTION and r.get("n")}
+    if 1 in s_ns or not s_ns:
+        return recs
+    detailed = [r for r in recs if r.get("type") == T_DETAILED]
+    ak = [r for r in recs if r.get("type") == T_ANSWER_KEY]
+    s2 = next((r for r in recs if r.get("type") == T_SOLUTION and r.get("n") == 2),
+              None)
+    if detailed:
+        d = min(detailed, key=lambda r: (r["page"], -float(r["y"])))
+        page, y = d["page"], max(0.0, float(d["y"]) - 20.0)
+    elif s2:
+        page, y = s2["page"], float(s2["y"]) + 24.0
+    elif ak:
+        a = min(ak, key=lambda r: (r["page"], -float(r["y"])))
+        if float(a["y"]) < 220:
+            page, y = int(a["page"]) + 1, 780.0
+        else:
+            page, y = a["page"], max(0.0, float(a["y"]) - 20.0)
+    else:
+        return recs
+    return backfill_header(recs, T_SOLUTION, 1, page, y=y,
+                           snippet="s1 inject (OCR miss)", method="s1_inject")
+
+
+def heal_visual_headers(recs):
+    """Deterministic furniture repair after scan. Order matters."""
+    recs = infer_missing_answer_key(recs)
+    recs = inject_gap_headers(recs, T_QUESTION)
+    recs = inject_gap_headers(recs, T_SOLUTION)
+    recs = inject_missing_first_solution(recs)
+    return recs
 
 
 def inject_gap_headers(recs, typ):

@@ -813,8 +813,8 @@ class ChapterRunner:
     def detect_boundaries(self, ch_first, ch_last):
         """Gemini boundary only if visual header index is empty."""
         try:
-            self._visual_headers = header_index.scan_chapter(
-                self.pdf, ch_first, ch_last)
+            self._visual_headers = header_index.heal_visual_headers(
+                header_index.scan_chapter(self.pdf, ch_first, ch_last))
         except Exception as e:
             self.notes.append(f"visual header index failed ({e})")
             self._visual_headers = []
@@ -1975,10 +1975,8 @@ class ChapterRunner:
             if not self._visual_headers:
                 self._visual_headers = header_index.scan_chapter(
                     self.pdf, ch_first, ch_last)
-            self._visual_headers = header_index.inject_gap_headers(
-                self._visual_headers, header_index.T_QUESTION)
-            self._visual_headers = header_index.inject_gap_headers(
-                self._visual_headers, header_index.T_SOLUTION)
+            self._visual_headers = header_index.heal_visual_headers(
+                self._visual_headers)
             vis = header_index.index_sets(self._visual_headers)
             if vis["q_ns"]:
                 self._printed_q_hdrs = vis["q_hdrs"] or self._printed_q_hdrs

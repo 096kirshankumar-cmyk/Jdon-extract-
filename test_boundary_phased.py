@@ -1362,6 +1362,60 @@ class KeyRegionAndGapTests(unittest.TestCase):
         ]
         self.assertEqual(header_index.key_region_pages(recs3), [52])
 
+    def test_infer_answer_key_between_last_q_and_detailed(self):
+        """ANA-002/007: OCR missed Answer Key; last Q then Detailed+Sol1."""
+        recs = [
+            {"page": 22, "y": 700, "type": header_index.T_QUESTION, "n": 13},
+            {"page": 22, "y": 200, "type": header_index.T_DETAILED, "n": None},
+            {"page": 22, "y": 160, "type": header_index.T_SOLUTION, "n": 1},
+        ]
+        out = header_index.infer_missing_answer_key(recs)
+        self.assertTrue(any(r["type"] == header_index.T_ANSWER_KEY for r in out))
+        self.assertEqual(header_index.key_region_pages(out), [22])
+        # already present -> no second inject
+        out2 = header_index.infer_missing_answer_key(out)
+        self.assertEqual(
+            sum(1 for r in out2 if r["type"] == header_index.T_ANSWER_KEY), 1)
+
+    def test_infer_answer_key_cross_page(self):
+        recs = [
+            {"page": 117, "y": 300, "type": header_index.T_QUESTION, "n": 21},
+            {"page": 118, "y": 700, "type": header_index.T_DETAILED, "n": None},
+            {"page": 118, "y": 650, "type": header_index.T_SOLUTION, "n": 1},
+        ]
+        out = header_index.infer_missing_answer_key(recs)
+        self.assertEqual(header_index.key_region_pages(out), [117, 118])
+
+    def test_inject_missing_s1_above_s2(self):
+        recs = [
+            {"page": 9, "y": 130, "type": header_index.T_ANSWER_KEY, "n": None},
+            {"page": 10, "y": 166, "type": header_index.T_SOLUTION, "n": 2},
+            {"page": 11, "y": 700, "type": header_index.T_SOLUTION, "n": 3},
+        ]
+        out = header_index.inject_missing_first_solution(recs)
+        s1 = next(r for r in out if r.get("type") == header_index.T_SOLUTION
+                  and r.get("n") == 1)
+        self.assertEqual(s1["page"], 10)
+        self.assertGreater(s1["y"], 166)
+
+    def test_heal_visual_does_ak_and_s1(self):
+        recs = [
+            {"page": 22, "y": 700, "type": header_index.T_QUESTION, "n": 12},
+            {"page": 22, "y": 500, "type": header_index.T_QUESTION, "n": 13},
+            {"page": 22, "y": 200, "type": header_index.T_DETAILED, "n": None},
+            {"page": 22, "y": 80, "type": header_index.T_SOLUTION, "n": 2},
+        ]
+        out = header_index.heal_visual_headers(recs)
+        self.assertTrue(any(r["type"] == header_index.T_ANSWER_KEY for r in out))
+        self.assertIn(1, {r["n"] for r in out if r.get("type") == header_index.T_SOLUTION})
+        self.assertEqual(header_index.key_region_pages(out), [22])
+
+    def test_classify_ocr_olution_and_answer_koy(self):
+        self.assertEqual(header_index.classify_line("olution to Question 1:"),
+                         (header_index.T_SOLUTION, 1))
+        self.assertEqual(header_index.classify_line("Answer Koy")[0],
+                         header_index.T_ANSWER_KEY)
+
     def test_gap_inject_question_7(self):
         recs = [
             {"page": 49, "y": 700, "type": header_index.T_QUESTION, "n": 6},
