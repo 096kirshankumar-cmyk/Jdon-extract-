@@ -15,11 +15,16 @@ import json as _json
 import os
 import shutil
 import socket
+import sys
 import threading
 import time
 import traceback
 import zipfile
 from pathlib import Path
+
+_REPO_ROOT = str(Path(__file__).resolve().parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import requests
 from flask import Flask, render_template_string, request, redirect, url_for, send_file, jsonify

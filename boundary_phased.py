@@ -59,6 +59,13 @@ import time
 import traceback
 from pathlib import Path
 
+# Sibling modules (header_index, crop_parse, …) live next to this file.
+# `python /abs/path/boundary_phased.py` from another cwd otherwise fails
+# with ModuleNotFoundError: header_index.
+_REPO_ROOT = str(Path(__file__).resolve().parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import google.generativeai as genai
 
 import gemini_keys

@@ -8,7 +8,7 @@ KEY = Path("/home/user/.gkey").read_text().strip()
 os.environ["GEMINI_API_KEY"] = KEY
 os.environ.setdefault("OUTPUT_DIR", "/home/user/obg_ch1_3_run")
 
-sys.path.insert(0, "/home/user/repo_git")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gemini_keys
 import qbank_pipeline as qp
 import google.generativeai as genai
