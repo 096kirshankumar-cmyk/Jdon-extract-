@@ -93,6 +93,9 @@ def classify_line(text):
     m = _Q.search(t)
     if m:
         return T_QUESTION, int(m.group(1))
+    m = re.search(r"(?i)^\s*question\s+(\d{1,3})\s*$", t)
+    if m:
+        return T_QUESTION, int(m.group(1))
     return None
 
 
@@ -256,7 +259,71 @@ def parse_key_rows_from_ocr_text(text):
     out = {}
     for m in _KEYROW.finditer(text or ""):
         out[int(m.group(1))] = m.group(2).upper()
+    if len(out) < 6:
+        for m in _KEYROW_LOOSE.finditer(text or ""):
+            n = int(m.group(1))
+            if n not in out:
+                out[n] = m.group(2).upper()
     return out
+
+
+def key_region_pages(recs):
+    """File pages from Answer Key header through Detailed Explanations / Sol 1.
+
+    Mid-page Y split is implied: we include both the key-header page AND the
+    explanations/first-solution page (Ch1 p12–13, Ch2 p37–38).
+    """
+    recs = list(recs or [])
+    keys = [r for r in recs if r.get("type") == T_ANSWER_KEY]
+    if not keys:
+        return []
+    start = min(keys, key=lambda r: (r["page"], -float(r["y"])))
+    stops = [r for r in recs
+             if r.get("type") in (T_DETAILED, T_SOLUTION)
+             and (r["page"] > start["page"]
+                  or (r["page"] == start["page"]
+                      and float(r["y"]) < float(start["y"])))]
+    if not stops:
+        return [int(start["page"])]
+    end = min(stops, key=lambda r: (r["page"], -float(r["y"])))
+    return list(range(int(start["page"]), int(end["page"]) + 1))
+
+
+def inject_gap_headers(recs, typ):
+    """If headers skip n (6 then 8), inject n between them so crop extract runs."""
+    recs = list(recs or [])
+    owned = {r["n"] for r in recs if r.get("type") == typ and r.get("n")}
+    for n in sequence_gaps(owned):
+        prev = next((r for r in recs if r.get("type") == typ and r.get("n") == n - 1), None)
+        nxt = next((r for r in recs if r.get("type") == typ and r.get("n") == n + 1), None)
+        if not prev:
+            continue
+        y = max(0.0, float(prev["y"]) - 18.0)
+        recs = backfill_header(recs, typ, n, prev["page"], y=y,
+                               snippet=f"gap inject {n}", method="gap_inject")
+    return recs
+
+
+def sequence_gaps(ns):
+    """Missing integers in 1..max(ns)."""
+    ns = {int(n) for n in (ns or []) if n}
+    if not ns:
+        return []
+    return [n for n in range(1, max(ns) + 1) if n not in ns]
+
+
+def backfill_header(recs, typ, n, page, y=0.0, snippet="", method="gap_probe"):
+    recs = list(recs or [])
+    if any(r.get("type") == typ and r.get("n") == int(n) for r in recs):
+        return recs
+    recs.append({
+        "page": int(page), "y": float(y), "type": typ, "n": int(n),
+        "bbox": [0.0, float(y), 200.0, float(y) + 12],
+        "conf": 40.0, "snippet": (snippet or "")[:160],
+        "method": method,
+    })
+    recs.sort(key=lambda r: (r["page"], -r["y"]))
+    return recs
 
 
 def ocr_key_table(pdf_path, pages, dpi=170):

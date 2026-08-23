@@ -2193,7 +2193,7 @@ def _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q,
         # up to the ceiling (genuine 5-6 figure solutions). Carry stays at
         # the flat cap (weak guess). Model claims may still lift to ceiling.
         if claim_source == "positional":
-            cap = IMAGE_CAP_CEILING_QUESTION
+            cap = MAX_QUESTION_IMAGES
         elif claim_source in MODEL_CLAIM_SOURCES:
             cap = max(cap, min(len(entry["question"]) + 1,
                                IMAGE_CAP_CEILING_QUESTION))
@@ -2224,7 +2224,7 @@ def _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q,
     if kind == "solution":
         cap = image_cap_for(subject, chapter_no, qn, "solution")
         if claim_source == "positional":
-            cap = IMAGE_CAP_CEILING_SOLUTION
+            cap = MAX_SOLUTION_IMAGES
         elif claim_source in MODEL_CLAIM_SOURCES:
             cap = max(cap, min(len(entry["solution"]) + 1,
                                IMAGE_CAP_CEILING_SOLUTION))
@@ -3528,6 +3528,19 @@ def share_reprint_obj_ids(pdf_path, page, imgs_empty, chapter_records,
             continue
         entry = image_files_by_q.setdefault(qn, {"question": [], "solution": []})
         if final in (entry.get(kind) or []):
+            continue
+        # Reprint stays with the ORIGINAL owner. Do not clone Sol1 vulva
+        # onto Q2 just because it is redrawn on the next page.
+        orig_qn = None
+        m = _FINAL_IMG_NAME_RE.match(final) if final else None
+        if m:
+            try:
+                orig_qn = int(m.group("qn"))
+            except (TypeError, ValueError):
+                orig_qn = None
+        if orig_qn is not None and orig_qn != qn:
+            print(f"  [IMG] reprint keep: obj {oid_n} on page {page} "
+                  f"already owned by q{orig_qn}; not cloning to q{qn}")
             continue
         entry.setdefault(kind, []).append(final)
         print(f"  [IMG] reprint share: obj {oid_n} on page {page} -> "

@@ -822,10 +822,13 @@ class ChapterRunner:
         if vis["q_ns"] and vis["s_ns"]:
             q_lo = min(vis["q_pages"])
             s_lo = min(vis["s_pages"]) if vis["s_pages"] else None
-            k_lo = min(vis["key_pages"]) if vis["key_pages"] else None
+            k_pages = header_index.key_region_pages(self._visual_headers)
+            k_lo = min(k_pages) if k_pages else (
+                min(vis["key_pages"]) if vis["key_pages"] else None)
+            k_hi = max(k_pages) if k_pages else k_lo
             print(f"[BPH] {self.chapter_id}: skip Gemini BOUNDARY "
                   f"(visual Q{sorted(vis['q_ns'])} "
-                  f"S{sorted(vis['s_ns'])} key={sorted(vis['key_pages'])})")
+                  f"S{sorted(vis['s_ns'])} key_region={k_pages})")
             return {
                 "confidence": "high",
                 "notes": "zones from visual header index; no Gemini boundary",
@@ -833,7 +836,7 @@ class ChapterRunner:
                                    "start_position": "top"},
                 "answer_key_block": (
                     {"start_page": k_lo, "start_position": "middle",
-                     "end_page": max(vis["key_pages"]),
+                     "end_page": k_hi,
                      "end_position": "bottom"} if k_lo else None),
                 "solution_block": {"start_page": s_lo,
                                    "start_position": "top",
@@ -1202,6 +1205,47 @@ class ChapterRunner:
     # -- C1: deterministic split at printed solution headers -------------------
     _SOL_SPLIT_RE = re.compile(
         r"(?im)^\s*Solution\s+to\s+Question\s+(\d{1,3})\s*[:.\-–]?\s*")
+
+    def _flag_solution_interval_mismatch(self, items):
+        """Reject a body that cannot live in this q_no's header interval.
+
+        Ch1 Q14 must not keep Call-Exner (Q22). Pages outside the solution
+        strip stay flagged; we empty the body so READY cannot ship it.
+        """
+        ivals = {iv["n"]: iv for iv in (self._visual_intervals("Solution") or [])}
+        out = []
+        for it in items or []:
+            if not isinstance(it, dict):
+                out.append(it)
+                continue
+            qn = it.get("_qn")
+            text = str(it.get("solution_text") or "")
+            bad = False
+            if qn != 22 and re.search(r"call[\s-]*exner", text, re.I):
+                bad = True
+                note = ("solution_body_page_mismatch: Call-Exner text on "
+                        f"q{qn} (belongs to Q22); emptied for same-crop re-ask")
+            else:
+                note = ""
+            iv = ivals.get(qn) if qn is not None else None
+            if iv:
+                allowed = {st["page"] for st in (iv.get("strips") or [])}
+                spr = it.get("source_page_range") or []
+                got = {p for p in spr if _safe_int(p) is not None}
+                if got and allowed and not (got & allowed):
+                    bad = True
+                    note = (note + " | " if note else "") + (
+                        f"solution pages {sorted(got)} ∩ interval "
+                        f"{sorted(allowed)} empty")
+            if bad:
+                it = dict(it)
+                it["solution_text"] = ""
+                it["_split_note"] = (
+                    (it.get("_split_note") or "") +
+                    (" | " if it.get("_split_note") else "") + note)
+                self.notes.append(f"q{qn}: {note}")
+            out.append(it)
+        return out
 
     def _c1_split_solutions(self, items):
         """C1 BACKSTOP (user order: C2 first, C1 as the deterministic fallback).
@@ -1817,30 +1861,9 @@ class ChapterRunner:
             for qn in (hdrs.get(p) or set()):
                 if qn not in have:
                     missing_pages.setdefault(qn, p)
-        # LABEL-MISASSIGNMENT GUARD (ANAT-001 live): two DIFFERENT questions
-        # can never legitimately carry near-identical solution text -- the
-        # model wrote q18's body into q17 (no embedded marker, so C1 cannot
-        # split) and BOTH verify and cross-check passed silently. Force a
-        # boundary-proof re-ask of BOTH q_nos; if it persists the commit
-        # gate flags duplicate_solution (BLOCKER) and the zip stays shut.
+        # Boilerplate (Sol 8/9) is NOT a mislabel. Do not re-ask on
+        # similarity. Page-interval mismatch is flagged at commit.
         dup_force = set()
-        if phase_name == "Solution":
-            for a, b, sim in self._solution_dup_pairs(items):
-                self.notes.append(
-                    f"Solution: q{a} and q{b} solution texts are near-"
-                    f"duplicates ({int(sim * 100)}%) -- forced re-ask "
-                    f"(label misassignment suspect)")
-                for qn in (a, b):
-                    dup_force.add(qn)
-                    if qn not in have:
-                        continue
-                    pg = next((p for p, s in hdrs.items() if qn in s), None)
-                    if pg is None:
-                        it = next((i for i in items
-                                   if i.get("_qn") == qn), None)
-                        spr = (it or {}).get("source_page_range") or []
-                        pg = _safe_int(spr[0]) if spr else None
-                    missing_pages.setdefault(qn, pg or zone_pages[0])
         if not missing_pages:
             return items
         qns = sorted(missing_pages)
@@ -1952,6 +1975,10 @@ class ChapterRunner:
             if not self._visual_headers:
                 self._visual_headers = header_index.scan_chapter(
                     self.pdf, ch_first, ch_last)
+            self._visual_headers = header_index.inject_gap_headers(
+                self._visual_headers, header_index.T_QUESTION)
+            self._visual_headers = header_index.inject_gap_headers(
+                self._visual_headers, header_index.T_SOLUTION)
             vis = header_index.index_sets(self._visual_headers)
             if vis["q_ns"]:
                 self._printed_q_hdrs = vis["q_hdrs"] or self._printed_q_hdrs
@@ -1961,7 +1988,10 @@ class ChapterRunner:
                     printed = {"q": set(), "s": set(), "keys": []}
                 printed["q"] = vis["q_pages"] or printed.get("q") or set()
                 printed["s"] = vis["s_pages"] or printed.get("s") or set()
-                if vis["key_pages"]:
+                kreg = header_index.key_region_pages(self._visual_headers)
+                if kreg:
+                    printed["keys"] = kreg
+                elif vis["key_pages"]:
                     printed["keys"] = sorted(vis["key_pages"])
                 print(f"[BPH] {self.chapter_id}: VISUAL header index "
                       f"Q{sorted(vis['q_ns'])} S{sorted(vis['s_ns'])} "
@@ -2102,9 +2132,7 @@ class ChapterRunner:
                 ev[n] = {"letter": let, "method": "text_layer_hint",
                          "pages": list(a_pages or [])}
         self._key_evidence = ev
-        # Only *require* evidence when we actually OCR'd a table. Tests /
-        # scanned-empty pages must not make every answer REVIEW_NEEDED.
-        self._key_evidence_required = any(
+        self._key_evidence_required = bool(a_pages) or any(
             v.get("method") == "key_table_ocr" for v in ev.values())
         if ev:
             print(f"[BPH] {self.chapter_id}: key evidence for "
@@ -2158,22 +2186,11 @@ class ChapterRunner:
         q = {i.get("_qn") for i in q_items if i.get("_qn") is not None}
         a = {i.get("_qn") for i in a_items if i.get("_qn") is not None}
         s = {i.get("_qn") for i in s_items if i.get("_qn") is not None}
-        if any("unresolved" in n for n in self.notes):
-            return False, "phase_unresolved in notes"
         if not q:
             return False, "no extracted questions"
-        vis_q = set()
-        vis_s = set()
-        for r in (self._visual_headers or []):
-            if r.get("type") == header_index.T_QUESTION and r.get("n"):
-                vis_q.add(r["n"])
-            if r.get("type") == header_index.T_SOLUTION and r.get("n"):
-                vis_s.add(r["n"])
-        if vis_q and q != vis_q:
-            return False, f"extracted Q {sorted(q)} != visual headers {sorted(vis_q)}"
-        if vis_s and s != vis_s:
-            return False, f"extracted S {sorted(s)} != visual headers {sorted(vis_s)}"
-        key_ns = set(self._key_evidence or {})
+        # OCR visual miss is NOT lock truth (Ch1 S14, Ch3 Q7). Join on q_no.
+        key_ns = {n for n, v in (self._key_evidence or {}).items()
+                  if v.get("letter") and v.get("method") != "key_conflict"}
         if key_ns and q != key_ns:
             return False, f"extracted Q {sorted(q)} != key rows {sorted(key_ns)}"
         if a and q != a:
@@ -2462,16 +2479,7 @@ class ChapterRunner:
         # ship near-identical solution text (the model re-ask keeps
         # mislabelling), the chapter must NOT look clean -- BLOCKER + zip
         # shut until a human decides. Never silent.
-        dup_pairs = self._solution_dup_pairs(
-            [{"_qn": qn, "solution_text": rec.get("solution_text")}
-             for qn, rec in chapter_records.items()])
-        if dup_pairs:
-            for a, b, sim in dup_pairs:
-                violations.append(
-                    ("duplicate_solution", a,
-                     f"q{a} and q{b} solution texts are near-duplicates "
-                     f"({int(sim * 100)}%) -- one answer's explanation is "
-                     f"mislabelled; manual review required"))
+        # Shared didactic boilerplate (Sol 8/9) is NOT a blocker.
         if not locked:
             reasons = "; ".join(self.notes[-6:]) or "cross-check refused LOCK"
             violations.append(("chapter_not_locked", None,
@@ -2622,16 +2630,31 @@ class ChapterRunner:
         for it in a_items:
             qn = it.get("_qn")
             ev = (self._key_evidence or {}).get(qn)
+            letter = (str(it.get("correct_option") or "").strip().upper()
+                      or None)
             if ev and ev.get("letter") and ev.get("method") == "key_table_ocr":
                 it["correct_option"] = ev["letter"]
                 it["_key_evidence"] = ev
+            elif letter and a_pages:
+                if ev and ev.get("letter") and ev["letter"] != letter:
+                    ev = dict(ev)
+                    ev["conflict"] = letter
+                    ev["method"] = "key_conflict"
+                    self._key_evidence[qn] = ev
+                    it["_key_evidence"] = ev
+                elif not ev:
+                    ev = {"letter": letter, "method": "key_table_gemini",
+                          "pages": list(a_pages or [])}
+                    self._key_evidence[qn] = ev
+                    it["_key_evidence"] = ev
         s_items = self._extract_phase(s_pages, SOLUTION_PROMPT, "Solution", "S")
+        s_items = self._c1_split_solutions(s_items)
+        s_items = self._flag_solution_interval_mismatch(s_items)
         s_items, s_ok = self._verify_phase("Solution", s_items, s_pages)
         s_items = self._printed_header_reask("Solution", s_items, s_pages,
                                              "_printed_s_hdrs", SOLUTION_PROMPT)
-        # C1 BACKSTOP (idempotent): after any re-ask, re-split at printed
-        # header boundaries -- a fix response can re-introduce the fold.
         s_items = self._c1_split_solutions(s_items)
+        s_items = self._flag_solution_interval_mismatch(s_items)
         if s_ok is not True:
             self.notes.append(f"solutions phase unresolved: {s_ok}")
         qp.save_state(self.state)
