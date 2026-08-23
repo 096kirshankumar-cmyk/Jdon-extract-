@@ -3903,6 +3903,61 @@ def _verdict_confidence(verdicts, rel):
     return conf if conf in ("high", "medium", "low") else None
 
 
+def try_reassign_cap_hit(rel, page, y_img, chapter_records, image_files_by_q,
+                         subject, chapter_no, visual_recs=None):
+    """Fix 4: before discard, if a neighbour declared a figure and has 0
+    images, and this leftover's Y sits in that neighbour's header interval,
+    claim it there. Unresolved only if reassign fails. Never Gemini.
+    """
+    if y_img is None or not chapter_records:
+        return None
+    try:
+        import header_index as hi
+    except Exception:
+        return None
+    q_ivals = {iv["n"]: iv for iv in hi.intervals(visual_recs or [], hi.T_QUESTION)}
+    s_ivals = {iv["n"]: iv for iv in hi.intervals(visual_recs or [], hi.T_SOLUTION)}
+    guess = hi.owner_of_point(visual_recs or [], page, y_img)
+    seeds = []
+    if guess:
+        seeds.append(int(guess[1]))
+    for qn in list(chapter_records):
+        if isinstance(qn, int):
+            seeds.append(qn)
+    seen = set()
+    for qn in seeds:
+        for nb in (qn - 1, qn + 1, qn):
+            if nb in seen or nb not in chapter_records:
+                continue
+            seen.add(nb)
+            rec = chapter_records[nb]
+            entry = image_files_by_q.setdefault(nb, {"question": [], "solution": []})
+            for kind, flag, ivals in (
+                    ("solution", "has_figure_in_solution", s_ivals),
+                    ("question", "has_figure_in_question", q_ivals)):
+                if not rec.get(flag):
+                    continue
+                if entry.get(kind):
+                    continue
+                iv = ivals.get(nb)
+                if iv and not hi.interval_contains_point(iv, page, y_img):
+                    continue
+                if iv is None and guess and int(guess[1]) != nb:
+                    continue
+                new_rel = _rename_for_slot(
+                    rel, nb, kind, subject, chapter_no, image_files_by_q,
+                    claim_source="positional",
+                    evidence=(f"Fix4 cap-hit reassign: leftover y={y_img:.0f} "
+                              f"on p{page} matches neighbour q{nb} {kind} "
+                              f"(declared figure, empty slot)"))
+                if new_rel:
+                    entry.setdefault(kind, []).append(new_rel)
+                    print(f"  [IMG] cap-hit reassign: {rel} -> q{nb} {kind} "
+                          f"(neighbour interval)")
+                    return new_rel
+    return None
+
+
 def _record_unresolved_image(subject, chapter_id, page, rel, reason,
                              model_verdict=None, method="unresolved",
                              confidence=None):

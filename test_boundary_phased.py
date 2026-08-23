@@ -1493,6 +1493,44 @@ class KeyRegionAndGapTests(unittest.TestCase):
             st = next(s for s in iv["strips"] if s["page"] == 11)
             self.assertGreaterEqual(st["y_lo"], 500.0)
 
+    def test_widen_interval_to_next_header(self):
+        recs = [
+            {"page": 10, "y": 600.0, "type": header_index.T_QUESTION, "n": 7},
+            {"page": 10, "y": 400.0, "type": header_index.T_QUESTION, "n": 8},
+            {"page": 11, "y": 500.0, "type": header_index.T_QUESTION, "n": 9},
+        ]
+        ivals = header_index.intervals(recs, header_index.T_QUESTION)
+        iv7 = next(i for i in ivals if i["n"] == 7)
+        wide = header_index.widen_interval_to_next_header(iv7, recs)
+        self.assertTrue(wide.get("widened"))
+        # current interval already stops at Q8; widen reaches the next header (Q9).
+        self.assertEqual(wide["end_page"], 11)
+        self.assertAlmostEqual(wide["end_y"], 500.0)
+
+    def test_interval_contains_point(self):
+        iv = {"n": 5, "strips": [{"page": 79, "y_hi": 700.0, "y_lo": 200.0}]}
+        self.assertTrue(header_index.interval_contains_point(iv, 79, 400.0))
+        self.assertFalse(header_index.interval_contains_point(iv, 79, 50.0))
+        self.assertFalse(header_index.interval_contains_point(iv, 80, 400.0))
+
+    def test_cap_hit_reassign_to_empty_declared_neighbour(self):
+        recs = [
+            {"page": 79, "y": 700.0, "type": header_index.T_SOLUTION, "n": 5},
+            {"page": 79, "y": 350.0, "type": header_index.T_SOLUTION, "n": 7},
+        ]
+        records = {
+            5: {"has_figure_in_solution": True},
+            7: {"has_figure_in_solution": True},
+        }
+        files = {5: {"question": [], "solution": ["OPH/dummy.webp"]},
+                 7: {"question": [], "solution": []}}
+        # No real file on disk -> rename fails; function must return None
+        # without crashing (unresolved path).
+        got = qp.try_reassign_cap_hit(
+            "OPH/OPH-p79-99.webp", 79, 300.0, records, files,
+            "OPH", 4, visual_recs=recs)
+        self.assertIsNone(got)
+
     def test_key_region_strips_y_split(self):
         recs = [
             {"page": 12, "y": 200, "type": header_index.T_ANSWER_KEY, "n": None},

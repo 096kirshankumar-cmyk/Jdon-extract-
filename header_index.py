@@ -274,6 +274,64 @@ def index_sets(recs):
     }
 
 
+def interval_contains_point(iv, page, y):
+    """True if (page, y) sits inside any strip of the interval."""
+    if not iv:
+        return False
+    page, y = int(page), float(y)
+    for st in iv.get("strips") or []:
+        if int(st["page"]) != page:
+            continue
+        lo = float(st.get("y_lo") or 0.0)
+        hi = float(st.get("y_hi") or 0.0)
+        if lo > hi:
+            lo, hi = hi, lo
+        if lo - 2.0 <= y <= hi + 2.0:
+            return True
+    return False
+
+
+def widen_interval_to_next_header(iv, recs):
+    """One-shot widen: last strip extends to the next visual header (or page bottom).
+
+    Used after verify 'exceeded attempts' — never a 7-page window.
+    """
+    if not iv:
+        return iv
+    iv = dict(iv)
+    strips = [dict(s) for s in (iv.get("strips") or [])]
+    if not strips:
+        return iv
+    last = strips[-1]
+    p0 = int(last["page"])
+    y0 = float(last.get("y_lo") or 0.0)
+    ordered = sorted(recs or [], key=lambda r: (r["page"], -float(r["y"])))
+    nxt = None
+    for r in ordered:
+        if r["page"] > p0 or (r["page"] == p0 and float(r["y"]) < y0 - 1.0):
+            nxt = r
+            break
+    if nxt is None:
+        last["y_lo"] = 0.0
+        iv["end_page"] = p0
+        iv["end_y"] = 0.0
+    elif int(nxt["page"]) == p0:
+        last["y_lo"] = min(y0, float(nxt["y"]))
+        iv["end_page"] = p0
+        iv["end_y"] = last["y_lo"]
+    else:
+        last["y_lo"] = 0.0
+        for p in range(p0 + 1, int(nxt["page"])):
+            strips.append({"page": p, "y_hi": 9999.0, "y_lo": 0.0})
+        strips.append({"page": int(nxt["page"]), "y_hi": 9999.0,
+                       "y_lo": float(nxt["y"])})
+        iv["end_page"] = int(nxt["page"])
+        iv["end_y"] = float(nxt["y"])
+    iv["strips"] = strips
+    iv["widened"] = True
+    return iv
+
+
 def owner_of_point(recs, page, y):
     """Closest heading ABOVE (y) on this page, else open interval from prev page.
 

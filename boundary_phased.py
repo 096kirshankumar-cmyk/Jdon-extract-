@@ -1494,7 +1494,65 @@ class ChapterRunner:
                              "no genuine mismatches (minor/phantom dropped)")
                 return items, True
             items = self._targeted_fix(phase_name, items, genuine)
+        # Fix 5: one widened-crop retry to the next visible header, then stop.
+        items = self._widened_crop_retry(phase_name, items, genuine)
         return items, ("exceeded attempts", last)
+
+    def _widened_crop_retry(self, phase_name, items, mismatches):
+        """After MAX_FIX_ATTEMPTS: one crop from this header to the next
+        visible header. No 7-page window. Failure stays INCOMPLETE.
+        """
+        if phase_name not in ("Question", "Solution"):
+            return items
+        qns = []
+        for m in mismatches or []:
+            qn = _norm_q_no((m or {}).get("q_no"))
+            if qn is not None:
+                qns.append(qn)
+        if not qns:
+            return items
+        label = phase_name
+        ivals = {iv["n"]: iv for iv in (self._visual_intervals(label) or [])}
+        prompt_tmpl = (QUESTION_PROMPT if label == "Question"
+                       else SOLUTION_PROMPT)
+        by = {it.get("_qn"): it for it in items if it.get("_qn") is not None}
+        for qn in qns:
+            iv = ivals.get(qn)
+            if not iv:
+                continue
+            wide = header_index.widen_interval_to_next_header(
+                iv, self._visual_headers)
+            self.notes.append(
+                f"{phase_name}: exceeded attempts q{qn} -> one widened crop "
+                f"p{wide.get('start_page')}-{wide.get('end_page')}")
+            kept = self._gemini_crop_batch(
+                [wide], prompt_tmpl, label, f"WIDE_{label[0]}", dpi=130)
+            hit = next((it for it in kept if it.get("_qn") == qn), None)
+            if hit and self._crop_item_ok(hit, label):
+                hit["_widened_retry"] = True
+                by[qn] = hit
+            else:
+                cur = dict(by.get(qn) or {"_qn": qn, "q_no": str(qn)})
+                cur["_exceeded_attempts"] = True
+                if label == "Question" and not str(cur.get("stem") or "").strip():
+                    pass
+                if label == "Solution" and not self._crop_item_ok(cur, label):
+                    cur["solution_text"] = cur.get("solution_text") or ""
+                by[qn] = cur
+        order = []
+        seen = set()
+        out = []
+        for it in items:
+            qn = it.get("_qn")
+            if qn in by and qn not in seen:
+                out.append(by[qn])
+                seen.add(qn)
+            elif qn not in by:
+                out.append(it)
+        for qn, it in by.items():
+            if qn not in seen:
+                out.append(it)
+        return self._merge_phase_items(out)
 
     def _filter_verify_mismatches(self, phase_name, items, mism):
         """BUG 6 (OBG-001 live): verify hallucinated Q1 'Lobia' (not in JSON)
@@ -2445,6 +2503,9 @@ class ChapterRunner:
                 reasons.append("question phase marked text_confidence=low")
             if str(srow.get("text_confidence", "")).lower() == "low":
                 reasons.append("solution phase marked text_confidence=low")
+            if q.get("_exceeded_attempts") or srow.get("_exceeded_attempts"):
+                reasons.append(
+                    "verify exceeded attempts after one widened-crop retry")
             if srow.get("_split_note"):
                 reasons.append("solution text split at printed 'Solution "
                                "to Question N:' header boundary (deterministic "
@@ -2575,6 +2636,26 @@ class ChapterRunner:
                     leftover, self.pdf, page, self.subject, self.chapter_no,
                     chapter_records, image_files_by_q, chapter_id=self.chapter_id,
                     active_block=active_block, section=page_section.get(page))
+                still = []
+                for rel in leftover:
+                    y_img = None
+                    try:
+                        oid = int(Path(rel).stem.rsplit("-", 1)[-1])
+                        info = (pos or {}).get(oid)
+                        if info:
+                            y_img = info[0]
+                            h = info[4] if len(info) > 4 else 0
+                            if h and y_img + h < y_img:
+                                y_img = y_img + h
+                    except Exception:
+                        y_img = None
+                    moved = qp.try_reassign_cap_hit(
+                        rel, page, y_img, chapter_records, image_files_by_q,
+                        self.subject, self.chapter_no,
+                        visual_recs=self._visual_headers)
+                    if not moved:
+                        still.append(rel)
+                leftover = still
                 for rel in leftover:
                     entry = {"chapter_id": self.chapter_id, "q_no": None,
                              "page": page, "file": rel,
