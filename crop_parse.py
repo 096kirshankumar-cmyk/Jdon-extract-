@@ -88,6 +88,30 @@ def parse_question_text(text, q_no):
     return it
 
 
+_TABLE_HEAD = re.compile(
+    r"(?im)^\s*(?:table\s+\d+|sl\.?\s*no|s\.?\s*no|question\s+no\.?|"
+    r"correct\s+option|findings?|features?)\s*[:|]?"
+)
+
+
+def drop_reprinted_table_header(text):
+    """Extra (b): a continued table reprints column names on the next page.
+
+    Drop a second identical header-ish line; never invents rows.
+    """
+    lines = (text or "").splitlines()
+    seen = set()
+    out = []
+    for ln in lines:
+        key = re.sub(r"\s+", " ", ln.strip().lower())
+        if _TABLE_HEAD.search(ln) and key in seen:
+            continue
+        if _TABLE_HEAD.search(ln) and key:
+            seen.add(key)
+        out.append(ln)
+    return "\n".join(out)
+
+
 def parse_solution_text(text, q_no):
     """Body after Solution to Question N: until next such header."""
     t = text or ""
@@ -101,6 +125,7 @@ def parse_solution_text(text, q_no):
         nxt = re.search(r"(?i)solution\s+to\s+question\s+\d+", body)
         if nxt:
             body = body[:nxt.start()]
+    body = drop_reprinted_table_header(body)
     body = body.strip()
     if not body:
         return None

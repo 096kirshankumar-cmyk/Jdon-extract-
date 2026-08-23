@@ -149,6 +149,47 @@ def _crop_strip_png(pdf_path, page, y_hi, y_lo, dpi=130):
     return buf.getvalue()
 
 
+def _stitch_interval_png(pdf_path, iv, dpi=130):
+    """One composite image: header → next header, all strips stacked.
+
+    Multi-page intervals are ONE Gemini part (labeled continues), not
+    separate page crops that truncate mid-item.
+    """
+    from PIL import Image, ImageDraw
+    import io
+    parts = []
+    for i, st in enumerate(iv.get("strips") or []):
+        raw = _crop_strip_png(pdf_path, st["page"], st["y_hi"], st["y_lo"],
+                              dpi=dpi)
+        if not raw:
+            continue
+        im = Image.open(io.BytesIO(raw)).convert("RGB")
+        label = (f"INTERVAL part {i + 1}/{len(iv.get('strips') or [])}  "
+                 f"file page {st['page']}  "
+                 f"{'CONTINUES' if i else 'START'}  q{iv.get('n')}")
+        bar_h = 22
+        canvas = Image.new("RGB", (im.width, im.height + bar_h), (20, 20, 20))
+        canvas.paste(im, (0, bar_h))
+        ImageDraw.Draw(canvas).text((6, 4), label, fill=(255, 255, 0))
+        parts.append(canvas)
+    if not parts:
+        return None
+    w = max(p.width for p in parts)
+    h = sum(p.height for p in parts) + 4 * (len(parts) - 1)
+    out = Image.new("RGB", (w, h), (255, 255, 255))
+    y = 0
+    for p in parts:
+        if p.width != w:
+            pad = Image.new("RGB", (w, p.height), (255, 255, 255))
+            pad.paste(p, (0, 0))
+            p = pad
+        out.paste(p, (0, y))
+        y += p.height + 4
+    buf = io.BytesIO()
+    out.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def _chunk_pages(pages, n):
     return [pages[i:i + n] for i in range(0, len(pages), n)]
 
@@ -779,18 +820,27 @@ class ChapterRunner:
         return self._gen(files)
 
     def _call_crops(self, ivals, prompt, dpi=130):
-        """Gemini on isolated header-interval crops only (not 7-page windows)."""
+        """Gemini on isolated header-interval crops only (not 7-page windows).
+
+        Multi-page interval = one stitched composite (part 1 continues…).
+        """
         pages = [iv["start_page"] for iv in ivals]
-        files = [f"ISOLATED CROPS (one strip per printed header; file pages "
-                 f"{pages}). Transcribe ONLY what is in each crop. Do not "
+        files = [f"ISOLATED INTERVAL CROPS (header → next header; file pages "
+                 f"{pages}). One image per printed item, possibly stitched "
+                 f"across pages. Transcribe ONLY that interval. Do not "
                  f"invent from chapter context."]
         for iv in ivals:
-            for st in iv.get("strips") or []:
-                b = _crop_strip_png(self.pdf, st["page"], st["y_hi"],
-                                    st["y_lo"], dpi=dpi)
-                if b:
-                    files.append({"mime_type": "image/png", "data":
-                                  base64.b64encode(b).decode()})
+            b = _stitch_interval_png(self.pdf, iv, dpi=dpi)
+            if not b:
+                for st in iv.get("strips") or []:
+                    b = _crop_strip_png(self.pdf, st["page"], st["y_hi"],
+                                        st["y_lo"], dpi=dpi)
+                    if b:
+                        files.append({"mime_type": "image/png", "data":
+                                      base64.b64encode(b).decode()})
+                continue
+            files.append({"mime_type": "image/png", "data":
+                          base64.b64encode(b).decode()})
         files.append(prompt)
         return self._gen(files)
 
@@ -798,10 +848,14 @@ class ChapterRunner:
         recs = self._visual_headers or []
         if not recs:
             return []
+        file_end = getattr(self, "_scan_last", None) or getattr(
+            self, "_ch_last", None)
         if label == "Question":
-            return header_index.intervals(recs, header_index.T_QUESTION)
+            return header_index.intervals(recs, header_index.T_QUESTION,
+                                          file_end=file_end)
         if label == "Solution":
-            return header_index.intervals(recs, header_index.T_SOLUTION)
+            return header_index.intervals(recs, header_index.T_SOLUTION,
+                                          file_end=file_end)
         return []
 
     def _ledger(self, pass_name, pages, status, n_items, note=""):
@@ -814,8 +868,17 @@ class ChapterRunner:
     def detect_boundaries(self, ch_first, ch_last):
         """Gemini boundary only if visual header index is empty."""
         try:
+            self._ch_last = int(ch_last)
+            self._ch_first = int(ch_first)
+            scan_last = int(ch_last)
+            try:
+                total = len(qp.PdfReader(self.pdf).pages)
+                scan_last = min(int(ch_last) + 2, int(total))
+            except Exception:
+                pass
+            self._scan_last = scan_last
             self._visual_headers = header_index.heal_visual_headers(
-                header_index.scan_chapter(self.pdf, ch_first, ch_last))
+                header_index.scan_chapter(self.pdf, ch_first, scan_last))
         except Exception as e:
             self.notes.append(f"visual header index failed ({e})")
             self._visual_headers = []

@@ -209,20 +209,64 @@ def clip_question_intervals_at_key(ivals, recs):
     return out
 
 
-def intervals(recs, typ):
-    """Reading-order intervals for one header type.
+FURNITURE = (T_QUESTION, T_SOLUTION, T_ANSWER_KEY, T_DETAILED)
+
+
+def reading_order(recs):
+    """Global sort: page, then top-first (larger y first). The unit is this."""
+    return sorted(recs or [], key=lambda r: (int(r["page"]), -float(r["y"])))
+
+
+def next_furniture(ordered, i):
+    """Next printed furniture header after index i (not body text)."""
+    for j in range(i + 1, len(ordered)):
+        if ordered[j].get("type") in FURNITURE:
+            return ordered[j]
+    return None
+
+
+def close_interval_to_page(iv, file_end):
+    """Last open interval continues through file_end (chapter last Q/S).
+
+    Extra (e): last question body may bleed 1–2 pages past the last header
+    page; those pages stay in THIS interval until the next furniture header
+    or file_end. Never a 7-page Gemini window.
+    """
+    if not iv or not file_end:
+        return iv
+    iv = dict(iv)
+    strips = [dict(s) for s in (iv.get("strips") or [])]
+    if not strips:
+        return iv
+    end_p = int(iv.get("end_page") or strips[-1]["page"])
+    hi = int(file_end)
+    if end_p >= hi:
+        return iv
+    last = strips[-1]
+    last["y_lo"] = 0.0
+    for p in range(end_p + 1, hi + 1):
+        strips.append({"page": int(p), "y_hi": 9999.0, "y_lo": 0.0})
+    iv["strips"] = strips
+    iv["end_page"] = hi
+    iv["end_y"] = 0.0
+    iv["closed_to_file_end"] = True
+    return iv
+
+
+def intervals(recs, typ, file_end=None):
+    """THE crop unit: this header → next furniture header (any # of pages).
 
     Each interval is {n, start_page, start_y, end_page, end_y, strips}.
     strips = [{page, y_hi, y_lo}] from this header down to the next header
-    (or page bottom). y is PDF-ish (larger = higher). Mid-page split is y.
-    Cross-page bodies become two strips (join later).
+    (or page bottom / file_end). y is PDF-ish (larger = higher).
+    Cross-page bodies become N strips (stitched later for Gemini).
     """
-    ordered = sorted(recs or [], key=lambda r: (r["page"], -r["y"]))
+    ordered = reading_order(recs)
     out = []
     for i, r in enumerate(ordered):
         if r.get("type") != typ or not r.get("n"):
             continue
-        nxt = ordered[i + 1] if i + 1 < len(ordered) else None
+        nxt = next_furniture(ordered, i)
         strips = []
         p0, y0 = r["page"], float(r["y"])
         if nxt is None:
@@ -238,11 +282,14 @@ def intervals(recs, typ):
             strips.append({"page": nxt["page"], "y_hi": 9999.0,
                            "y_lo": float(nxt["y"])})
             end_p, end_y = nxt["page"], float(nxt["y"])
-        out.append({
+        rec = {
             "n": int(r["n"]), "start_page": p0, "start_y": y0,
             "end_page": end_p, "end_y": end_y, "strips": strips,
             "header": r,
-        })
+        }
+        if nxt is None and file_end:
+            rec = close_interval_to_page(rec, file_end)
+        out.append(rec)
     if typ == T_QUESTION:
         out = clip_question_intervals_at_key(out, recs)
     return out
@@ -353,7 +400,9 @@ def owner_of_point(recs, page, y):
     if not earlier:
         return None
     hit = max(earlier, key=lambda r: (r["page"], -float(r["y"])))
-    if page - hit["page"] > 1:
+    # Floated figure (extra a): top of next page, no new header → previous
+    # interval. Allow one extra page of carry; farther is review, not guess.
+    if page - hit["page"] > 2:
         return None
     kind = "question" if hit["type"] == T_QUESTION else "solution"
     return kind, int(hit["n"])

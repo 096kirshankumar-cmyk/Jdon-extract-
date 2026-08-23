@@ -1493,6 +1493,32 @@ class KeyRegionAndGapTests(unittest.TestCase):
             st = next(s for s in iv["strips"] if s["page"] == 11)
             self.assertGreaterEqual(st["y_lo"], 500.0)
 
+    def test_interval_is_header_to_next_header_across_pages(self):
+        recs = [
+            {"page": 10, "y": 200.0, "type": header_index.T_QUESTION, "n": 20},
+            {"page": 12, "y": 600.0, "type": header_index.T_ANSWER_KEY, "n": None},
+        ]
+        iv = header_index.intervals(recs, header_index.T_QUESTION)[0]
+        pages = [st["page"] for st in iv["strips"]]
+        self.assertEqual(pages, [10, 11, 12])
+        self.assertAlmostEqual(iv["strips"][-1]["y_lo"], 600.0)
+
+    def test_last_interval_closes_to_file_end(self):
+        recs = [{"page": 80, "y": 500.0, "type": header_index.T_SOLUTION, "n": 20}]
+        iv = header_index.intervals(recs, header_index.T_SOLUTION, file_end=82)[0]
+        self.assertTrue(iv.get("closed_to_file_end"))
+        self.assertEqual([st["page"] for st in iv["strips"]], [80, 81, 82])
+
+    def test_drop_reprinted_table_header(self):
+        import crop_parse
+        txt = ("Solution to Question 3: row one\n"
+               "Question No. Correct Option\n"
+               "1 A\n"
+               "Question No. Correct Option\n"
+               "2 B")
+        it = crop_parse.parse_solution_text(txt, 3)
+        self.assertEqual(it["solution_text"].count("Question No."), 1)
+
     def test_widen_interval_to_next_header(self):
         recs = [
             {"page": 10, "y": 600.0, "type": header_index.T_QUESTION, "n": 7},
