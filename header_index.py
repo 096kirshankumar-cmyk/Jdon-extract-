@@ -409,9 +409,98 @@ def backfill_header(recs, typ, n, page, y=0.0, snippet="", method="gap_probe"):
     return recs
 
 
-def ocr_key_table(pdf_path, pages, dpi=170):
-    """OCR whole key pages (narrow: only those pages). Pixels, not pdftotext."""
+KEY_TABLE_DPI = 300
+
+
+def key_region_strips(recs, pages):
+    """Y-strips for the printed key table only (header → Detailed/Sol1)."""
+    recs = list(recs or [])
+    pages = [int(p) for p in (pages or [])]
+    if not pages:
+        return []
+    keys = [r for r in recs if r.get("type") == T_ANSWER_KEY]
+    start = (min(keys, key=lambda r: (r["page"], -float(r["y"])))
+             if keys else None)
+    stops = []
+    if start:
+        stops = [r for r in recs
+                 if r.get("type") in (T_DETAILED, T_SOLUTION)
+                 and (r["page"] > start["page"]
+                      or (r["page"] == start["page"]
+                          and float(r["y"]) < float(start["y"])))]
+    stop = (min(stops, key=lambda r: (r["page"], -float(r["y"])))
+            if stops else None)
+    out = []
+    for p in pages:
+        y_hi = 9999.0
+        y_lo = 0.0
+        if start and p == int(start["page"]):
+            y_hi = float(start["y"]) + 20.0
+        if stop and p == int(stop["page"]):
+            y_lo = float(stop["y"])
+        out.append({"page": p, "y_hi": y_hi, "y_lo": y_lo})
+    return out
+
+
+def wash_key_crop(im):
+    """Drop header/footer/side gutters + wash pale watermark ink. No Gemini."""
+    if im is None:
+        return None
+    w, h = im.size
+    if w < 40 or h < 40:
+        return im
+    l = int(w * 0.05)
+    r = int(w * 0.95)
+    t = int(h * 0.03)
+    b = int(h * 0.92)
+    crop = im.crop((l, t, max(l + 8, r), max(t + 8, b))).convert("RGB")
+    px = crop.load()
+    cw, ch = crop.size
+    for y in range(ch):
+        for x in range(cw):
+            r0, g0, b0 = px[x, y]
+            if min(r0, g0, b0) >= 200:
+                px[x, y] = (255, 255, 255)
+    return crop
+
+
+def merge_dual_key_reads(map_a, map_b, third=None):
+    """Two independent full-table maps. Letter only if both agree.
+
+    `third` is recorded for audit; it NEVER picks a winner (no guess).
+    Disagree / missing pair → method key_conflict, letter None.
+    """
+    third = third or {}
+    out = {}
+    ns = set(map_a or {}) | set(map_b or {}) | set(third)
+    for n in ns:
+        la = (map_a or {}).get(n)
+        lb = (map_b or {}).get(n)
+        lt = third.get(n)
+        if la and lb and la == lb:
+            rec = {"letter": la, "method": "key_dual_gemini", "agree": True,
+                   "reads": [la, lb]}
+            if lt and lt != la:
+                rec["third"] = lt
+            out[n] = rec
+        else:
+            reads = [x for x in (la, lb, lt) if x]
+            out[n] = {
+                "letter": None,
+                "method": "key_conflict",
+                "agree": False,
+                "reads": reads,
+                "conflict": "/".join(reads) if reads else "empty",
+            }
+    return out
+
+
+def ocr_key_table(pdf_path, pages, dpi=None, recs=None):
+    """OCR key-TABLE crop only at KEY_TABLE_DPI. Trim + wash first."""
+    dpi = int(dpi or KEY_TABLE_DPI)
     blob = []
+    strips = key_region_strips(recs or [], pages) if recs else []
+    by_p = {s["page"]: s for s in strips}
     for p in pages:
         try:
             import qbank_pipeline as qp
@@ -420,6 +509,17 @@ def ocr_key_table(pdf_path, pages, dpi=170):
             png = None
         if not png:
             continue
+        st = by_p.get(int(p))
+        if st and scale:
+            h = png.height
+            top = int(max(0, h - (float(st["y_hi"]) * scale)))
+            bot = int(min(h, h - (float(st["y_lo"]) * scale)))
+            if bot > top + 8:
+                png = png.crop((0, top, png.width, bot))
+        try:
+            png = wash_key_crop(png)
+        except Exception:
+            pass
         lines = _ocr_lines(png, scale or 1.0)
         blob.append("\n".join(t for _y, _x, t, _c in lines))
     return parse_key_rows_from_ocr_text("\n".join(blob))

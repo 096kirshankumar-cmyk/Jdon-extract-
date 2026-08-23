@@ -119,6 +119,33 @@ class T(unittest.TestCase):
         self.assertIn(hi.text_layer_health("■□�" * 40 + "xxxx????"),
                       ("GARBLED", "DEGRADED"))
 
+    def test_crop_batchable_text_only_not_last_or_crosspage(self):
+        mid = {"n": 3, "strips": [{"page": 6, "y_hi": 400, "y_lo": 200}]}
+        last = {"n": 5, "strips": [{"page": 7, "y_hi": 300, "y_lo": 0}]}
+        cross = {"n": 4, "strips": [{"page": 6, "y_hi": 100, "y_lo": 0},
+                                    {"page": 7, "y_hi": 800, "y_lo": 500}]}
+        leftover = [mid, cross, last]
+        self.assertTrue(bph.ChapterRunner._crop_is_batchable(
+            mid, "Question", leftover))
+        self.assertFalse(bph.ChapterRunner._crop_is_batchable(
+            last, "Question", leftover))
+        self.assertFalse(bph.ChapterRunner._crop_is_batchable(
+            cross, "Question", leftover))
+        self.assertFalse(bph.ChapterRunner._crop_is_batchable(
+            mid, "Solution", leftover))
+
+    def test_crop_item_ok_rejects_low_conf_and_thin(self):
+        ok = {"stem": "Which bone?", "options": {"A": "a", "B": "b", "C": "c",
+                                                 "D": "d"},
+              "text_confidence": "high"}
+        self.assertTrue(bph.ChapterRunner._crop_item_ok(ok, "Question"))
+        low = dict(ok, text_confidence="low")
+        self.assertFalse(bph.ChapterRunner._crop_item_ok(low, "Question"))
+        fig = dict(ok, has_figure=True)
+        self.assertFalse(bph.ChapterRunner._crop_item_ok(fig, "Question"))
+        thin = dict(ok, options={"A": "a", "B": "b", "C": "c"})
+        self.assertFalse(bph.ChapterRunner._crop_item_ok(thin, "Question"))
+
     def test_no_seven_page_extract_when_visual_headers(self):
         """Q/S must use crops, never fall back to 7-page windows."""
         r = bph.ChapterRunner("x.pdf", "OBG", 1, "/tmp", model=object(),
@@ -1409,6 +1436,35 @@ class KeyRegionAndGapTests(unittest.TestCase):
         self.assertTrue(any(r["type"] == header_index.T_ANSWER_KEY for r in out))
         self.assertIn(1, {r["n"] for r in out if r.get("type") == header_index.T_SOLUTION})
         self.assertEqual(header_index.key_region_pages(out), [22])
+
+    def test_merge_dual_key_reads_agree_only(self):
+        a = {1: "A", 2: "B", 3: "C"}
+        b = {1: "A", 2: "D", 3: "C"}
+        third = {2: "B"}
+        m = header_index.merge_dual_key_reads(a, b, third)
+        self.assertEqual(m[1]["letter"], "A")
+        self.assertEqual(m[1]["method"], "key_dual_gemini")
+        self.assertTrue(m[1]["agree"])
+        self.assertIsNone(m[2]["letter"])
+        self.assertEqual(m[2]["method"], "key_conflict")
+        self.assertEqual(m[3]["letter"], "C")
+
+    def test_key_region_strips_y_split(self):
+        recs = [
+            {"page": 12, "y": 200, "type": header_index.T_ANSWER_KEY, "n": None},
+            {"page": 13, "y": 500, "type": header_index.T_DETAILED, "n": None},
+        ]
+        st = header_index.key_region_strips(recs, [12, 13])
+        self.assertEqual([s["page"] for s in st], [12, 13])
+        self.assertGreater(st[0]["y_hi"], 200)
+        self.assertEqual(st[1]["y_lo"], 500)
+
+    def test_wash_key_crop_whitens_pale(self):
+        from PIL import Image
+        im = Image.new("RGB", (100, 100), (210, 210, 210))
+        out = header_index.wash_key_crop(im)
+        self.assertEqual(out.getpixel((out.size[0] // 2, out.size[1] // 2)),
+                         (255, 255, 255))
 
     def test_classify_ocr_olution_and_answer_koy(self):
         self.assertEqual(header_index.classify_line("olution to Question 1:"),

@@ -70,6 +70,7 @@ import crop_parse
 
 MAX_FIX_ATTEMPTS = 3
 PAGE_CHUNK = 7            # boundary detect only; Q/S extract uses crops
+KEY_TABLE_DPI = 300       # answer-key table crop only (dense grid)
 
 # Tests flip this off; production paces every Gemini request through
 # qp._pace_gemini_call (free tier ~15 RPM).
@@ -914,60 +915,117 @@ class ChapterRunner:
         if leftover:
             print(f"[BPH] {self.chapter_id}: {pass_name} geom ok={len(out)} "
                   f"gemini_crops={len(leftover)}")
-        for batch in _chunk_pages(leftover, 4):
-            lo = batch[0]["start_page"]
-            hi = batch[-1]["end_page"]
-            p = prompt_tmpl.format(chapter_name=self.chapter_id,
-                                   start=lo, end=hi)
-            p = (p + "\n\nNOTE: Images are CROPS of a single printed item "
-                 "(header → next header). Extract THAT item only. "
-                 f"Expected q_nos in this batch: "
-                 f"{[iv['n'] for iv in batch]}.")
-            items = None
-            for reask in range(2):
-                try:
-                    raw = self._call_crops(batch, p, dpi=dpi)
-                except ModelBlocked:
-                    self._ledger(pass_name, [iv["start_page"] for iv in batch],
-                                 qp.PASS_STATUS_UNRESOLVED, 0,
-                                 "model blocked on crop")
-                    self.notes.append(f"{pass_name} crop unresolved (blocked)")
-                    break
-                items = _unwrap_items(_parse_json(raw))
-                if isinstance(items, list):
-                    break
-            if not isinstance(items, list):
+        batchable, singles = [], []
+        for iv in leftover:
+            if self._crop_is_batchable(iv, label, leftover):
+                batchable.append(iv)
+            else:
+                singles.append(iv)
+        work = list(_chunk_pages(batchable, 4)) + [[iv] for iv in singles]
+        retry_singles = []
+        for batch in work:
+            kept = self._gemini_crop_batch(batch, prompt_tmpl, label,
+                                           pass_name, dpi)
+            by_n = {it.get("_qn"): it for it in kept if it.get("_qn") is not None}
+            if len(batch) > 1:
+                for iv in batch:
+                    it = by_n.get(iv["n"])
+                    if not self._crop_item_ok(it, label):
+                        retry_singles.append(iv)
+                    else:
+                        out.append(it)
+            else:
+                out.extend(kept)
+        for iv in retry_singles:
+            self.notes.append(
+                f"{pass_name}: batch miss/low-conf q{iv['n']} -> single crop")
+            kept = self._gemini_crop_batch([iv], prompt_tmpl, label,
+                                           pass_name, dpi)
+            out.extend(kept)
+        return self._merge_phase_items(out)
+
+    @staticmethod
+    def _crop_is_batchable(iv, label, leftover):
+        """Text-only mid-chapter same-page Q only. Figures/boundary = single."""
+        if label != "Question":
+            return False
+        ns = [x.get("n") for x in (leftover or []) if x.get("n")]
+        if ns and iv.get("n") == max(ns):
+            return False
+        pages = {st["page"] for st in (iv.get("strips") or [])}
+        if len(pages) > 1:
+            return False
+        return True
+
+    @staticmethod
+    def _crop_item_ok(it, label):
+        if not isinstance(it, dict):
+            return False
+        if str(it.get("text_confidence") or "").lower() == "low":
+            return False
+        if it.get("has_figure"):
+            return False
+        if label == "Question":
+            opts, _ = _norm_options(it.get("options"))
+            return bool(str(it.get("stem") or "").strip()) and len(opts) >= 4
+        if label == "Solution":
+            return bool(str(it.get("solution_text") or "").strip())
+        return True
+
+    def _gemini_crop_batch(self, batch, prompt_tmpl, label, pass_name, dpi):
+        if not batch:
+            return []
+        lo = batch[0]["start_page"]
+        hi = batch[-1]["end_page"]
+        p = prompt_tmpl.format(chapter_name=self.chapter_id,
+                               start=lo, end=hi)
+        p = (p + "\n\nNOTE: Images are CROPS of a single printed item "
+             "(header → next header). Extract THAT item only. "
+             f"Expected q_nos in this batch: "
+             f"{[iv['n'] for iv in batch]}.")
+        items = None
+        for reask in range(2):
+            try:
+                raw = self._call_crops(batch, p, dpi=dpi)
+            except ModelBlocked:
                 self._ledger(pass_name, [iv["start_page"] for iv in batch],
                              qp.PASS_STATUS_UNRESOLVED, 0,
-                             "crop batch unparsable")
-                continue
-            expect = {iv["n"] for iv in batch}
-            kept = []
-            for it in items:
-                qn0 = _item_qn(it)
-                if not isinstance(it, dict) or qn0 is None:
-                    continue
-                _normalize_phase_item(label, it)
-                it["_qn"] = qn0
-                it["_header_n"] = qn0 if qn0 in expect else None
-                it["_continuation"] = _is_continuation_marker(_item_qno_raw(it))
-                if pass_name == "Q" and self._printed_q_max is not None \
-                        and qn0 > self._printed_q_max:
-                    continue
-                # stamp source from the matching interval
-                for iv in batch:
-                    if iv["n"] == qn0:
-                        it["source_page"] = iv["start_page"]
-                        it["source_page_range"] = [iv["start_page"],
-                                                   iv["end_page"]]
-                        break
-                kept.append(it)
-            out.extend(kept)
+                             "model blocked on crop")
+                self.notes.append(f"{pass_name} crop unresolved (blocked)")
+                break
+            items = _unwrap_items(_parse_json(raw))
+            if isinstance(items, list):
+                break
+        if not isinstance(items, list):
             self._ledger(pass_name, [iv["start_page"] for iv in batch],
-                         qp.PASS_STATUS_SUCCESS if kept
-                         else qp.PASS_STATUS_PARTIAL, len(kept),
-                         "crop extract")
-        return self._merge_phase_items(out)
+                         qp.PASS_STATUS_UNRESOLVED, 0,
+                         "crop batch unparsable")
+            return []
+        expect = {iv["n"] for iv in batch}
+        kept = []
+        for it in items:
+            qn0 = _item_qn(it)
+            if not isinstance(it, dict) or qn0 is None:
+                continue
+            _normalize_phase_item(label, it)
+            it["_qn"] = qn0
+            it["_header_n"] = qn0 if qn0 in expect else None
+            it["_continuation"] = _is_continuation_marker(_item_qno_raw(it))
+            if pass_name == "Q" and self._printed_q_max is not None \
+                    and qn0 > self._printed_q_max:
+                continue
+            for iv in batch:
+                if iv["n"] == qn0:
+                    it["source_page"] = iv["start_page"]
+                    it["source_page_range"] = [iv["start_page"],
+                                               iv["end_page"]]
+                    break
+            kept.append(it)
+        self._ledger(pass_name, [iv["start_page"] for iv in batch],
+                     qp.PASS_STATUS_SUCCESS if kept
+                     else qp.PASS_STATUS_PARTIAL, len(kept),
+                     "crop extract")
+        return kept
 
     def _extract_phase(self, pages, prompt_tmpl, label, pass_name, dpi=110):
         ivals = self._visual_intervals(label)
@@ -2095,19 +2153,156 @@ class ChapterRunner:
             return "-"
         return f"{pages[0]}-{pages[-1]}"
 
+
+    def _key_table_png_parts(self, a_pages, dpi=None):
+        """300dpi washed table strips -> Gemini image parts. Not cached."""
+        dpi = int(dpi or KEY_TABLE_DPI)
+        strips = header_index.key_region_strips(self._visual_headers, a_pages)
+        if not strips:
+            strips = [{"page": p, "y_hi": 9999.0, "y_lo": 0.0} for p in a_pages]
+        parts = []
+        for st in strips:
+            raw = _crop_strip_png(self.pdf, st["page"], st["y_hi"], st["y_lo"],
+                                  dpi=dpi)
+            if not raw:
+                continue
+            try:
+                from PIL import Image
+                import io
+                im = Image.open(io.BytesIO(raw)).convert("RGB")
+                im = header_index.wash_key_crop(im)
+                buf = io.BytesIO()
+                im.save(buf, format="PNG")
+                raw = buf.getvalue()
+            except Exception:
+                pass
+            parts.append({"mime_type": "image/png",
+                          "data": base64.b64encode(raw).decode()})
+        return parts
+
+    def _parse_key_letter_map(self, raw):
+        items = _unwrap_items(_parse_json(raw))
+        out = {}
+        if not isinstance(items, list):
+            return out
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            _normalize_phase_item("Answer-key", it)
+            qn = _item_qn(it)
+            let = str(it.get("correct_option") or "").strip().upper()
+            if qn is None or not re.fullmatch(r"[A-E]", let or ""):
+                continue
+            out[qn] = let
+        return out
+
+    def _gemini_key_table_once(self, a_pages, parts, tag):
+        """One independent full-table transcription. Never reuse a prior call."""
+        lo, hi = (min(a_pages), max(a_pages)) if a_pages else (0, 0)
+        prompt = ANSWER_KEY_PROMPT.format(
+            chapter_name=self.chapter_id, start=lo, end=hi)
+        files = [
+            f"KEY TABLE CROP ONLY (file pages {list(a_pages)}, {KEY_TABLE_DPI} "
+            f"dpi, watermark/header/footer trimmed). Independent read {tag}. "
+            f"Do not reuse memory of a previous answer.",
+        ]
+        files.extend(parts)
+        files.append(prompt)
+        try:
+            raw = self._gen(files)
+        except ModelBlocked:
+            self._ledger(f"A_DUAL_{tag}", a_pages, qp.PASS_STATUS_UNRESOLVED,
+                         0, "model blocked on key table")
+            return {}
+        mp = self._parse_key_letter_map(raw)
+        self._ledger(f"A_DUAL_{tag}", a_pages,
+                     qp.PASS_STATUS_SUCCESS if mp else qp.PASS_STATUS_PARTIAL,
+                     len(mp), f"independent key read {tag}")
+        return mp
+
+    def _gemini_key_row_third(self, a_pages, parts, qns):
+        """Narrower re-ask for mismatched rows only. Does not pick a winner."""
+        if not qns or not parts:
+            return {}
+        lo, hi = (min(a_pages), max(a_pages)) if a_pages else (0, 0)
+        prompt = ANSWER_KEY_PROMPT.format(
+            chapter_name=self.chapter_id, start=lo, end=hi)
+        prompt += (f"\n\nNOTE: SIRF in q_no rows ko padho: {sorted(qns)}. "
+                   f"Baaki ignore. Guess mat karo.")
+        files = [f"KEY TABLE ROW TIE-CHECK q{sorted(qns)} pages {list(a_pages)}"]
+        files.extend(parts)
+        files.append(prompt)
+        try:
+            raw = self._gen(files)
+        except ModelBlocked:
+            return {}
+        return {n: let for n, let in self._parse_key_letter_map(raw).items()
+                if n in set(qns)}
+
+    def _extract_key_dual(self, a_pages):
+        """Two independent Gemini reads of the SAME 300dpi table crop.
+
+        Agree -> letter. Disagree -> one row-narrow third read (audit only);
+        still no guess: letter stays empty + key_conflict.
+        """
+        parts = self._key_table_png_parts(a_pages, dpi=KEY_TABLE_DPI)
+        if not parts:
+            self.notes.append("key dual: no table crop rendered")
+            return []
+        m1 = self._gemini_key_table_once(a_pages, parts, "1")
+        m2 = self._gemini_key_table_once(a_pages, parts, "2")
+        disagree = sorted({n for n in set(m1) | set(m2)
+                           if m1.get(n) != m2.get(n)})
+        third = {}
+        if disagree:
+            third = self._gemini_key_row_third(a_pages, parts, disagree)
+            self.notes.append(f"key dual mismatch rows {disagree} -- third "
+                              f"read recorded, no guess")
+        merged = header_index.merge_dual_key_reads(m1, m2, third)
+        items = []
+        for n, rec in sorted(merged.items()):
+            ev = dict(rec)
+            ev["pages"] = list(a_pages)
+            self._key_evidence[n] = ev
+            items.append({"_qn": n, "q_no": str(n),
+                          "correct_option": ev.get("letter"),
+                          "low_confidence": not ev.get("agree"),
+                          "_key_evidence": ev})
+        n_ok = sum(1 for v in merged.values() if v.get("agree"))
+        print(f"[BPH] {self.chapter_id}: key dual Gemini "
+              f"agree={n_ok}/{len(merged)} mismatch={disagree or '-'}")
+        return items
+
     def _attach_key_evidence(self, a_pages):
         """Answers are READY only with key-TABLE evidence (pixels/OCR of the
         table pages). pdftotext _printed_key is a hint, never enough alone
         on a garbled page. Gemini table letters must cite this map."""
-        ev = {}
+        ev = dict(self._key_evidence or {})
         if a_pages:
             try:
-                ocr_map = header_index.ocr_key_table(self.pdf, a_pages)
+                ocr_map = header_index.ocr_key_table(
+                    self.pdf, a_pages, dpi=KEY_TABLE_DPI,
+                    recs=self._visual_headers)
             except Exception:
                 ocr_map = {}
             for n, let in ocr_map.items():
-                ev[n] = {"letter": let, "method": "key_table_ocr",
-                         "pages": list(a_pages)}
+                prev = ev.get(n) or {}
+                if prev.get("agree") and prev.get("letter") == let:
+                    prev = dict(prev)
+                    prev["ocr"] = let
+                    ev[n] = prev
+                elif prev.get("agree") and prev.get("letter") and prev["letter"] != let:
+                    prev = dict(prev)
+                    prev["method"] = "key_conflict"
+                    prev["conflict"] = let
+                    prev["agree"] = False
+                    ev[n] = prev
+                    self.notes.append(
+                        f"key dual vs OCR conflict q{n}: "
+                        f"dual={prev.get('letter')} ocr={let}")
+                elif not prev.get("letter"):
+                    ev[n] = {"letter": let, "method": "key_table_ocr",
+                             "pages": list(a_pages)}
         # Dual independent read: CLEAN text-layer on KEY PAGES only.
         # Disagree with OCR → flag, do not pick a winner (flag-don't-fix).
         layer = {}
@@ -2131,7 +2326,8 @@ class ChapterRunner:
                          "pages": list(a_pages or [])}
         self._key_evidence = ev
         self._key_evidence_required = bool(a_pages) or any(
-            v.get("method") == "key_table_ocr" for v in ev.values())
+            v.get("method") in ("key_table_ocr", "key_dual_gemini")
+            for v in ev.values())
         if ev:
             print(f"[BPH] {self.chapter_id}: key evidence for "
                   f"{len(ev)} row(s) ({','.join(sorted({v['method'] for v in ev.values()}))})")
@@ -2604,10 +2800,8 @@ class ChapterRunner:
             self.notes.append(f"question phase unresolved: {q_ok}")
         qp.save_state(self.state)
         if a_pages:
-            a_items = self._extract_phase(a_pages, ANSWER_KEY_PROMPT,
-                                          "Answer-key", "A", dpi=170)
-            a_items, a_ok = self._verify_phase("Answer-key", a_items, a_pages,
-                                               dpi=170)
+            a_items = self._extract_key_dual(a_pages)
+            a_ok = True
         elif self._inline_answers_present(q_pages):
             # no key TABLE, but answers print inline next to each question --
             # dedicated zero-guess micro-phase (spec extension)
@@ -2623,28 +2817,19 @@ class ChapterRunner:
         if a_ok is not True:
             self.notes.append(f"answer-key phase unresolved: {a_ok}")
         self._attach_key_evidence(a_pages if a_pages else q_pages)
-        # Prefer key-table OCR letter when it exists (pixels). Gemini A
-        # letters are transcription of that table, not a second opinion.
+        # Dual Gemini is authoritative when both reads agree. OCR at 300dpi
+        # may only CONFIRM or force REVIEW — never replace a dual letter.
         for it in a_items:
             qn = it.get("_qn")
             ev = (self._key_evidence or {}).get(qn)
-            letter = (str(it.get("correct_option") or "").strip().upper()
-                      or None)
-            if ev and ev.get("letter") and ev.get("method") == "key_table_ocr":
+            if not ev:
+                continue
+            it["_key_evidence"] = ev
+            if ev.get("agree") and ev.get("letter") and ev.get("method") != "key_conflict":
                 it["correct_option"] = ev["letter"]
-                it["_key_evidence"] = ev
-            elif letter and a_pages:
-                if ev and ev.get("letter") and ev["letter"] != letter:
-                    ev = dict(ev)
-                    ev["conflict"] = letter
-                    ev["method"] = "key_conflict"
-                    self._key_evidence[qn] = ev
-                    it["_key_evidence"] = ev
-                elif not ev:
-                    ev = {"letter": letter, "method": "key_table_gemini",
-                          "pages": list(a_pages or [])}
-                    self._key_evidence[qn] = ev
-                    it["_key_evidence"] = ev
+            elif ev.get("method") == "key_conflict":
+                it["correct_option"] = ev.get("letter")
+                it["low_confidence"] = True
         s_items = self._extract_phase(s_pages, SOLUTION_PROMPT, "Solution", "S")
         s_items = self._c1_split_solutions(s_items)
         s_items = self._flag_solution_interval_mismatch(s_items)
@@ -2848,3 +3033,4 @@ if __name__ == "__main__":
     res = run_chapter(sys.argv[1], sys.argv[2], int(sys.argv[3]),
                       qp.OUTPUT_ROOT, state=_state)
     print(json.dumps(res, ensure_ascii=False, indent=2, default=str))
+
