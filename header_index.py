@@ -135,6 +135,80 @@ def scan_chapter(pdf_path, first, last, dpi=150):
     return recs
 
 
+def answer_key_y_on_page(recs, page):
+    """PDF-ish Y of the Answer Key header on `page`, or None.
+
+    Used to Y-split a page that sits in both the question zone and the
+    key zone (last Q + printed table on one leaf). Never Gemini.
+    """
+    hits = [r for r in (recs or [])
+            if r.get("type") == T_ANSWER_KEY and int(r["page"]) == int(page)]
+    if not hits:
+        return None
+    # Highest header on the page (first printed Answer Key band).
+    hit = max(hits, key=lambda r: float(r["y"]))
+    return float(hit["y"])
+
+
+def clip_question_intervals_at_key(ivals, recs):
+    """Stop every Question crop at the Answer Key Y on a shared page.
+
+    OPH-004 live: last Question and Answer Key share a page. If the next
+    visual header is Detailed/Sol on a later page, the last-Q interval
+    otherwise swallows the whole key table (+ following pages). Above the
+    key header stays Q; at/below it is A. General, not a chapter patch.
+    """
+    recs = list(recs or [])
+    ak_by_page = {}
+    for r in recs:
+        if r.get("type") != T_ANSWER_KEY:
+            continue
+        p = int(r["page"])
+        y = float(r["y"])
+        if p not in ak_by_page or y > ak_by_page[p]:
+            ak_by_page[p] = y
+    if not ak_by_page:
+        return list(ivals or [])
+    first_ak_page = min(ak_by_page)
+    out = []
+    for iv in ivals or []:
+        iv = dict(iv)
+        strips = []
+        end_p, end_y = iv.get("end_page"), iv.get("end_y")
+        cut = False
+        for st in iv.get("strips") or []:
+            if cut:
+                break
+            st = dict(st)
+            p = int(st["page"])
+            # A page after the first Answer Key page is never a Q crop.
+            if p > first_ak_page:
+                cut = True
+                break
+            ak_y = ak_by_page.get(p)
+            if ak_y is not None:
+                # Q lives strictly above the key band.
+                st["y_lo"] = max(float(st.get("y_lo") or 0.0), ak_y)
+                if float(st.get("y_hi") or 0.0) <= st["y_lo"] + 4:
+                    # header sits at/under the key — drop the strip
+                    cut = True
+                    break
+                end_p, end_y = p, st["y_lo"]
+                strips.append(st)
+                cut = True
+                break
+            strips.append(st)
+            end_p, end_y = p, st.get("y_lo", 0.0)
+        if not strips:
+            continue
+        iv["strips"] = strips
+        iv["end_page"] = end_p
+        iv["end_y"] = end_y
+        iv["qa_y_split"] = True if cut else iv.get("qa_y_split")
+        out.append(iv)
+    return out
+
+
 def intervals(recs, typ):
     """Reading-order intervals for one header type.
 
@@ -169,6 +243,8 @@ def intervals(recs, typ):
             "end_page": end_p, "end_y": end_y, "strips": strips,
             "header": r,
         })
+    if typ == T_QUESTION:
+        out = clip_question_intervals_at_key(out, recs)
     return out
 
 

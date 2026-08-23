@@ -1449,6 +1449,50 @@ class KeyRegionAndGapTests(unittest.TestCase):
         self.assertEqual(m[2]["method"], "key_conflict")
         self.assertEqual(m[3]["letter"], "C")
 
+    def test_qa_same_page_y_split_stops_last_q_above_key(self):
+        """Fix 3: last Q + Answer Key on one page (OPH-004 Q20).
+
+        Next furniture is Detailed on a later page — without the Y-split
+        the last-Q crop would swallow the table and following pages.
+        """
+        recs = [
+            {"page": 72, "y": 700.0, "type": header_index.T_QUESTION, "n": 19},
+            {"page": 72, "y": 400.0, "type": header_index.T_QUESTION, "n": 20},
+            {"page": 72, "y": 220.0, "type": header_index.T_ANSWER_KEY, "n": None},
+            {"page": 74, "y": 600.0, "type": header_index.T_DETAILED, "n": None},
+            {"page": 74, "y": 500.0, "type": header_index.T_SOLUTION, "n": 1},
+        ]
+        ivals = header_index.intervals(recs, header_index.T_QUESTION)
+        by_n = {iv["n"]: iv for iv in ivals}
+        self.assertIn(20, by_n)
+        iv = by_n[20]
+        pages = [st["page"] for st in iv["strips"]]
+        self.assertEqual(pages, [72])
+        self.assertAlmostEqual(iv["strips"][0]["y_lo"], 220.0)
+        self.assertLess(iv["end_y"], 400.0)
+        self.assertGreater(iv["strips"][0]["y_hi"], iv["strips"][0]["y_lo"])
+        # Q19 must still end at Q20, not jump to the key.
+        self.assertEqual([st["page"] for st in by_n[19]["strips"]], [72])
+        self.assertAlmostEqual(by_n[19]["strips"][0]["y_lo"], 400.0)
+        self.assertAlmostEqual(header_index.answer_key_y_on_page(recs, 72), 220.0)
+
+    def test_qa_same_page_split_drops_post_key_pages(self):
+        recs = [
+            {"page": 10, "y": 100.0, "type": header_index.T_QUESTION, "n": 5},
+            {"page": 11, "y": 500.0, "type": header_index.T_ANSWER_KEY, "n": None},
+            {"page": 12, "y": 700.0, "type": header_index.T_DETAILED, "n": None},
+        ]
+        # Q5 starts p10 and would continue through p12 without clip.
+        ivals = header_index.intervals(recs, header_index.T_QUESTION)
+        iv = ivals[0]
+        pages = [st["page"] for st in iv["strips"]]
+        self.assertNotIn(12, pages)
+        # p11 is the key page: Q crop must not keep a strip there (or
+        # if it does, y_lo is the key Y and nothing below).
+        if 11 in pages:
+            st = next(s for s in iv["strips"] if s["page"] == 11)
+            self.assertGreaterEqual(st["y_lo"], 500.0)
+
     def test_key_region_strips_y_split(self):
         recs = [
             {"page": 12, "y": 200, "type": header_index.T_ANSWER_KEY, "n": None},
