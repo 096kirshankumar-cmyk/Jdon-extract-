@@ -743,6 +743,37 @@ def _inclusive_pages(pages, ch_last):
     return list(range(lo, hi + 1))
 
 
+def _zone_pages_from_headers(pages, ch_last):
+    """Contiguous page span for a zone, ignoring headers past the chapter end.
+
+    RUN-31 (OPH-001 live). detect_boundaries scans ch_first..ch_last+2 ON
+    PURPOSE, so a block that continues past the chapter's last page is still
+    seen and cropped. But those extra pages belong to the NEXT chapter, and
+    spanning min..max over the whole set let them stretch the zone:
+
+        visual Question headers  {4,5,6,7,8,9,10,11, 24}
+        _inclusive_pages(..., ch_last=22)  ->  4..22      <-- WRONG
+
+    One next-chapter header on p24 turned a correct Q 4-11 into Q 4-22,
+    swallowing the answer-key page and overlapping the whole solution zone
+    (the run logged Q 4-22 and S 12-22 at once). This was not Gemini
+    hallucinating -- the boundary JSON was right (Q 4-11 | A 12 | S 12-22);
+    the min..max span discarded it.
+
+    Dropping pages beyond ch_last before spanning fixes it without breaking
+    legitimate internal gaps (a question spanning pages 6-8 still leaves no
+    header on 7). Crop intervals keep using file_end=_scan_last, so
+    continuation content past ch_last is still extracted -- only the ZONE
+    stays inside the chapter.
+
+    Returns [] when every header is past ch_last; the caller then keeps the
+    model-derived zone rather than getting an empty one."""
+    inside = [p for p in (pages or []) if p is not None and int(p) <= int(ch_last)]
+    if not inside:
+        return []
+    return _inclusive_pages(inside, ch_last)
+
+
 class ChapterRunner:
     """One chapter through Steps 0-8, then a real commit into the pipeline's
     normal output (Step 8 is WRITE-THROUGH, not a dry run).
@@ -1004,6 +1035,21 @@ class ChapterRunner:
                 singles.append(iv)
         work = list(_chunk_pages(batchable, 4)) + [[iv] for iv in singles]
         retry_singles = []
+        def _keep_shippable(kept, tag):
+            """RUN-31: one place that decides what may ship, so the batch
+            path, the single-crop path and the post-retry path cannot drift.
+            Anything structurally incomplete is DROPPED here -- it is then
+            missing (named by q_no in the export gate) instead of shipping as
+            a plausible hallucination that every downstream check accepts."""
+            good = [it for it in kept if self._crop_item_shippable(it, label)]
+            bad = len(kept) - len(good)
+            if bad:
+                msg = (f"{pass_name}: {tag} DISCARDED {bad} unusable item(s) "
+                       f"-- left missing rather than shipped as a guess")
+                self.notes.append(msg)
+                print(f"[BPH] {self.chapter_id}: {msg}")
+            return good
+
         for batch in work:
             kept = self._gemini_crop_batch(batch, prompt_tmpl, label,
                                            pass_name, dpi)
@@ -1016,13 +1062,16 @@ class ChapterRunner:
                     else:
                         out.append(it)
             else:
-                out.extend(kept)
+                # Was `out.extend(kept)`: a single crop was appended with no
+                # check at all, so the unbatched path -- the majority on a
+                # book whose text layer is not CLEAN -- could ship anything.
+                out.extend(_keep_shippable(kept, f"q{batch[0]['n']}"))
         for iv in retry_singles:
             self.notes.append(
                 f"{pass_name}: batch miss/low-conf q{iv['n']} -> single crop")
             kept = self._gemini_crop_batch([iv], prompt_tmpl, label,
                                            pass_name, dpi)
-            out.extend(kept)
+            out.extend(_keep_shippable(kept, f"q{iv['n']} after retry"))
         return self._merge_phase_items(out)
 
     @staticmethod
@@ -1045,6 +1094,30 @@ class ChapterRunner:
         if str(it.get("text_confidence") or "").lower() == "low":
             return False
         if it.get("has_figure"):
+            return False
+        if label == "Question":
+            opts, _ = _norm_options(it.get("options"))
+            return bool(str(it.get("stem") or "").strip()) and len(opts) >= 4
+        if label == "Solution":
+            return bool(str(it.get("solution_text") or "").strip())
+        return True
+
+    @staticmethod
+    def _crop_item_shippable(it, label):
+        """RUN-31: may this item SHIP? Not the same question as
+        _crop_item_ok, which asks "should we retry this crop?".
+
+        The difference is has_figure: _crop_item_ok rejects a figured item
+        because a figure can hide text, so it is worth another read. But a
+        figure is NOT a text defect -- the image pass attaches it separately.
+        Using _crop_item_ok as the ship test would throw away every question
+        with a diagram, which on this book is most of them.
+
+        For an 18k-question book with no human review capacity the rule is:
+        ship only content that is structurally complete, otherwise leave the
+        item missing. A missing item is reported by q_no in the export gate;
+        a plausible hallucination looks clean to every downstream check."""
+        if not isinstance(it, dict):
             return False
         if label == "Question":
             opts, _ = _norm_options(it.get("options"))
@@ -2231,10 +2304,16 @@ class ChapterRunner:
             # Inclusive [min, max] of printed Question headers only.
             # OBG-001 live: max Q header is p12 (Q25-26 + key start);
             # the old `max+1` then another `+1` pulled p13 (solutions) into Q.
-            q_pages = _inclusive_pages(printed["q"], ch_last)
+            # RUN-31: headers past ch_last belong to the NEXT chapter and must
+            # not stretch this one (OPH-001: a p24 header made Q 4-11 -> 4-22).
+            spanned = _zone_pages_from_headers(printed["q"], ch_last)
+            if spanned:
+                q_pages = spanned
         s_pages = m_s
         if printed["s"]:
-            s_pages = _inclusive_pages(printed["s"], ch_last)
+            spanned = _zone_pages_from_headers(printed["s"], ch_last)
+            if spanned:
+                s_pages = spanned
         a_pages = m_a
         if printed["keys"]:
             a_pages = sorted(set(printed["keys"]))

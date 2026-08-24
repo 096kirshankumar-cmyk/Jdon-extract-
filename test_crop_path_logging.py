@@ -79,6 +79,9 @@ class CropRunner(_Base):
     the geometric reader and the Gemini batch call."""
 
     _extract_from_crops = bph.ChapterRunner._extract_from_crops
+    # RUN-31 added a ship-check to the crop loop; both are staticmethods on
+    # ChapterRunner, so re-wrap or `self` is passed as the item.
+    _crop_item_shippable = staticmethod(bph.ChapterRunner._crop_item_shippable)
 
     def _geom_item_from_interval(self, iv, label):
         return None                     # force every crop to the Gemini leg
