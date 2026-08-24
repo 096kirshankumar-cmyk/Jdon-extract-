@@ -178,6 +178,49 @@ class TestCropGeomSplitIsAlwaysReported(unittest.TestCase):
         self.assertIn("gemini_crops=2", out)
 
 
+class TestCropsAreSentOneAtATime(unittest.TestCase):
+    """RUN-38. Batching four crops contradicted the prompt sent with them
+    ("One image per printed item ... Transcribe ONLY that interval"), and is
+    how OPH-001 q4 came back with q3's explanation prepended."""
+
+    def test_batch_size_is_one(self):
+        self.assertEqual(bph.CROP_BATCH_SIZE, 1)
+
+    def test_each_crop_gets_its_own_call(self):
+        ivals = [{"n": i, "start_page": 4 + i, "end_page": 4 + i,
+                  "strips": [{"page": 4 + i, "y_hi": 9.0, "y_lo": 0.0}]}
+                 for i in range(1, 6)]
+        r = CropRunner(ivals, [{"page": 4}])
+        r._geom_item_from_interval = lambda iv, label: None
+        calls = []
+        r._gemini_crop_batch = lambda batch, *a, **k: (
+            calls.append([iv["n"] for iv in batch]) or [])
+        import io as _io
+        from contextlib import redirect_stdout
+        with redirect_stdout(_io.StringIO()):
+            r._extract_from_crops(ivals, "{chapter_name}{start}{end}",
+                                  "Question", "Q", dpi=130)
+        self.assertEqual(len(calls), 5, calls)
+        for c in calls:
+            self.assertEqual(len(c), 1, "no crop may share a call")
+        self.assertEqual([c[0] for c in calls], [1, 2, 3, 4, 5])
+
+    def test_the_isolation_is_reported_in_the_log(self):
+        r = CropRunner([{"n": 1, "start_page": 4, "end_page": 4,
+                         "strips": [{"page": 4, "y_hi": 9.0, "y_lo": 0.0}]}],
+                       [{"page": 4}])
+        r._geom_item_from_interval = lambda iv, label: None
+        import io as _io
+        from contextlib import redirect_stdout
+        buf = _io.StringIO()
+        with redirect_stdout(buf):
+            r._extract_from_crops(
+                [{"n": 1, "start_page": 4, "end_page": 4,
+                  "strips": [{"page": 4, "y_hi": 9.0, "y_lo": 0.0}]}],
+                "{chapter_name}{start}{end}", "Question", "Q", dpi=130)
+        self.assertIn("one Gemini call each", buf.getvalue())
+
+
 if __name__ == "__main__":
     import shutil
     try:

@@ -77,6 +77,23 @@ import crop_parse
 
 MAX_FIX_ATTEMPTS = 3
 PAGE_CHUNK = 7            # boundary detect only; Q/S extract uses crops
+# RUN-38: how many crop images go into ONE Gemini call.
+#
+# This was 4, and that contradicted the prompt sent alongside the images:
+# "One image per printed item ... Transcribe ONLY that interval. Do not invent
+# from chapter context." Handing the model four adjacent blocks and asking it
+# to ignore three of them is how q4 came back with q3's explanation prepended
+# -- the neighbouring crop was sitting right there in context.
+#
+# 1 costs more calls (OPH-001: ~12 -> ~46 per chapter) and buys the only thing
+# that actually matters here: an item cannot be contaminated by a neighbour it
+# was never shown. Raise it only if quota forces the trade, and expect
+# cross-item bleed to come back with it.
+CROP_BATCH_SIZE = 1
+# Set to a directory to write every crop image Gemini is sent, named
+# <chapter>_<Q|S><q_no>_part<i>.png. The only way to tell a wrong block
+# boundary from a model that added text -- you have to look at the crop.
+CROP_DUMP_DIR = os.environ.get("QBANK_CROP_DUMP", "").strip()
 KEY_TABLE_DPI = 300       # answer-key table crop only (dense grid)
 
 # Tests flip this off; production paces every Gemini request through
@@ -876,6 +893,19 @@ class ChapterRunner:
                  f"invent from chapter context."]
         for iv in ivals:
             b = _stitch_interval_png(self.pdf, iv, dpi=dpi)
+            if b and CROP_DUMP_DIR:
+                # RUN-38: the only way to separate "the block boundary was
+                # wrong" from "the model added text" is to look at the crop
+                # the model was actually sent. q4 shipped with q3's
+                # explanation prepended and nothing on disk could say which
+                # of the two had happened.
+                try:
+                    d = Path(CROP_DUMP_DIR)
+                    d.mkdir(parents=True, exist_ok=True)
+                    (d / f"{self.chapter_id}_q{iv.get('n')}"
+                         f"_p{iv.get('start_page')}.png").write_bytes(b)
+                except OSError as de:
+                    print(f"[BPH] {self.chapter_id}: crop dump failed ({de})")
             if not b:
                 for st in iv.get("strips") or []:
                     b = _crop_strip_png(self.pdf, st["page"], st["y_hi"],
@@ -1089,7 +1119,14 @@ class ChapterRunner:
                 batchable.append(iv)
             else:
                 singles.append(iv)
-        work = list(_chunk_pages(batchable, 4)) + [[iv] for iv in singles]
+        work = (list(_chunk_pages(batchable, CROP_BATCH_SIZE))
+                + [[iv] for iv in singles])
+        if CROP_BATCH_SIZE == 1:
+            # Every item gets its own call, so say so in the log -- the call
+            # count is the visible cost of the isolation.
+            print(f"[BPH] {self.chapter_id}: {pass_name} sending "
+                  f"{len(work)} isolated crop(s), one Gemini call each "
+                  f"(CROP_BATCH_SIZE=1: no neighbour in context)")
         retry_singles = []
         def _keep_shippable(kept, tag):
             """RUN-31: one place that decides what may ship, so the batch
