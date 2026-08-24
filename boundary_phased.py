@@ -3057,6 +3057,70 @@ class ChapterRunner:
             print(f"  [BPH] {self.chapter_id}: closed {closed} flag(s) from "
                   f"the previous extraction of this chapter")
 
+    def _corroborated_carry_files(self):
+        """RUN-37: carry-owned figures that are geometrically INSIDE their
+        owner's own block extent.
+
+        A carry claim means "no heading was found above this figure on its own
+        page, so it went to the block still open from the previous page". On
+        OPH-001 that is simply how the book is laid out -- the figure sits
+        above its question's stem and the "Question N:" header is at the
+        bottom of the previous page:
+
+            ## Question 12:            <- bottom of page 7
+            ---                        <- page break
+            [figure]                   <- top of page 8
+            A child was brought with complaints of decreased vision. Fundus
+            examination shows a developmental anomaly as shown below.
+
+        The attribution was right, and flagging it produced 6 of 23
+        REVIEW_NEEDED rows for correct data. The answer is not to stop
+        flagging carries -- it is to add the evidence that was missing.
+        header_index.intervals already knows every block's page extent, so if
+        the owner's interval covers the figure's page then the figure lies
+        INSIDE that block, which is the same geometric fact a block-position
+        claim rests on. Only those carries are cleared; a carry whose owner's
+        interval does not reach the figure's page still flags.
+
+        Returns a set of final file paths."""
+        spanned = {}
+        for label, kind in (("Question", "question"), ("Solution", "solution")):
+            try:
+                ivals = self._visual_intervals(label) or []
+            except Exception:
+                ivals = []
+            for iv in ivals:
+                try:
+                    qn = int(iv.get("n"))
+                except (TypeError, ValueError):
+                    continue
+                pages = {int(st["page"]) for st in (iv.get("strips") or [])
+                         if st.get("page") is not None}
+                if pages:
+                    spanned[(qn, kind)] = pages
+        if not spanned:
+            return set()
+        corroborated = set()
+        for row in qp.carry_claims(self.chapter_id):
+            owner = str(row.get("owner") or "")
+            slot = row.get("slot")
+            page = row.get("page")
+            if not owner or slot not in ("question", "solution") or page is None:
+                continue
+            try:
+                qn = int(owner.rsplit("-", 1)[-1])
+            except (TypeError, ValueError):
+                continue
+            if int(page) in spanned.get((qn, slot), ()):
+                f = row.get("final_file") or row.get("file")
+                if f:
+                    corroborated.add(f)
+        if corroborated:
+            print(f"[IMG] {self.chapter_id}: {len(corroborated)} carry claim(s) "
+                  f"corroborated -- the figure lies inside its owner's own "
+                  f"block interval, so the owner is proven geometrically")
+        return corroborated
+
     # -- WRITE-THROUGH (Step 8) -----------------------------------------------
     def _commit(self, ch_first, ch_last, page_section, q_items, a_items,
                 s_items, locked, pre_rows):
@@ -3160,13 +3224,15 @@ class ChapterRunner:
         # that look identical to READY ones. Keyed here, where qn is known --
         # the built master row carries only "id", no q_no.
         row_status = {}
+        corroborated = self._corroborated_carry_files()
         for qn, rec in sorted(chapter_records.items(), key=lambda x: x[0]):
             _row = qp.build_final_question(
                 self.subject, self.chapter_id, self.chapter_no, qn, rec,
                 image_files_by_q.get(qn, {"question": [], "solution": []}),
                 source_pages=qn_source_pages.get(qn),
                 ownership_pages=ownership_pages,
-                gate_notices=gate_by_qn.get(qn, []))
+                gate_notices=gate_by_qn.get(qn, []),
+                carry_corroborated=corroborated)
             chapter_rows.append(_row)
             row_status[int(qn)] = {
                 "qa_status": _row.get("qa_status"),

@@ -1834,7 +1834,7 @@ def _is_printed_answer_key(t):
 
 def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files,
                          source_pages=None, ownership_pages=None,
-                         gate_notices=None):
+                         gate_notices=None, carry_corroborated=None):
     qid = f"{subject}-{chapter_no:03d}-{q_no:03d}"
 
     def valid_images(imgs, kind):
@@ -1977,25 +1977,34 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
 
     weak_img_files = []
     carry_img_files = []
+    corroborated_files = []
+    _corroborated = carry_corroborated or set()
+
+    def _record_image_flag(fname, cls, meth, conf):
+        """RUN-37: a carry whose figure lies inside its owner's own block
+        interval is corroborated by geometry and does not need a human. Any
+        other carry still flags -- clearing the class wholesale would just
+        hide the attributions that really are guesses."""
+        if cls == "model":
+            weak_img_files.append(f"{fname} ({meth}/{conf or '?'})")
+        elif cls == "carry":
+            if fname in _corroborated:
+                corroborated_files.append(fname)
+            else:
+                carry_img_files.append(f"{fname} ({meth}/{conf or '?'})")
+
     for side, imgs in (("question", q_images), ("solution", sol_images)):
         for im in imgs:
             ev = ownership_methods.get(im["file"], {})
             meth, conf = ev.get("method"), ev.get("confidence")
-            cls = _img_evidence_class(meth, conf)
-            if cls == "model":
-                weak_img_files.append(f"{im['file']} ({meth}/{conf or '?'})")
-            elif cls == "carry":
-                carry_img_files.append(f"{im['file']} ({meth}/{conf or '?'})")
+            _record_image_flag(im["file"], _img_evidence_class(meth, conf),
+                               meth, conf)
     opt_blob = (image_files.get("option") or {})
     for letter, files in opt_blob.items():
         for fn, meta in [] if not ownership_methods else [
                 (f, ownership_methods.get(f, {})) for f in files]:
             meth, conf = meta.get("method"), meta.get("confidence")
-            cls = _img_evidence_class(meth, conf)
-            if cls == "model":
-                weak_img_files.append(f"{fn} ({meth}/{conf or '?'})")
-            elif cls == "carry":
-                carry_img_files.append(f"{fn} ({meth}/{conf or '?'})")
+            _record_image_flag(fn, _img_evidence_class(meth, conf), meth, conf)
     if weak_img_files:
         status_reasons.append("image(s) attached by model-only evidence: "
                               + "; ".join(weak_img_files))
@@ -2985,6 +2994,43 @@ def _ownership_method_map(chapter_id):
                 out[v] = {"method": row.get("method"),
                           "confidence": row.get("confidence"),
                           "page": row.get("page")}
+    return out
+
+
+def carry_claims(chapter_id):
+    """[{file, final_file, owner, slot, page}] for this chapter's carry claims.
+
+    RUN-37. A carry claim is the weakest deterministic ownership: no heading
+    was found above the figure on its own page, so it went to the block still
+    open from the previous page. The caller decides whether independent
+    geometry corroborates it -- see
+    boundary_phased.ChapterRunner._corroborated_carry_files."""
+    out = []
+    path = DATA_DIR / "image_ownership.jsonl"
+    if not path.exists():
+        return out
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("chapter_id") != chapter_id:
+            continue
+        if row.get("outcome") != "claimed":
+            continue
+        if row.get("method") != CARRY_CLAIM_SOURCE:
+            continue
+        out.append({"file": row.get("file"),
+                    "final_file": row.get("final_file") or row.get("file"),
+                    "owner": row.get("owner"),
+                    "slot": row.get("slot"),
+                    "page": row.get("page")})
     return out
 
 
