@@ -2821,6 +2821,13 @@ class ChapterRunner:
                 "tables": qp._dedupe_tables(srow.get("tables") or []),
                 "has_figure_in_question": bool(q.get("has_figure")),
                 "has_figure_in_solution": bool(srow.get("has_figure")),
+                # RUN-33: where the TEXT came from. crop_parse tags its own
+                # output "_method": "geometric_text"; a model read leaves it
+                # absent. Downstream checks that only make sense for
+                # model-written text (the [IMG] placeholder count) need to
+                # tell the two apart.
+                "_q_text_method": str(q.get("_method") or ""),
+                "_s_text_method": str(srow.get("_method") or ""),
                 "_review_reasons": reasons,
                 "q_no_anchors": {"field_provenance": {
                     "question_text": "BOUNDARY_PHASED", "options": "BOUNDARY_PHASED",

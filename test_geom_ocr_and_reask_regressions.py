@@ -228,6 +228,62 @@ class ReaskCase(unittest.TestCase):
         self.assertIn(15, r.asked_pages[0])
 
 
+class TestPlaceholderCheckSkipsDeterministicText(unittest.TestCase):
+    """RUN-33: OPH-001 after the OCR fallback started working --
+
+        Q crops=23 geom_ok=22 ... | why: ocr=22 text_garbled_ocr_parse_missed=1
+        S crops=23 geom_ok=23 ... | why: ocr=23
+
+    -- then logged 17 img_placeholder_count_mismatch rows across 13 of 23
+    questions and the chapter went to 15 REVIEW_NEEDED. crop_parse is a text
+    parser; it never emits [IMG], so "0 tokens vs N owned files" fired on
+    every figured item."""
+
+    def _rec(self, text, method, qn=5):
+        return {qn: {"question_text": text, "solution_text": "",
+                     "_q_text_method": method, "_s_text_method": ""}}
+
+    def test_deterministic_text_with_figures_is_not_flagged(self):
+        recs = self._rec("Stem with a diagram but no placeholder.",
+                         "geometric_text")
+        qp.apply_img_placeholder_reconcile(
+            recs, {5: {"question": ["OPH/OPH-001-005_Q_01.webp"],
+                       "solution": []}})
+        self.assertEqual(recs[5]["_review_reasons"], [],
+                         "a geometric parse has no [IMG] discipline to check")
+
+    def test_model_text_missing_placeholders_is_still_flagged(self):
+        """The check still does its real job: a model read that dropped its
+        [IMG] markers is a genuine defect."""
+        recs = self._rec("Stem with a diagram but no placeholder.", "")
+        qp.apply_img_placeholder_reconcile(
+            recs, {5: {"question": ["OPH/OPH-001-005_Q_01.webp"],
+                       "solution": []}})
+        self.assertTrue(any("img_placeholder_count_mismatch" in r
+                            for r in recs[5]["_review_reasons"]),
+                        recs[5]["_review_reasons"])
+
+    def test_model_text_with_matching_count_is_clean(self):
+        recs = self._rec("Stem [IMG] with a diagram.", "")
+        qp.apply_img_placeholder_reconcile(
+            recs, {5: {"question": ["OPH/OPH-001-005_Q_01.webp"],
+                       "solution": []}})
+        self.assertEqual(recs[5]["_review_reasons"], [])
+
+    def test_sides_are_judged_independently(self):
+        """Deterministic question + model-written solution: only the solution
+        side is checked."""
+        recs = {5: {"question_text": "Stem, no placeholder.",
+                    "solution_text": "Solution, no placeholder.",
+                    "_q_text_method": "geometric_text",
+                    "_s_text_method": ""}}
+        qp.apply_img_placeholder_reconcile(
+            recs, {5: {"question": ["a.webp"], "solution": ["b.webp"]}})
+        notes = recs[5]["_review_reasons"]
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn("solution", notes[0])
+
+
 if __name__ == "__main__":
     import shutil
     try:

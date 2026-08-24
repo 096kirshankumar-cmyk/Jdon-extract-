@@ -4041,18 +4041,24 @@ def count_img_placeholders(text):
     return len(_IMG_PLACEHOLDER_RE.findall(text or ""))
 
 
-def reconcile_img_placeholders(text, n_files):
+def reconcile_img_placeholders(text, n_files, side=None):
     """Match [IMG] tokens to geometrically owned files by COUNT only.
 
     Equal -> ok (files already reading-order). Unequal -> conflict note.
     Never insert/delete tokens to force a match.
+
+    RUN-33: `side` is optional and only labels the note. The persisted
+    qa_reason used to omit it, so a reviewer reading the flag could not tell
+    whether the question or the solution side disagreed -- only the stdout
+    line knew.
     """
     n_tok = count_img_placeholders(text)
     n_files = int(n_files or 0)
     if n_tok == n_files:
         return True, ""
-    return False, (f"img_placeholder_count_mismatch: text has {n_tok} [IMG] "
-                   f"token(s), interval owns {n_files} file(s)")
+    where = f" ({side})" if side else ""
+    return False, (f"img_placeholder_count_mismatch{where}: text has {n_tok} "
+                   f"[IMG] token(s), interval owns {n_files} file(s)")
 
 
 def flag_high_image_counts(chapter_records, image_files_by_q):
@@ -4084,13 +4090,29 @@ def flag_high_image_counts(chapter_records, image_files_by_q):
 
 
 def apply_img_placeholder_reconcile(chapter_records, image_files_by_q):
+    """Flag [IMG] tokens that disagree with the owned file count.
+
+    RUN-33: skip blocks whose text was parsed DETERMINISTICALLY (crop_parse,
+    off the PDF text layer or OCR of the crop). Such a parser never emits
+    [IMG] tokens -- it has no notion of where a figure sits -- so comparing
+    its 0 tokens against the owned files flagged every figured item in the
+    chapter. OPH-001 live: once the OCR fallback started working, 22/23
+    questions and 23/23 solutions became deterministic and this produced 17
+    mismatches across 13 of 23 questions, pushing the chapter to 15
+    REVIEW_NEEDED. The count check exists to catch a MODEL dropping or
+    inventing [IMG] markers, which is a genuine failure mode; it carries no
+    information about text a model never wrote. The figures still ship in
+    question.images / solution.images exactly as before."""
     for qn, rec in (chapter_records or {}).items():
         entry = (image_files_by_q or {}).get(qn) or {}
         reasons = list(rec.get("_review_reasons") or [])
-        for side, field in (("question", "question_text"),
-                            ("solution", "solution_text")):
+        for side, field, mkey in (
+                ("question", "question_text", "_q_text_method"),
+                ("solution", "solution_text", "_s_text_method")):
+            if str(rec.get(mkey) or "") == "geometric_text":
+                continue
             ok, note = reconcile_img_placeholders(
-                rec.get(field), len(entry.get(side) or []))
+                rec.get(field), len(entry.get(side) or []), side=side)
             if not ok:
                 if note not in reasons:
                     reasons.append(note)
