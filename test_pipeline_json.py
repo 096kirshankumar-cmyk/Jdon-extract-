@@ -1567,20 +1567,43 @@ class Run21bCarrySeedAndCarryCapTests(unittest.TestCase):
             "positional stacking")
 
     def test_carry_source_reaches_rename_guard(self):
+        """RUN-29 update. This used to assert that _rename_for_slot held two
+        `claim_source in MODEL_CLAIM_SOURCES` cap-lift guards. The no-cap
+        change (2026-08-24) deleted those guards on purpose -- geometry owns
+        the file, and an outlier is FLAGGED (flag_high_image_counts ->
+        review_suggested: high_image_count) instead of refused. Asserting the
+        removed branches exist kept this test red and described a contract
+        that no longer holds. These assertions are the current one."""
         src = Path(qp.__file__).read_text()
         i = src.index("def _rename_for_slot")
         body = src[i:i + 9000]
-        # AUDIT-FIX: the run-21 carry-cap LIFT let a stale carry stack a
-        # whole page of wrong-owner figures past the flat cap (the ch. 28
-        # failure class). New contract: carries obey the flat caps; only
-        # model-declared claims may lift.
+        # Carries never lifted the cap, and still must not: a carry is the
+        # weakest deterministic claim (ch. 28 failure class).
         self.assertEqual(
             body.count("claim_source == CARRY_CLAIM_SOURCE"), 0,
             "carry claims must NOT lift the cap any more (audit fix)")
+        # No count-based refusal survives in the choke point.
         self.assertEqual(
-            body.count("claim_source in MODEL_CLAIM_SOURCES"), 2,
-            "both the question-side and solution-side guards must still "
-            "honour model-declared claims")
+            body.count("claim_source in MODEL_CLAIM_SOURCES"), 0,
+            "the cap-lift guards are gone with the cap; nothing may still "
+            "branch on MODEL_CLAIM_SOURCES here")
+        self.assertNotIn(
+            'outcome="refused_cap"', body,
+            "no image may be refused for count any more -- outliers are "
+            "flagged, never dropped")
+
+    def test_high_image_count_is_flagged_not_dropped(self):
+        """Behavioural half of the no-cap contract."""
+        recs = {1: {"question_text": "q"}, 2: {"question_text": "q"}}
+        by_q = {1: {"question": [], "solution": [f"s{i}.webp" for i in range(7)]},
+                2: {"question": [], "solution": ["a.webp"]}}
+        qp.flag_high_image_counts(recs, by_q)
+        self.assertEqual(recs[1].get("_review_suggested"), "high_image_count")
+        self.assertTrue(any("high_image_count" in r
+                            for r in recs[1].get("_review_reasons", [])))
+        # the data itself is untouched -- this is a flag, not a filter
+        self.assertEqual(len(by_q[1]["solution"]), 7)
+        self.assertNotIn("_review_suggested", recs[2])
 
 
 class Run22GarbledHeaderAndOrphanInferenceTests(unittest.TestCase):

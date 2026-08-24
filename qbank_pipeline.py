@@ -1806,28 +1806,60 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
     if structural_missing:
         status_reasons.append(f"missing structural fields: {structural_missing}")
 
-    # image-evidence review: any attached image whose only ownership proof is
-    # a non-deterministic (model) method or non-high confidence
+    # image-evidence review: any attached image whose ownership proof is
+    # WEAKER than same-page printed geometry. Two distinct classes, reported
+    # separately so a reviewer can tell them apart:
+    #   * model-only -- isolated_crop_vision, or full_page_vision at
+    #     non-high confidence (the original rule);
+    #   * positional_carry -- deterministic, but the owner is the block
+    #     CARRIED across the page edge (active_block), not a heading printed
+    #     above the figure on its own page. RUN-29 (OPH-001 live): carry
+    #     claims were graded "medium" and matched neither branch above, so
+    #     the row shipped READY. Every mis-attribution the carry produced was
+    #     invisible to qa_status and therefore to /review. A carry is real
+    #     evidence, so it does not make the row INCOMPLETE -- it makes it
+    #     REVIEW_NEEDED, which is exactly what the review layer is for.
     ownership_methods = _ownership_method_map(chapter_id)
+
+    def _img_evidence_class(meth, conf):
+        """None | "model" | "carry" -- the weakness class of one claim."""
+        if meth == "isolated_crop_vision":
+            return "model"
+        if meth == "full_page_vision" and conf != "high":
+            return "model"
+        if meth == CARRY_CLAIM_SOURCE:
+            return "carry"
+        return None
+
     weak_img_files = []
+    carry_img_files = []
     for side, imgs in (("question", q_images), ("solution", sol_images)):
         for im in imgs:
             ev = ownership_methods.get(im["file"], {})
             meth, conf = ev.get("method"), ev.get("confidence")
-            if meth == "isolated_crop_vision" or (
-                    meth == "full_page_vision" and conf != "high"):
+            cls = _img_evidence_class(meth, conf)
+            if cls == "model":
                 weak_img_files.append(f"{im['file']} ({meth}/{conf or '?'})")
+            elif cls == "carry":
+                carry_img_files.append(f"{im['file']} ({meth}/{conf or '?'})")
     opt_blob = (image_files.get("option") or {})
     for letter, files in opt_blob.items():
         for fn, meta in [] if not ownership_methods else [
                 (f, ownership_methods.get(f, {})) for f in files]:
             meth, conf = meta.get("method"), meta.get("confidence")
-            if meth == "isolated_crop_vision" or (
-                    meth == "full_page_vision" and conf != "high"):
+            cls = _img_evidence_class(meth, conf)
+            if cls == "model":
                 weak_img_files.append(f"{fn} ({meth}/{conf or '?'})")
+            elif cls == "carry":
+                carry_img_files.append(f"{fn} ({meth}/{conf or '?'})")
     if weak_img_files:
         status_reasons.append("image(s) attached by model-only evidence: "
                               + "; ".join(weak_img_files))
+    if carry_img_files:
+        status_reasons.append(
+            "image(s) owned by cross-page carry (no heading printed above "
+            "the figure on its own page -- owner inferred from the block "
+            "still open on the previous page): " + "; ".join(carry_img_files))
 
     # gate notices for this question (wrong-owner suspect, strong missing
     # figure, etc.)
@@ -2807,6 +2839,84 @@ def _ownership_method_map(chapter_id):
                           "confidence": row.get("confidence"),
                           "page": row.get("page")}
     return out
+
+
+def image_attribution_summary(chapter_id):
+    """How this chapter's figures actually got their owner, from the ledgers.
+
+    RUN-29 (OPH-001): the carry rate was only readable by counting "[IMG]
+    page N: active-block carry" lines out of a run log, so it was not a
+    metric anyone could watch regress. This recomputes the same split from
+    the append-only ownership ledger -- claimed rows by `method` -- plus the
+    unclaimed count from unmatched_images.jsonl, so every chapter reports
+    its own attribution mix and a rising carry share is visible without
+    reading logs.
+
+    Returns {"claimed_by_method": {method: n}, "carry": n, "positional": n,
+             "model": n, "claimed_total": n, "unclaimed": n,
+             "carry_share": float|None}. carry_share is the share of CLAIMED
+    figures owned by cross-page carry (the OPH-001 number)."""
+    path = DATA_DIR / "image_ownership.jsonl"
+    # One file can appear on several claimed rows (multi-draw share,
+    # resume-relink), so key by the file and keep its LATEST claim -- then
+    # count each file exactly once, the same de-duplication
+    # _ownership_method_map applies when it drives qa_status.
+    latest_method: dict = {}
+    if path.exists():
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("chapter_id") != chapter_id:
+                continue
+            if row.get("outcome") != "claimed":
+                continue
+            key = row.get("final_file") or row.get("file")
+            if not key:
+                continue
+            latest_method[key] = row.get("method") or "unknown"
+
+    by_method: dict = {}
+    for m in latest_method.values():
+        by_method[m] = by_method.get(m, 0) + 1
+
+    unclaimed = 0
+    um_path = DATA_DIR / "unmatched_images.jsonl"
+    if um_path.exists():
+        try:
+            for line in um_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    u = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if u.get("chapter_id") == chapter_id:
+                    unclaimed += 1
+        except OSError:
+            pass
+
+    carry = by_method.get(CARRY_CLAIM_SOURCE, 0)
+    positional = by_method.get("positional", 0) + \
+        by_method.get("deterministic_geometry", 0) + \
+        by_method.get("deterministic_ocr_geometry", 0)
+    model = by_method.get("isolated_crop_vision", 0) + \
+        by_method.get("full_page_vision", 0)
+    claimed_total = sum(by_method.values())
+    return {"claimed_by_method": by_method,
+            "carry": carry,
+            "positional": positional,
+            "model": model,
+            "claimed_total": claimed_total,
+            "unclaimed": unclaimed,
+            "carry_share": (carry / claimed_total) if claimed_total else None}
 
 
 def _answer_option_mismatch(rec, correct_id, option_rows):

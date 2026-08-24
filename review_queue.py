@@ -1799,12 +1799,28 @@ def build_final_zip(output_root, dest=None):
                 if row.get("file"):
                     referenced.add(row["file"])
 
+    # RUN-29 (OPH-001): what the package ACTUALLY contains, verdict-wise.
+    # The queue gate proves every flag was DECIDED -- not that every row is
+    # clean. A REVIEW_NEEDED row a human approved or ignored ships unchanged,
+    # and `record_decision` has no exclude action, so this count can be
+    # non-zero on a legitimately built file. Stating it in the receipt makes
+    # the delivered zip self-documenting instead of relying on a reviewer
+    # remembering which rows were flagged. "UNLABELLED" covers split files
+    # written before qa_status propagated.
+    shipped_status: dict = {}
+    if split_root.exists():
+        for qf in sorted(split_root.glob("*/*/questions.jsonl")):
+            for row in _read_jsonl(qf):
+                st = row.get("qa_status") or "UNLABELLED"
+                shipped_status[st] = shipped_status.get(st, 0) + 1
+
     receipt = {
         "built_at": _now(), "output_root": out_root.name,
         "chapters": len(manifest_files), "subjects": sorted(subjects),
         "images_shipped": len(referenced),
         "review_decisions": len(receipts),
         "human_edits": len(edits),
+        "shipped_qa_status_counts": shipped_status or None,
         "gate": "queue clear — built only after every flag was resolved",
     }
 

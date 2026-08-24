@@ -2863,6 +2863,66 @@ class ChapterRunner:
                   f"(stems/options/answers/solutions/images/assets all "
                   f"accounted)")
 
+        # Master rows FIRST (run-29). The split layer used to be written
+        # before chapter_rows existed, so it could only see the raw
+        # chapter_records and had to invent its own structural
+        # extraction_status -- leaving qa_status (READY / REVIEW_NEEDED /
+        # INCOMPLETE) stranded in data/questions.jsonl, which final_export.zip
+        # does not ship. Building the rows here lets the SAME verdict be
+        # copied verbatim onto the split rows instead of being re-derived.
+        # Nothing the split layer reads depends on the master file being
+        # written after it, so the swap is safe; the master write still
+        # precedes _close_previous_flags, which needs rows on disk.
+        gate_by_qn = {}
+        for kind, qn_v, detail in violations:
+            # NOTE: chapter/page-scope violations carry qn=None or even the
+            # pages LIST (unresolved_page_* rows) -- only a true int is a
+            # question number that row-level gate notices can attach to.
+            if isinstance(qn_v, int):
+                gate_by_qn.setdefault(qn_v, []).append((kind, detail))
+        chapter_rows = []
+        # Per-question verdict map handed to the split layer (run-29): the
+        # split rows copy these three fields verbatim, so final_export.zip is
+        # distinguishable row-by-row instead of shipping REVIEW_NEEDED rows
+        # that look identical to READY ones. Keyed here, where qn is known --
+        # the built master row carries only "id", no q_no.
+        row_status = {}
+        for qn, rec in sorted(chapter_records.items(), key=lambda x: x[0]):
+            _row = qp.build_final_question(
+                self.subject, self.chapter_id, self.chapter_no, qn, rec,
+                image_files_by_q.get(qn, {"question": [], "solution": []}),
+                source_pages=qn_source_pages.get(qn),
+                ownership_pages=ownership_pages,
+                gate_notices=gate_by_qn.get(qn, []))
+            chapter_rows.append(_row)
+            row_status[int(qn)] = {
+                "qa_status": _row.get("qa_status"),
+                "qa_reasons": _row.get("qa_reasons") or [],
+                "manual_review": bool(_row.get("manual_review")),
+            }
+        questions_path = qp.DATA_DIR / "questions.jsonl"
+        qp.rewrite_questions_file(questions_path, self.chapter_id, chapter_rows)
+        qp.write_chapter_file(self.subject, self.chapter_id, chapter_rows)
+
+        # Attribution mix for this chapter (run-29). Recomputed from the
+        # append-only ledgers, so the carry rate is a reported number instead
+        # of something counted out of "[IMG] ... active-block carry" log
+        # lines. Nothing here blocks the export -- it is the metric that says
+        # whether figure attribution is actually improving.
+        try:
+            _attrib = qp.image_attribution_summary(self.chapter_id)
+            _share = _attrib["carry_share"]
+            print(f"  [IMG] {self.chapter_id}: attribution "
+                  f"{_attrib['positional']} block-position / "
+                  f"{_attrib['carry']} carry / {_attrib['model']} model / "
+                  f"{_attrib['unclaimed']} unclaimed"
+                  + (f" | carry share {_share:.0%} of "
+                     f"{_attrib['claimed_total']} claimed"
+                     if _share is not None else " | no claimed figures"))
+        except Exception as _ae:
+            print(f"  [IMG] {self.chapter_id}: attribution summary failed "
+                  f"({_ae}) -- non-fatal, counts unavailable")
+
         # Split layer (sidecar). A failure here must never hurt the master
         # rows -- same contract the pipeline always kept.
         try:
@@ -2880,7 +2940,8 @@ class ChapterRunner:
                 pdf_path=self.pdf, page_files=page_files,
                 reconciled=reconciled,
                 output_root=qp.OUTPUT_ROOT,
-                ownership_pages=ownership_pages)
+                ownership_pages=ownership_pages,
+                row_status=row_status)
             print(f"  [SPLIT] {self.chapter_id}: "
                   f"{split_completeness.get('question_records')} questions / "
                   f"{split_completeness.get('answer_records')} answers / "
@@ -2888,25 +2949,6 @@ class ChapterRunner:
         except Exception as e:
             print(f"  [SPLIT] {self.chapter_id}: split-layer error ({e}) -- "
                   f"master output unaffected, split files NOT written")
-
-        gate_by_qn = {}
-        for kind, qn_v, detail in violations:
-            # NOTE: chapter/page-scope violations carry qn=None or even the
-            # pages LIST (unresolved_page_* rows) -- only a true int is a
-            # question number that row-level gate notices can attach to.
-            if isinstance(qn_v, int):
-                gate_by_qn.setdefault(qn_v, []).append((kind, detail))
-        chapter_rows = []
-        for qn, rec in sorted(chapter_records.items(), key=lambda x: x[0]):
-            chapter_rows.append(qp.build_final_question(
-                self.subject, self.chapter_id, self.chapter_no, qn, rec,
-                image_files_by_q.get(qn, {"question": [], "solution": []}),
-                source_pages=qn_source_pages.get(qn),
-                ownership_pages=ownership_pages,
-                gate_notices=gate_by_qn.get(qn, [])))
-        questions_path = qp.DATA_DIR / "questions.jsonl"
-        qp.rewrite_questions_file(questions_path, self.chapter_id, chapter_rows)
-        qp.write_chapter_file(self.subject, self.chapter_id, chapter_rows)
 
         # rows are on disk NOW -> previous extraction's open flags for this
         # chapter are superseded (append-only decision trail, re-openable).
