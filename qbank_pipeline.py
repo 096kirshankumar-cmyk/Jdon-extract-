@@ -1706,16 +1706,31 @@ def strip_page_furniture(text):
     return cleaned, dropped
 
 
+# Characters that indicate OCR or font damage rather than real typography.
+# Medical textbooks legitimately use ° µ – — ‘ ’ “ ” • → × ≤ ≥ ± and Greek
+# letters, so the original "ord(c) > 127" test produced false positives on
+# OPH-001: q9's three-bullet list scored 3/137 = 0.022 non-ASCII and was
+# flagged as damage, pushing the chapter from 6 REVIEW_NEEDED to 11 for text
+# that was perfectly correct. Only glyphs that never appear in correct print
+# count now; the private-use area is where garbled font encodings land.
+_OCR_DAMAGE_CHARS = frozenset("\ufffd\u25a0\u25a1\u25aa\u25ab")
+
+
+def _ocr_damage_share(s):
+    """Share of characters that are OCR/font damage, not typography."""
+    n = max(len(s), 1)
+    return sum(1 for c in s
+               if c in _OCR_DAMAGE_CHARS or "\ue000" <= c <= "\uf8ff") / n
+
+
 def _ocr_noise_note(text, field):
     """A review reason when `text` looks like OCR damage rather than prose.
 
     Nothing here rewrites anything -- the record ships as extracted and a
-    human decides. The thresholds mirror header_index.text_layer_health's
-    DEGRADED band (non-ASCII share, alphabetic share) but are applied per
-    FIELD, because a whole-page health check says nothing about one option
-    label and would call a legitimate "2.4 cm" empty.
+    human decides. Applied per FIELD, because a whole-page health check says
+    nothing about one option label and would call a legitimate "2.4 cm" empty.
 
-    OPH-001 shipped all of these as READY:
+    OPH-001 shipped both of these as READY:
         q2 stem  "oe SS \u00ab\\ni i ity?\\nAt what age would a child attain full a \u00ab"
         q3 stem  "A ascarid presen GR the abnormality as shown below"
         q1 opt D "Astigmatic x\u201c es _ ne 0 n\\* \\ \u00bb\\* XW e Niactinn = a ws +."
@@ -1724,11 +1739,11 @@ def _ocr_noise_note(text, field):
     if not s:
         return None
     n = len(s)
-    weird = sum(1 for c in s if ord(c) > 127 or c in "\u25a0\u25a1\ufffd")
     letters = sum(1 for c in s if c.isalpha())
-    if n >= 24 and weird / n > 0.02:
-        return (f"{field}: non-ASCII noise {weird}/{n} chars -- looks like OCR "
-                f"damage, not print")
+    damage = _ocr_damage_share(s)
+    if n >= 24 and damage > 0.02:
+        return (f"{field}: damaged glyphs {damage * n:.0f}/{n} chars -- looks "
+                f"like OCR damage, not print")
     if n >= 40 and letters / n < 0.55:
         return (f"{field}: only {letters}/{n} alphabetic -- looks like OCR "
                 f"damage, not prose")

@@ -1676,6 +1676,72 @@ class ChapterRunner:
         return out
 
     # -- Verify helper (Steps 2/4/6 share this) --------------------------------
+    def _recheck_unverified(self, phase_name, items, verdict):
+        """RUN-35: re-test a verify verdict AFTER the re-ask has run.
+
+        _verify_phase runs BEFORE _printed_header_reask, so its verdict goes
+        stale. OPH-001 live:
+
+            verify -> q3 'Solution text is completely empty.'  (genuine)
+            re-ask -> filled q3
+            commit -> missing solution: 0, 0 INCOMPLETE      (data was fine)
+            gate   -> phase_unresolved ... NOT a clean export (stale verdict)
+
+        The chapter was blocked on a problem the pipeline had already fixed,
+        and because the note is chapter-scoped (q_no=None) it could not even
+        be traced to a row. Re-test every flagged q_no against the items we
+        are actually about to ship: whatever is now complete comes off the
+        list, and if nothing is left the phase counts as resolved. A verdict
+        in any other shape is returned untouched -- this never invents a pass.
+        """
+        if verdict is True:
+            return True
+        if not isinstance(verdict, tuple) or len(verdict) != 2:
+            return verdict
+        reason, payload = verdict
+        if not isinstance(payload, dict) or not isinstance(
+                payload.get("mismatches"), list):
+            return verdict
+
+        content_key = {"Solution": "solution_text",
+                       "Question": "stem"}.get(phase_name)
+        by_qn = {}
+        for it in items or []:
+            qn = _norm_q_no(it.get("_qn") if it.get("_qn") is not None
+                            else it.get("q_no"))
+            if qn is not None:
+                by_qn[qn] = it
+
+        def _now_complete(qn):
+            it = by_qn.get(qn)
+            if it is None or content_key is None:
+                return False
+            val = str(it.get(content_key) or "").strip()
+            if content_key == "solution_text":
+                val, _ = qp.sanitize_solution_text(val, own_qn=qn)
+                val = val.strip()
+            return bool(val)
+
+        still = []
+        recovered = []
+        for m in payload.get("mismatches") or []:
+            qn = _norm_q_no((m or {}).get("q_no"))
+            if qn is not None and _now_complete(qn):
+                recovered.append(qn)
+            else:
+                still.append(m)
+        if recovered:
+            print(f"[BPH] {self.chapter_id}: {phase_name} verify verdict was "
+                  f"stale -- q{sorted(recovered)} recovered by the re-ask, "
+                  f"cleared from the phase verdict")
+        if not still:
+            return True
+        if len(still) == len(payload.get("mismatches") or []):
+            return verdict
+        updated = dict(payload)
+        updated["mismatches"] = still
+        return (reason, updated)
+
     def _verify_phase(self, phase_name, items, pages, dpi=110):
         if not pages:
             return items, True
@@ -3205,6 +3271,7 @@ class ChapterRunner:
         q_items, q_ok = self._verify_phase("Question", q_items, q_pages)
         q_items = self._printed_header_reask("Question", q_items, q_pages,
                                              "_printed_q_hdrs", QUESTION_PROMPT)
+        q_ok = self._recheck_unverified("Question", q_items, q_ok)
         if q_ok is not True:
             self.notes.append(f"question phase unresolved: {q_ok}")
         qp.save_state(self.state)
@@ -3247,6 +3314,9 @@ class ChapterRunner:
                                              "_printed_s_hdrs", SOLUTION_PROMPT)
         s_items = self._c1_split_solutions(s_items)
         s_items = self._flag_solution_interval_mismatch(s_items)
+        # After the re-ask AND the C1 split, so the re-check sees exactly the
+        # items that will be committed.
+        s_ok = self._recheck_unverified("Solution", s_items, s_ok)
         if s_ok is not True:
             self.notes.append(f"solutions phase unresolved: {s_ok}")
         qp.save_state(self.state)

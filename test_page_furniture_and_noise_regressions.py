@@ -115,13 +115,46 @@ class TestOcrNoiseNote(unittest.TestCase):
         for opt in ("2.4 cm", "Mesoderm", "Neural crest", "6 months"):
             self.assertIsNone(qp._ocr_noise_note(opt, "option"), opt)
 
-    def test_non_ascii_noise_is_flagged(self):
-        bad = ("Astigmatic x\u201c es _ ne 0 n\\* \\ \u00bb\\* XW e Niactinn "
-               "= a ws +.")
+    def test_damaged_glyphs_are_flagged(self):
+        bad = ("Astigmatic \ufffd\ufffd es _ ne 0 n * * XW e Niactinn "
+               "= a ws +. \u25a0\u25a0")
         note = qp._ocr_noise_note(bad, "option D")
         self.assertIsNotNone(note)
         self.assertIn("option D", note)
-        self.assertIn("non-ASCII", note)
+        self.assertIn("damaged glyphs", note)
+
+    def test_legitimate_typography_is_never_flagged(self):
+        """RUN-35 regression. The first version counted ANY non-ASCII char as
+        damage, so OPH-001 q9's ordinary three-bullet list scored 3/137 = 0.022
+        and was flagged -- pushing the chapter from 6 REVIEW_NEEDED to 11 on
+        text that was perfectly correct. Medical books legitimately use
+        degrees, dashes, curly quotes, bullets and Greek."""
+        legit = {
+            "bullets": ("\u2022 Anterior cerebral artery - dorsal chiasma "
+                        "\u2022 Anterior communicating artery - ventral "
+                        "chiasma \u2022 Internal carotid artery - ventral "
+                        "chiasma"),
+            "en-dash": ("Sphincter pupillae: Short ciliary nerve\u2013Ciliary "
+                        "ganglion. Ciliary muscle\u2013Accessory ganglion. "
+                        "Dilator pupillae and Muller muscle."),
+            "degrees": ("The orbit is more divergent (50\u00b0) as compared "
+                        "to adult (45\u00b0). Note: The lacrimal glands are "
+                        "underdeveloped in a newborn."),
+            "curly+greek": ("Mittendorf\u2019s dot \u2014 remnant of the "
+                            "hyaloid artery. The angle \u03b1 and \u03ba "
+                            "are both measured here."),
+            "units": ("The anteroposterior diameter is 24 mm/2.4 cm. At birth "
+                      "the axial length is 16.5 mm, growing to 23 mm by 3 "
+                      "years of age."),
+        }
+        for name, text in legit.items():
+            self.assertIsNone(qp._ocr_noise_note(text, name), name)
+
+    def test_real_garbage_is_still_caught(self):
+        """The typo-detection must survive the tightening."""
+        bad = ("Astigmatic x es _ ne 0 n *  * XW e Niactinn = a ws + "
+               "z q 1 2 3 4 5 - = + ~ ^ % $ # @")
+        self.assertIsNotNone(qp._ocr_noise_note(bad, "question stem"))
 
     def test_low_alphabetic_text_is_flagged(self):
         bad = ("oe SS \u00ab i i ity At what age would a child attain full a "
@@ -183,10 +216,12 @@ class TestNoiseReachesQaStatus(unittest.TestCase):
                         row["qa_reasons"])
 
     def test_garbled_option_is_reported_by_letter(self):
+        """The verbatim option D that OPH-001 shipped as READY. 30/57
+        alphabetic (0.526); the book's legitimate options score ~0.76."""
         row = self._row(
             "At what age would a child attain full visual acuity in years?",
             {"A": "6 months", "B": "1 year", "C": "3 years",
-             "D": "Astigmatic x\u201c es _ ne 0 n\\* \\ \u00bb\\* XW e Niactinn"},
+             "D": "Astigmatic x\u201c es _ ne 0 n\\* \\ \u00bb\\* XW e Niactinn = a ws +."},
             REAL_SHORT_SOLUTION)
         self.assertEqual(row["qa_status"], "REVIEW_NEEDED")
         self.assertTrue(any("option D" in r for r in row["qa_reasons"]),

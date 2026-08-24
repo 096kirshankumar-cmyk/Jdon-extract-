@@ -286,6 +286,106 @@ class TestPlaceholderCheckSkipsDeterministicText(unittest.TestCase):
         self.assertIn("solution", notes[0])
 
 
+class TestStaleVerifyVerdictIsRechecked(unittest.TestCase):
+    """RUN-35. OPH-001 live:
+
+        verify -> q3 'Solution text is completely empty.'   (genuine)
+        re-ask -> filled q3
+        commit -> missing solution: 0, 0 INCOMPLETE         (data was fine)
+        gate   -> phase_unresolved ... NOT a clean export   (stale verdict)
+
+    The chapter was blocked on a problem the pipeline had already fixed."""
+
+    VERDICT = ("exceeded attempts",
+               {"phase": "Solution", "total_entries_checked": 23,
+                "all_verified": False,
+                "mismatches": [
+                    {"q_no": "3", "issue": "Solution text is completely empty.",
+                     "severity": "genuine"}]})
+
+    def _runner(self):
+        r = bph.ChapterRunner.__new__(bph.ChapterRunner)
+        r.chapter_id = "OPH-001"
+        return r
+
+    def test_recovered_item_clears_the_verdict(self):
+        items = [{"_qn": 3,
+                  "solution_text": "Uveal melanomas arise from uveal "
+                                   "melanocytes, which are derived from the "
+                                   "neural crest cells."}]
+        self.assertIs(
+            bph.ChapterRunner._recheck_unverified(
+                self._runner(), "Solution", items, self.VERDICT),
+            True)
+
+    def test_still_empty_item_keeps_the_verdict(self):
+        items = [{"_qn": 3, "solution_text": ""}]
+        out = bph.ChapterRunner._recheck_unverified(
+            self._runner(), "Solution", items, self.VERDICT)
+        self.assertIsNot(out, True)
+        self.assertEqual(out, self.VERDICT)
+
+    def test_header_only_text_counts_as_still_empty(self):
+        """sanitize strips 'Solution to Question 3:' to nothing -- that is
+        exactly the OBG-010-021 shape and must not clear the verdict."""
+        items = [{"_qn": 3, "solution_text": "Solution to Question 3:"}]
+        out = bph.ChapterRunner._recheck_unverified(
+            self._runner(), "Solution", items, self.VERDICT)
+        self.assertIsNot(out, True)
+
+    def test_partial_recovery_keeps_only_what_is_still_broken(self):
+        verdict = ("exceeded attempts",
+                   {"phase": "Solution", "all_verified": False,
+                    "mismatches": [
+                        {"q_no": "3", "issue": "empty", "severity": "genuine"},
+                        {"q_no": "23", "issue": "ends abruptly",
+                         "severity": "genuine"}]})
+        items = [{"_qn": 3, "solution_text": "A complete explanation here."},
+                 {"_qn": 23, "solution_text": ""}]
+        out = bph.ChapterRunner._recheck_unverified(
+            self._runner(), "Solution", items, verdict)
+        self.assertIsNot(out, True)
+        remaining = out[1]["mismatches"]
+        self.assertEqual([m["q_no"] for m in remaining], ["23"])
+
+    def test_a_verdict_in_another_shape_is_returned_untouched(self):
+        """Never invent a pass. ('verify-error', str) has no mismatches to
+        re-test, so it must come back exactly as it went in."""
+        for verdict in (("verify-error", "boom"), None, "weird",
+                        ("exceeded attempts", "not a dict")):
+            self.assertEqual(
+                bph.ChapterRunner._recheck_unverified(
+                    self._runner(), "Solution", [], verdict),
+                verdict)
+
+    def test_a_true_verdict_stays_true(self):
+        self.assertIs(
+            bph.ChapterRunner._recheck_unverified(
+                self._runner(), "Solution", [], True),
+            True)
+
+    def test_question_phase_checks_the_stem(self):
+        verdict = ("exceeded attempts",
+                   {"phase": "Question", "all_verified": False,
+                    "mismatches": [{"q_no": "5", "issue": "stem missing",
+                                    "severity": "genuine"}]})
+        items = [{"_qn": 5, "stem": "By how many weeks does the optic groove "
+                                   "appear?"}]
+        self.assertIs(
+            bph.ChapterRunner._recheck_unverified(
+                self._runner(), "Question", items, verdict),
+            True)
+
+    def test_q_no_as_string_or_int_both_match(self):
+        """The model returns q_no as a string; items key it as an int."""
+        items = [{"q_no": 3,
+                  "solution_text": "A complete explanation of the answer."}]
+        self.assertIs(
+            bph.ChapterRunner._recheck_unverified(
+                self._runner(), "Solution", items, self.VERDICT),
+            True)
+
+
 if __name__ == "__main__":
     import shutil
     try:
