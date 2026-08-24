@@ -2956,6 +2956,107 @@ class ChapterRunner:
         return records, qn_source_pages
 
     # -- Images: deterministic ownership only ---------------------------------
+    def _all_intervals(self):
+        """[(kind, q_no, interval)] for both sides, built once per chapter."""
+        cached = getattr(self, "_interval_cache", None)
+        if cached is not None:
+            return cached
+        out = []
+        for label, kind in (("Question", "question"), ("Solution", "solution")):
+            try:
+                ivals = self._visual_intervals(label) or []
+            except Exception:
+                ivals = []
+            for iv in ivals:
+                try:
+                    out.append((kind, int(iv.get("n")), iv))
+                except (TypeError, ValueError):
+                    continue
+        self._interval_cache = out
+        return out
+
+    def _claim_images_by_interval(self, page, imgs, chapter_records,
+                                 image_files_by_q):
+        """RUN-39: PRIMARY image ownership -- the crop interval a figure sits
+        inside.
+
+        Text and figures used to be attributed by two different header
+        systems. Crops come from header_index.intervals (this header -> next
+        furniture header, spanning pages as strips); images came from
+        qp.union_block_headers_on_page, page by page, with a cross-page
+        "carry" to bridge the gap between them. The carry only exists because
+        the image pass never saw the intervals.
+
+        A figure whose (page, y) lies inside a block's strip is inside that
+        block by construction -- the same geometric fact the crop itself rests
+        on, and the same one a reader uses. Claiming it here means:
+          * a figure printed ABOVE its question's stem, with the "Question N:"
+            header at the bottom of the previous page, belongs to that
+            question with no carry involved (OPH-001 q12);
+          * one header system instead of two, so text and figures cannot
+            disagree about where a block starts.
+
+        Conservative by construction: a figure inside TWO intervals (overlap)
+        or inside NONE is left alone for the existing per-page passes, which
+        stay as the safety net rather than the primary path.
+
+        Returns the images still unclaimed."""
+        intervals = self._all_intervals()
+        if not intervals or not imgs:
+            return list(imgs)
+        try:
+            pos = qp.image_positions_on_page(self.pdf, page)
+        except Exception:
+            return list(imgs)
+        if not pos:
+            return list(imgs)
+        leftover = []
+        for rel in imgs:
+            try:
+                oid = int(Path(rel).stem.rsplit("-", 1)[-1])
+            except (ValueError, IndexError):
+                leftover.append(rel)
+                continue
+            info = pos.get(oid)
+            if info is None:
+                leftover.append(rel)
+                continue
+            y_img = info[0]
+            h = info[4] if len(info) > 4 else 0
+            if h and y_img + h < y_img:
+                y_img = y_img + h        # bottom edge, flip-normalised
+            hits = sorted({(kind, qn) for kind, qn, iv in intervals
+                           if header_index.interval_contains_point(iv, page,
+                                                                   y_img)})
+            if len(hits) != 1:
+                # 0 -> outside every block (page furniture, a full-page
+                # plate). 2+ -> the intervals overlap here, so the geometry
+                # does not decide. Both go to the fallback passes.
+                leftover.append(rel)
+                continue
+            kind, qn = hits[0]
+            if qn not in chapter_records:
+                leftover.append(rel)
+                continue
+            new_rel = qp._rename_for_slot(
+                rel, qn, kind, self.subject, self.chapter_no,
+                image_files_by_q, claim_source=qp.INTERVAL_CLAIM_SOURCE,
+                confidence="high",
+                evidence=f"figure at y={y_img:.1f} on page {page} lies inside "
+                         f"{kind} q{qn}'s crop interval")
+            if not new_rel:
+                leftover.append(rel)
+                continue
+            entry = image_files_by_q.setdefault(
+                qn, {"question": [], "solution": []})
+            entry.setdefault("option", {})
+            if new_rel not in entry[kind]:
+                entry[kind].append(new_rel)
+            qid = f"{self.subject}-{self.chapter_no:03d}-{qn:03d}"
+            print(f"  [IMG] page {page}: crop interval -> {rel} -> {qid} "
+                  f"({kind})")
+        return leftover
+
     def _image_pass(self, ch_first, ch_last, page_section, chapter_records,
                     image_files_by_q):
         """Walk the chapter's pages once, in order. L1 geometry claim -> L2
@@ -3015,8 +3116,12 @@ class ChapterRunner:
             if imgs:
                 pos = qp.image_positions_on_page(self.pdf, page)
                 ordered = qp._order_imgs_by_position(imgs, pos)
+                # RUN-39: the crop interval decides first. Whatever it cannot
+                # prove falls through to the per-page passes below, unchanged.
+                leftover = self._claim_images_by_interval(
+                    page, ordered, chapter_records, image_files_by_q)
                 leftover = qp.claim_page_images(
-                    ordered, self.pdf, page, self.subject, self.chapter_no,
+                    leftover, self.pdf, page, self.subject, self.chapter_no,
                     chapter_records, image_files_by_q,
                     active_block=active_block, section=page_section.get(page))
                 leftover = qp.claim_block_images_ocr(
@@ -3289,6 +3394,7 @@ class ChapterRunner:
             _attrib = qp.image_attribution_summary(self.chapter_id)
             _share = _attrib["carry_share"]
             print(f"  [IMG] {self.chapter_id}: attribution "
+                  f"{_attrib['interval']} crop-interval / "
                   f"{_attrib['positional']} block-position / "
                   f"{_attrib['carry']} carry / {_attrib['model']} model / "
                   f"{_attrib['unclaimed']} unclaimed"

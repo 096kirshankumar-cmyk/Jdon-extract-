@@ -1427,6 +1427,12 @@ CARRY_SEED_LOOKBACK_PAGES = 3
 # Carry claims may reach the model ceiling; plain same-page positional claims
 # still stop at the strict cap.
 CARRY_CLAIM_SOURCE = "positional_carry"
+# RUN-39: the figure lies inside a CROP INTERVAL -- the same block extent the
+# text was cut from. This is the strongest deterministic claim there is: the
+# block boundary is the one the reader sees, and it spans pages, so a figure
+# above its question's stem (header on the previous page) is proven without
+# any carry. See boundary_phased.ChapterRunner._claim_images_by_interval.
+INTERVAL_CLAIM_SOURCE = "interval"
 # BUG 7B: a carry that crossed more than this many pages without a new
 # printed heading is too weak to auto-attach (image-heavy books).
 MAX_CARRY_PAGES = 1
@@ -2391,7 +2397,10 @@ def _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q,
         # deterministic same-page geometry is the strongest claim; a carry
         # spans a page edge; a model verdict is medium unless it declared
         # its own confidence (full_page_vision passes it via `confidence`).
+        # An interval claim is the strongest of all: the figure sits inside
+        # the very block extent the text was cut from.
         confidence = {"positional": "high",
+                      INTERVAL_CLAIM_SOURCE: "high",
                       CARRY_CLAIM_SOURCE: "medium"}.get(claim_source, "medium")
     _record_image_ownership(subject, chapter_id, src_page, rel, qid, kind,
                             claim_source,
@@ -3097,6 +3106,7 @@ def image_attribution_summary(chapter_id):
             pass
 
     carry = by_method.get(CARRY_CLAIM_SOURCE, 0)
+    interval = by_method.get(INTERVAL_CLAIM_SOURCE, 0)
     positional = by_method.get("positional", 0) + \
         by_method.get("deterministic_geometry", 0) + \
         by_method.get("deterministic_ocr_geometry", 0)
@@ -3105,6 +3115,7 @@ def image_attribution_summary(chapter_id):
     claimed_total = sum(by_method.values())
     return {"claimed_by_method": by_method,
             "carry": carry,
+            "interval": interval,
             "positional": positional,
             "model": model,
             "claimed_total": claimed_total,
