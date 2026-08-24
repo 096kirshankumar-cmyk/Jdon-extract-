@@ -984,29 +984,103 @@ class ChapterRunner:
         return res
 
     # -- Phase extraction helper ---------------------------------------------
+    _HEALTH_RANK = {"CLEAN": 3, "DEGRADED": 2, "GARBLED": 1, "EMPTY": 0}
+
     def _geom_item_from_interval(self, iv, label):
-        """CLEAN text-layer parse of one header interval. None if not usable."""
-        blobs = []
-        for st in iv.get("strips") or []:
+        """Deterministic parse of one crop: PDF text layer first, OCR of the
+        same rendered strips when that layer is not CLEAN. Returns the parsed
+        item or None, and tallies the outcome on self._geom_stats.
+
+        RUN-32 (OPH-001 live): this used to bail unless the text layer read
+        CLEAN, and the run logged geom_ok=0 on all 46 crops -- every question
+        and solution went to Gemini, with no way to tell an absent text layer
+        from a too-strict health check or a plain parse miss. The fallback and
+        the tally go in together: the fallback recovers what it can, the tally
+        reports what is still being lost and why.
+
+        An OCR result is held to the SAME completeness bar as a text-layer one
+        (_crop_item_shippable). OCR of a medical diagram is noisy, and on an
+        18k-question book with no human review a structurally incomplete item
+        must fall through to Gemini rather than ship half-read."""
+        stats = getattr(self, "_geom_stats", None)
+        if stats is None:
+            stats = self._geom_stats = {}
+
+        def _tally(key):
+            stats[key] = stats.get(key, 0) + 1
+
+        strips = iv.get("strips") or []
+        if not strips:
+            _tally("no_strips")
+            return None
+
+        # Worst health across the strips decides usability -- one garbled page
+        # in a multi-page block makes the joined blob unusable anyway.
+        worst, blobs = "CLEAN", []
+        for st in strips:
             try:
                 txt = qp.pdftotext_page(self.pdf, st["page"]) or ""
             except Exception:
                 txt = ""
             h = header_index.text_layer_health(txt)
-            if h in ("EMPTY", "GARBLED"):
-                return None
+            if self._HEALTH_RANK.get(h, 0) < self._HEALTH_RANK.get(worst, 3):
+                worst = h
             blobs.append(txt)
-        blob = "\n".join(blobs)
-        if header_index.text_layer_health(blob) != "CLEAN":
+
+        def _parse(text):
+            if label == "Question":
+                return crop_parse.parse_question_text(text, iv["n"])
+            if label == "Solution":
+                return crop_parse.parse_solution_text(text, iv["n"])
             return None
-        if label == "Question":
-            return crop_parse.parse_question_text(blob, iv["n"])
-        if label == "Solution":
-            return crop_parse.parse_solution_text(blob, iv["n"])
+
+        if worst == "CLEAN":
+            it = _parse("\n".join(blobs))
+            if it and self._crop_item_shippable(it, label):
+                _tally("text")
+                return it
+            # The text layer was readable but the parse found no complete
+            # item. That is a crop_parse coverage gap, NOT a missing-text
+            # problem -- OCR would not help, so do not spend 1-2s per crop.
+            _tally("text_clean_parse_missed")
+            return None
+
+        ocr_blobs = []
+        # Neither io nor Image is a module-level name in this file -- both are
+        # imported locally (see _call_crops). An unresolved name here would be
+        # swallowed by the except below and silently masquerade as
+        # "tesseract found nothing", which is exactly how this shipped once
+        # before the regression test caught it.
+        import io
+        from PIL import Image
+        for st in strips:
+            try:
+                raw = _crop_strip_png(self.pdf, st["page"], st["y_hi"],
+                                      st["y_lo"], dpi=150)
+            except Exception:
+                raw = None
+            if not raw:
+                continue
+            try:
+                ocr_blobs.append(qp.ocr_crop_text(Image.open(io.BytesIO(raw))))
+            except Exception:
+                continue
+        ocr_text = "\n".join(t for t in ocr_blobs if t).strip()
+        if not ocr_text:
+            _tally(f"text_{worst.lower()}_no_ocr")
+            return None
+        it = _parse(ocr_text)
+        if it and self._crop_item_shippable(it, label):
+            _tally("ocr")
+            return it
+        _tally(f"text_{worst.lower()}_ocr_parse_missed")
         return None
 
     def _extract_from_crops(self, ivals, prompt_tmpl, label, pass_name, dpi=130):
         """Geometric CLEAN parse first; Gemini only leftover crops (max 4)."""
+        # RUN-32: the tally is per-phase, so reset it before this phase's
+        # crops are read and report it with the split.
+        self._geom_stats = {}
         out = []
         leftover = []
         for iv in ivals:
@@ -1023,10 +1097,14 @@ class ChapterRunner:
         # Always report the split (run-30): it used to print only when
         # something needed Gemini, so a fully geometric phase -- the best
         # possible outcome, zero tokens -- looked identical to a phase that
-        # never ran the crop path at all.
+        # never ran the crop path at all. RUN-32 adds the WHY: geom_ok=0 told
+        # us nothing was being parsed deterministically but not whether the
+        # text layer was missing, unreadable, or merely unparseable.
+        _why = " ".join(f"{k}={v}" for k, v in
+                        sorted((self._geom_stats or {}).items())) or "-"
         print(f"[BPH] {self.chapter_id}: {pass_name} crops={len(ivals)} "
               f"geom_ok={len(out)} (0 Gemini calls) "
-              f"gemini_crops={len(leftover)}")
+              f"gemini_crops={len(leftover)} | why: {_why}")
         batchable, singles = [], []
         for iv in leftover:
             if self._crop_is_batchable(iv, label, leftover):
@@ -2153,7 +2231,21 @@ class ChapterRunner:
 
         have = {i.get("_qn") for i in items if _content_ok(i)}
         missing_pages = {}
-        for p in zone_pages:
+        # RUN-32: scan the pages the CROPS actually covered, not just the
+        # clamped zone. _resolve_zones clamps every zone at ch_last, but
+        # detect_boundaries scans ch_last+2 and header_index.intervals closes
+        # the last block at file_end -- so a block whose header sits just past
+        # the chapter's last page IS cropped and sent to Gemini, yet the old
+        # `for p in zone_pages` loop never saw that page and never re-asked.
+        # OPH-001 q23: a header-only solution ("Solution to Question 23:")
+        # sanitized to empty and shipped as missing_solution with no retry.
+        scan_pages = list(zone_pages or [])
+        for iv in (self._visual_intervals(phase_name) or []):
+            for st in (iv.get("strips") or []):
+                pg = st.get("page")
+                if pg is not None and pg not in scan_pages:
+                    scan_pages.append(pg)
+        for p in scan_pages:
             for qn in (hdrs.get(p) or set()):
                 if qn not in have:
                     missing_pages.setdefault(qn, p)
@@ -2163,10 +2255,14 @@ class ChapterRunner:
         if not missing_pages:
             return items
         qns = sorted(missing_pages)
+        # RUN-32: clamp at the last page the CROPS covered, not max(zone_pages)
+        # -- otherwise a re-ask for a block past the chapter end had its page
+        # window clamped back inside the zone and re-read the wrong page.
+        _hi = max(scan_pages) if scan_pages else max(zone_pages)
         pages = sorted({p for qn in qns
                         for p in range(missing_pages[qn],
                                        min(missing_pages[qn] + 1,
-                                           max(zone_pages)) + 1)})
+                                           _hi) + 1)})
         self.notes.append(f"{phase_name}: printed headers prove missing/"
                           f"empty block(s) q{qns} -- targeted re-ask on "
                           f"{pages}")

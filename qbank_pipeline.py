@@ -2769,6 +2769,31 @@ def ocr_page_anchors_xy(png, scale, page_h_pt):
     return []
 
 
+def ocr_crop_text(png):
+    """Plain reading-order text of a rendered crop strip. '' when the
+    tesseract binary is missing or OCR yields nothing.
+
+    RUN-32 (OPH-001 live): the run logged `geom_ok=0` on all 46 crops, so
+    every question and solution fell through to Gemini even though the crop
+    path was working. _geom_item_from_interval bails unless the PDF text
+    layer reads CLEAN, and on a book with a garbled or absent text layer that
+    is every page. The SAME rendered pixels already OCR well enough for this
+    module to find header anchors, so the body text is available too -- it
+    just was never asked for. psm 6 (uniform block) then psm 4 (single
+    column); psm 11 sparse is skipped because it scrambles reading order,
+    which matters when options are parsed line by line."""
+    if not shutil.which("tesseract"):
+        return ""
+    for cfg in ("--psm 6", "--psm 4"):
+        try:
+            txt = pytesseract.image_to_string(png, config=cfg)
+        except Exception:
+            continue
+        if (txt or "").strip():
+            return txt
+    return ""
+
+
 
 
 
