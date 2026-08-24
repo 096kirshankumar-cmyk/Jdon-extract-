@@ -106,6 +106,70 @@ class TestSanitizeStripsFurniture(unittest.TestCase):
         self.assertFalse(any("page-furniture" in n for n in notes), notes)
 
 
+class TestForeignSolutionHeadIsDropped(unittest.TestCase):
+    """RUN-36. OPH-001 q4 shipped READY with q3's explanation prepended:
+
+        "Uveal melanomas arise from uveal melanocytes...   <- q3's text
+
+         Solution to Question 4:
+
+         The macula is fully developed by 4-6 months of age..."
+
+    The crop bled over the page break. sanitize only stripped a LEADING
+    header, so the foreign head survived and nothing flagged it."""
+
+    Q3_TEXT = ("Uveal melanomas arise from uveal melanocytes. Uveal and "
+               "conjunctival melanocytes are derived from the neural crest "
+               "cells.")
+    Q4_TEXT = ("The macula is fully developed by 4-6 months of age. Apart "
+               "from the macula, the rest of the retina is fully developed "
+               "at birth.")
+
+    def _bled(self):
+        return (self.Q3_TEXT + "\n\nSolution to Question 4:\n\n" + self.Q4_TEXT)
+
+    def test_foreign_head_is_dropped_when_the_header_names_this_question(self):
+        out, notes = qp.sanitize_solution_text(self._bled(), own_qn=4)
+        self.assertNotIn("Uveal melanomas", out)
+        self.assertTrue(out.startswith("The macula is fully developed"))
+        self.assertIn("4-6 months", out)
+        self.assertTrue(any("PREVIOUS question" in n for n in notes), notes)
+
+    def test_a_neighbours_header_is_never_used_to_cut(self):
+        """If the embedded header names a DIFFERENT question, the old
+        conservative behaviour must stand -- we cannot prove which side is
+        ours, so nothing is cut."""
+        text = ("The macula is fully developed by 4-6 months of age and the "
+                "rest of the retina is developed at birth in the normal eye.\n"
+                "Solution to Question 5:\nThe optic groove appears by 3 weeks.")
+        out, notes = qp.sanitize_solution_text(text, own_qn=4)
+        self.assertIn("macula is fully developed", out)
+        self.assertIn("optic groove", out)
+        self.assertTrue(any("needs model/review" in n for n in notes), notes)
+
+    def test_duplicate_dump_still_truncates_to_the_head(self):
+        """The run-4 behaviour must survive: a re-recited dump is cut."""
+        text = ("The optic groove appears by 3 weeks in the developing "
+                "forebrain of the embryo at about day 22 of gestation.\n"
+                "Solution to Question 5:\nThe optic groove appears by 3 "
+                "weeks in the developing forebrain of the embryo.")
+        out, notes = qp.sanitize_solution_text(text, own_qn=9)
+        self.assertTrue(out.startswith("The optic groove appears by 3 weeks"))
+        self.assertTrue(any("duplicated" in n for n in notes), notes)
+
+    def test_own_header_match_wins_over_the_duplicate_rule(self):
+        """Same-qn takes priority: even if the tail looks like a repeat, the
+        header naming this question is the stronger evidence."""
+        text = (self.Q3_TEXT + "\n\nSolution to Question 4:\n" + self.Q3_TEXT)
+        out, _ = qp.sanitize_solution_text(text, own_qn=4)
+        self.assertEqual(out.strip(), self.Q3_TEXT)
+
+    def test_without_own_qn_nothing_is_cut(self):
+        out, notes = qp.sanitize_solution_text(self._bled(), own_qn=None)
+        self.assertIn("Uveal melanomas", out)
+        self.assertTrue(any("needs model/review" in n for n in notes), notes)
+
+
 class TestOcrNoiseNote(unittest.TestCase):
     def test_normal_prose_is_not_flagged(self):
         self.assertIsNone(qp._ocr_noise_note(REAL_SHORT_SOLUTION, "solution"))

@@ -1781,12 +1781,36 @@ def sanitize_solution_text(text, own_qn=None):
     if m and m.start() > 0:
         head = s[:m.start()].rstrip()
         tail = s[m.end():].lstrip(" :\n")
-        # The precise dump proof: the chunk IMMEDIATELY after the header
-        # restates THIS solution's own earlier content (the model re-recited
-        # this question before dumping its neighbours). Neighbour content
-        # further down the tail is never judged -- only the first line.
+        # RUN-36 (OPH-001 q4 live): the crop for this block bled over the page
+        # break and picked up the PREVIOUS question's explanation, so the
+        # record read
+        #     "Uveal melanomas arise from uveal melanocytes...   <- q3's
+        #
+        #      Solution to Question 4:
+        #
+        #      The macula is fully developed by 4-6 months..."
+        # When the embedded header names THIS question, everything before it
+        # cannot be this question's solution -- the book prints that header as
+        # the start of the explanation. Drop the head. This is deterministic,
+        # not a guess, and it shipped as qa_status=READY before: the old code
+        # only stripped a LEADING header, so a foreign head survived silently.
+        try:
+            hdr_qn = int(m.group(1))
+        except (TypeError, ValueError):
+            hdr_qn = None
         tail_first = tail.split("\n", 1)[0][:150]
-        if head and tail_first and _frag_mostly_present(tail_first, head, 0.8):
+        if head and own_qn is not None and hdr_qn == int(own_qn):
+            s = tail
+            notes.append(
+                f"dropped {len(head)} chars of the PREVIOUS question's "
+                f"solution that bled into this crop (embedded 'Solution to "
+                f"Question {hdr_qn}' header names this question)")
+        elif head and tail_first and _frag_mostly_present(tail_first, head, 0.8):
+            # The precise dump proof: the chunk IMMEDIATELY after the header
+            # restates THIS solution's own earlier content (the model
+            # re-recited this question before dumping its neighbours).
+            # Neighbour content further down the tail is never judged -- only
+            # the first line.
             s = head
             notes.append(f"truncated duplicated 'Solution to Question {m.group(1)}' dump")
         else:
