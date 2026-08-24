@@ -379,6 +379,67 @@ def widen_interval_to_next_header(iv, recs):
     return iv
 
 
+_TIE_PAD_PT = 14.0
+
+
+def intervals_covering_point(recs, page, y, kinds=None):
+    """All Q/S intervals whose strip contains (page, y). Furniture-only."""
+    kinds = kinds or (T_QUESTION, T_SOLUTION)
+    hits = []
+    for typ in kinds:
+        for iv in intervals(recs, typ):
+            if interval_contains_point(iv, page, y):
+                kind = "question" if typ == T_QUESTION else "solution"
+                hits.append((kind, int(iv["n"]), iv))
+    return hits
+
+
+def boundary_tie_owner(recs, page, y, chapter_records=None, image_files_by_q=None):
+    """Spec 3: Y ambiguous across adjacent intervals.
+
+    Prefer the interval whose owner has 0 images AND has_figure_in_solution
+    (or has_figure_in_question). Still 2+ after that → None (review, no guess).
+    Unique cover → that owner. Zero cover → None.
+    """
+    hits = intervals_covering_point(recs, page, y)
+    # Also treat "within pad of a furniture header" as a tie even if only
+    # one strip formally contains the point.
+    near_header = []
+    for r in recs or []:
+        if r.get("type") not in FURNITURE or not r.get("n"):
+            continue
+        if int(r["page"]) != int(page):
+            continue
+        if abs(float(r["y"]) - float(y)) <= _TIE_PAD_PT:
+            kind = "question" if r["type"] == T_QUESTION else "solution"
+            near_header.append((kind, int(r["n"])))
+    if len(hits) <= 1 and not near_header:
+        return hits[0][:2] if hits else None
+    # Candidates = covering intervals; if near a header, include both sides.
+    cands = {(k, n) for k, n, _iv in hits}
+    for k, n in near_header:
+        cands.add((k, n))
+        # neighbour n-1 of same kind often owns the body above the header
+        if n > 1:
+            cands.add((k, n - 1))
+    if len(cands) == 1:
+        return next(iter(cands))
+    recs_map = chapter_records or {}
+    files = image_files_by_q or {}
+    preferred = []
+    for kind, n in cands:
+        rec = recs_map.get(n) or {}
+        entry = files.get(n) or {}
+        flag = ("has_figure_in_solution" if kind == "solution"
+                else "has_figure_in_question")
+        empty = not (entry.get(kind) or [])
+        if rec.get(flag) and empty:
+            preferred.append((kind, n))
+    if len(preferred) == 1:
+        return preferred[0]
+    return None  # still ambiguous — flag, never guess
+
+
 def owner_of_point(recs, page, y):
     """Closest heading ABOVE (y) on this page, else open interval from prev page.
 

@@ -436,6 +436,10 @@ Rules:
   BILKUL mat nikaalo, chahe page pe dikh bhi jaye.
 - Figure/diagram ho to location note karo (page + position), "has_figure: true" 
   mark karo.
+- Crop mein figure JAISAA printed hai waisa hi dikhega — mat ignore. Jahan
+  image visually padti hai wahan text mein exactly `[IMG]` token daalo
+  (reading order). Coordinates se merge mat karo. `[IMG]` count = jitni
+  figures is interval mein dikhti hain.
 - Numbering exactly page ke jaisa follow karo, skip/merge mat karo.
 - options hamesha OBJECT (map) me do: {{"A": "...", "B": "...", "C": "...", 
   "D": "..."}} — LIST kabhi nahi. Printed letters lowercase (a/b/c/d) hain to 
@@ -484,6 +488,9 @@ ka hissa hai — proximity/layout se decide mat karo, sirf number-marker se.
 
 Task: Har solution extract karo — number, poora explanation (pre+post image 
 text merged), figure location agar hai.
+- Figure crop ke andar printed jagah pe text mein `[IMG]` token daalo
+  (reading order). Image hata ke alag se mat socho. Multi-page interval
+  = part 1..N same item. `[IMG]` count = us interval ki figures.
 
 ONLY respond in this JSON format:
 [
@@ -2801,6 +2808,8 @@ class ChapterRunner:
         if relink_notes:
             print(f"  [IMG] resume-relink restored {len(relink_notes)} "
                   f"previously-claimed figure(s)")
+        qp.flag_high_image_counts(chapter_records, image_files_by_q)
+        qp.apply_img_placeholder_reconcile(chapter_records, image_files_by_q)
         try:
             chapter_anchor_idx = qp.chapter_anchor_pages(
                 self.pdf, page_numbers, chapter_records,
@@ -3184,4 +3193,3 @@ if __name__ == "__main__":
     res = run_chapter(sys.argv[1], sys.argv[2], int(sys.argv[3]),
                       qp.OUTPUT_ROOT, state=_state)
     print(json.dumps(res, ensure_ascii=False, indent=2, default=str))
-

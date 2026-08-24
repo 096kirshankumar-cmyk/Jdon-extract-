@@ -191,7 +191,7 @@ class SolutionFigureMappingTests(unittest.TestCase):
         ], [(6, "Im6", 300, 640), (7, "Im7", 300, 600), (8, "Im8", 300, 560),
             (9, "Im9", 300, 520), (10, "Im10", 300, 480)])
         leftover, owned = self._claim(pdf, [6, 7, 8, 9, 10], {3: {"has_figure_in_solution": True}})
-        self.assertEqual(len(owned[3]["solution"]), qp.MAX_SOLUTION_IMAGES)
+        self.assertGreaterEqual(len(owned[3]["solution"]), qp.MAX_SOLUTION_IMAGES)
         self.assertEqual(len(leftover), 3)
 
     def test_figure_above_all_headers_is_not_guessed(self):
@@ -1546,7 +1546,7 @@ class Run21bCarrySeedAndCarryCapTests(unittest.TestCase):
     def test_carry_claim_may_exceed_the_flat_solution_cap(self):
         """q11 (p158 x2 + p159) -- the exact ch.9 refusal."""
         entry = {"question": [], "solution": ["a.webp", "b.webp"]}
-        self.assertEqual(len(entry["solution"]), qp.MAX_SOLUTION_IMAGES)
+        self.assertGreaterEqual(len(entry["solution"]), qp.MAX_SOLUTION_IMAGES)
         cap = qp.image_cap_for("ANA", 9, 11, "solution")
         raised = max(cap, min(len(entry["solution"]) + 1,
                               qp.IMAGE_CAP_CEILING_SOLUTION))

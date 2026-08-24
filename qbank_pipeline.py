@@ -2182,75 +2182,15 @@ def _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q,
                                 confidence="high", outcome="refused_tiny",
                                 obj_id=src_oid)
         return None
-    # Over-attribution guard (run-4: PSY-022-003 collected 7 question-side
-    # images through repeated model-confirmed passes -- every pass was
-    # individually reasonable, the SUM was nonsense). One question in this
-    # book never legitimately cites >3 figures.
-    #
-    # run-21: the cap is DYNAMIC. A deterministic (positional/OCR) claim still
-    # stops at MAX_QUESTION_IMAGES; a claim the model declared from the
-    # printed page may go up to IMAGE_CAP_CEILING_QUESTION, because a real
-    # question CAN cite 4-6 figures and refusing those was losing content.
-    if kind == "question":
-        cap = image_cap_for(subject, chapter_no, qn, "question")
-        # BUG 7C: a same-page positional heading is high-confidence -- allow
-        # up to the ceiling (genuine 5-6 figure solutions). Carry stays at
-        # the flat cap (weak guess). Model claims may still lift to ceiling.
-        if claim_source == "positional":
-            cap = MAX_QUESTION_IMAGES
-        elif claim_source in MODEL_CLAIM_SOURCES:
-            cap = max(cap, min(len(entry["question"]) + 1,
-                               IMAGE_CAP_CEILING_QUESTION))
-        if len(entry["question"]) >= cap:
-            _warn_key = ("overattr", qid, "question", rel)
-            if _warn_key not in _UNION_DROP_LOGGED:
-                _UNION_DROP_LOGGED.add(_warn_key)
-                print(f"  [WARN] over-attribution guard: {qid} already has "
-                      f"{len(entry['question'])} question images (cap {cap}, "
-                      f"source {claim_source}) -- refusing {rel}; left for review")
-            _record_image_ownership(subject, chapter_id, src_page, rel, qid,
-                                    kind, claim_source,
-                                    evidence or f"cap {cap} reached "
-                                    f"({len(entry['question'])} question images)",
-                                    confidence="high", outcome="refused_cap",
-                                    obj_id=src_oid)
-            return None
-        if cap > MAX_QUESTION_IMAGES:
-            _declared_image_allowance[
-                _allowance_key(subject, chapter_no, qn, "question")] = cap
-            print(f"  [IMG] dynamic cap: {qid} question images raised to {cap} "
-                  f"({claim_source} declared this owner)")
-    # Same guard on the solution side (user report: a 7-figure solutions page
-    # collapsed into 2 solutions because a single decoded header swallowed
-    # every image under it). A solution block legitimately cites a figure or
-    # two; beyond that the deterministic matcher is stacking neighbours'
-    # figures -- refuse and let the model/manual pass decide on content.
-    if kind == "solution":
-        cap = image_cap_for(subject, chapter_no, qn, "solution")
-        if claim_source == "positional":
-            cap = MAX_SOLUTION_IMAGES
-        elif claim_source in MODEL_CLAIM_SOURCES:
-            cap = max(cap, min(len(entry["solution"]) + 1,
-                               IMAGE_CAP_CEILING_SOLUTION))
-        if len(entry["solution"]) >= cap:
-            _warn_key = ("overattr", qid, "solution", rel)
-            if _warn_key not in _UNION_DROP_LOGGED:
-                _UNION_DROP_LOGGED.add(_warn_key)
-                print(f"  [WARN] over-attribution guard: {qid} already has "
-                      f"{len(entry['solution'])} solution images (cap {cap}, "
-                      f"source {claim_source}) -- refusing {rel}; left for review")
-            _record_image_ownership(subject, chapter_id, src_page, rel, qid,
-                                    kind, claim_source,
-                                    evidence or f"cap {cap} reached "
-                                    f"({len(entry['solution'])} solution images)",
-                                    confidence="high", outcome="refused_cap",
-                                    obj_id=src_oid)
-            return None
-        if cap > MAX_SOLUTION_IMAGES:
-            _declared_image_allowance[
-                _allowance_key(subject, chapter_no, qn, "solution")] = cap
-            print(f"  [IMG] dynamic cap: {qid} solution images raised to {cap} "
-                  f"({claim_source} declared this owner)")
+    # No hard image-count cap (2026-08-24). Geometry owns the file: if this
+    # caller proved an interval, every figure in that interval ships. A 6-
+    # figure solution is real data; refusing the 3rd+ was data loss. Outliers
+    # get a soft review_suggested flag later — never refused_cap.
+    if kind in ("question", "solution"):
+        n_have = len(entry.get(kind) or [])
+        if n_have >= 8:
+            print(f"  [IMG] {qid} {kind} already has {n_have} images; "
+                  f"still claiming {rel} (no cap, will flag high_image_count)")
     if kind == "option":
         opt = str(option_letter or "A").strip().upper()
         bucket = entry["option"].setdefault(opt, [])
@@ -3921,7 +3861,10 @@ def try_reassign_cap_hit(rel, page, y_img, chapter_records, image_files_by_q,
         return None
     q_ivals = {iv["n"]: iv for iv in hi.intervals(visual_recs or [], hi.T_QUESTION)}
     s_ivals = {iv["n"]: iv for iv in hi.intervals(visual_recs or [], hi.T_SOLUTION)}
-    guess = hi.owner_of_point(visual_recs or [], page, y_img)
+    guess = hi.boundary_tie_owner(
+        visual_recs or [], page, y_img, chapter_records, image_files_by_q)
+    if guess is None:
+        guess = hi.owner_of_point(visual_recs or [], page, y_img)
     seeds = []
     if guess:
         seeds.append(int(guess[1]))
@@ -3960,6 +3903,70 @@ def try_reassign_cap_hit(rel, page, y_img, chapter_records, image_files_by_q,
                           f"(neighbour interval)")
                     return new_rel
     return None
+
+
+_IMG_PLACEHOLDER_RE = re.compile(r"\[IMG\]", re.I)
+
+
+def count_img_placeholders(text):
+    return len(_IMG_PLACEHOLDER_RE.findall(text or ""))
+
+
+def reconcile_img_placeholders(text, n_files):
+    """Match [IMG] tokens to geometrically owned files by COUNT only.
+
+    Equal -> ok (files already reading-order). Unequal -> conflict note.
+    Never insert/delete tokens to force a match.
+    """
+    n_tok = count_img_placeholders(text)
+    n_files = int(n_files or 0)
+    if n_tok == n_files:
+        return True, ""
+    return False, (f"img_placeholder_count_mismatch: text has {n_tok} [IMG] "
+                   f"token(s), interval owns {n_files} file(s)")
+
+
+def flag_high_image_counts(chapter_records, image_files_by_q):
+    """Soft review_suggested: high_image_count. Never drop files."""
+    counts = []
+    for qn, rec in (chapter_records or {}).items():
+        entry = (image_files_by_q or {}).get(qn) or {}
+        nq = len(entry.get("question") or [])
+        ns = len(entry.get("solution") or [])
+        counts.append(nq + ns)
+    if not counts:
+        return
+    avg = sum(counts) / max(len(counts), 1)
+    # Far above chapter average, or a historically-absurd single-side pile.
+    thresh = max(avg * 3.0, 6.0)
+    for qn, rec in (chapter_records or {}).items():
+        entry = (image_files_by_q or {}).get(qn) or {}
+        nq = len(entry.get("question") or [])
+        ns = len(entry.get("solution") or [])
+        total = nq + ns
+        if total >= thresh or ns >= 6 or nq >= 8:
+            reasons = list(rec.get("_review_reasons") or [])
+            note = f"review_suggested: high_image_count (q={nq} s={ns} ch_avg={avg:.1f})"
+            if note not in reasons:
+                reasons.append(note)
+            rec["_review_reasons"] = reasons
+            rec["_review_suggested"] = "high_image_count"
+            print(f"  [IMG] {note} on q{qn} — data kept, not dropped")
+
+
+def apply_img_placeholder_reconcile(chapter_records, image_files_by_q):
+    for qn, rec in (chapter_records or {}).items():
+        entry = (image_files_by_q or {}).get(qn) or {}
+        reasons = list(rec.get("_review_reasons") or [])
+        for side, field in (("question", "question_text"),
+                            ("solution", "solution_text")):
+            ok, note = reconcile_img_placeholders(
+                rec.get(field), len(entry.get(side) or []))
+            if not ok:
+                if note not in reasons:
+                    reasons.append(note)
+                print(f"  [IMG] q{qn} {side}: {note}")
+        rec["_review_reasons"] = reasons
 
 
 def _record_unresolved_image(subject, chapter_id, page, rel, reason,

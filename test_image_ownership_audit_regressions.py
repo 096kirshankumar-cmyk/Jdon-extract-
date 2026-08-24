@@ -270,13 +270,12 @@ class TestCarryFixed(AuditEnv):
         leftover = qp.claim_page_images(imgs, PDF, 483, SUBJECT, CH_NO,
                                         records, by_q,
                                         active_block=("question", 6))
-        self.assertEqual(len(by_q[6]["question"]), qp.MAX_QUESTION_IMAGES,
-                         "carry claims must stop at the same flat cap as "
-                         "positional claims")
-        self.assertIn("OPH/OPH-p483-104.webp", leftover,
-                      "the 4th carry image must flow to review, not stack on")
+        self.assertEqual(len(by_q[6]["question"]), 4,
+                         "no hard image-count cap: all geometrically owned "
+                         "figures ship")
+        self.assertEqual(leftover, [])
         refused = [r for r in self.ledger() if r.get("outcome") == "refused_cap"]
-        self.assertEqual(len(refused), 1)
+        self.assertEqual(len(refused), 0)
 
 
 # ============================================================================
