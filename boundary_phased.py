@@ -987,21 +987,26 @@ class ChapterRunner:
     _HEALTH_RANK = {"CLEAN": 3, "DEGRADED": 2, "GARBLED": 1, "EMPTY": 0}
 
     def _geom_item_from_interval(self, iv, label):
-        """Deterministic parse of one crop: PDF text layer first, OCR of the
-        same rendered strips when that layer is not CLEAN. Returns the parsed
-        item or None, and tallies the outcome on self._geom_stats.
+        """Deterministic parse of one crop from the PDF TEXT LAYER only.
+        Returns the parsed item or None, and tallies the outcome on
+        self._geom_stats so the phase log says why a crop went to Gemini.
 
-        RUN-32 (OPH-001 live): this used to bail unless the text layer read
-        CLEAN, and the run logged geom_ok=0 on all 46 crops -- every question
-        and solution went to Gemini, with no way to tell an absent text layer
-        from a too-strict health check or a plain parse miss. The fallback and
-        the tally go in together: the fallback recovers what it can, the tally
-        reports what is still being lost and why.
+        RUN-34: an OCR fallback was added here in run-32 and is now REMOVED.
+        On OPH-001 it took geom_ok from 0 to 22/23 and cut Gemini calls from
+        46 to ~2 -- and the recovered text was unusable. Tesseract read the
+        page furniture as body copy:
 
-        An OCR result is held to the SAME completeness bar as a text-layer one
-        (_crop_item_shippable). OCR of a medical diagram is noisy, and on an
-        18k-question book with no human review a structurally incomplete item
-        must fall through to Gemini rather than ship half-read."""
+            q1 solution  "...leading to\\n12 Sold by @itachibot\\n\\nhypermetropia."
+            q3 solution  ". X"                    (whole explanation lost)
+            q6 solution  "...neural crest.\\nCmlistklianm Fm Pir tr rebkiana WM"
+            q2 stem      "oe SS «\\ni i ity?\\nAt what age would a child attain full a «"
+
+        Every one shipped as qa_status=READY, because _crop_item_shippable
+        checks structure (stem present + 4 options), not legibility. Gemini
+        reads the crop IMAGE and does not make these mistakes. Cheap-and-wrong
+        is the wrong trade for a book extracted 18,000 questions at a time
+        with nobody reviewing the output, so a crop whose text layer is not
+        CLEAN now falls through to Gemini exactly as it did before run-32."""
         stats = getattr(self, "_geom_stats", None)
         if stats is None:
             stats = self._geom_stats = {}
@@ -1027,53 +1032,26 @@ class ChapterRunner:
                 worst = h
             blobs.append(txt)
 
-        def _parse(text):
-            if label == "Question":
-                return crop_parse.parse_question_text(text, iv["n"])
-            if label == "Solution":
-                return crop_parse.parse_solution_text(text, iv["n"])
+        if worst != "CLEAN":
+            # Unreadable text layer -> hand the crop to Gemini, which reads
+            # the rendered image. Tally the health so a book that always
+            # lands here is visible in the log instead of silently spending
+            # a Gemini call per crop.
+            _tally(f"text_{worst.lower()}_to_gemini")
             return None
 
-        if worst == "CLEAN":
-            it = _parse("\n".join(blobs))
-            if it and self._crop_item_shippable(it, label):
-                _tally("text")
-                return it
-            # The text layer was readable but the parse found no complete
-            # item. That is a crop_parse coverage gap, NOT a missing-text
-            # problem -- OCR would not help, so do not spend 1-2s per crop.
-            _tally("text_clean_parse_missed")
+        if label == "Question":
+            it = crop_parse.parse_question_text("\n".join(blobs), iv["n"])
+        elif label == "Solution":
+            it = crop_parse.parse_solution_text("\n".join(blobs), iv["n"])
+        else:
             return None
-
-        ocr_blobs = []
-        # Neither io nor Image is a module-level name in this file -- both are
-        # imported locally (see _call_crops). An unresolved name here would be
-        # swallowed by the except below and silently masquerade as
-        # "tesseract found nothing", which is exactly how this shipped once
-        # before the regression test caught it.
-        import io
-        from PIL import Image
-        for st in strips:
-            try:
-                raw = _crop_strip_png(self.pdf, st["page"], st["y_hi"],
-                                      st["y_lo"], dpi=150)
-            except Exception:
-                raw = None
-            if not raw:
-                continue
-            try:
-                ocr_blobs.append(qp.ocr_crop_text(Image.open(io.BytesIO(raw))))
-            except Exception:
-                continue
-        ocr_text = "\n".join(t for t in ocr_blobs if t).strip()
-        if not ocr_text:
-            _tally(f"text_{worst.lower()}_no_ocr")
-            return None
-        it = _parse(ocr_text)
         if it and self._crop_item_shippable(it, label):
-            _tally("ocr")
+            _tally("text")
             return it
-        _tally(f"text_{worst.lower()}_ocr_parse_missed")
+        # Readable text but no complete item: a crop_parse coverage gap.
+        # Gemini gets the crop.
+        _tally("text_clean_parse_missed")
         return None
 
     def _extract_from_crops(self, ivals, prompt_tmpl, label, pass_name, dpi=130):
@@ -2812,12 +2790,29 @@ class ChapterRunner:
                 # shape/letter drift must NEVER crash the chapter and must
                 # NEVER pass silently: flag the row for human review.
                 reasons.append("options shape flagged: " + opt_issue)
+            # RUN-34: strip page furniture HERE, not later, so the master row
+            # and the split row both get the cleaned text. OPH-001 shipped
+            # "5 Sold by @itachibot" inside q7's stem and "12 Sold by
+            # @itachibot" between two clauses of q1's solution.
+            stem_txt, n_f = qp.strip_page_furniture(
+                str(q.get("stem") or "").strip())
+            sol_txt, n_fs = qp.strip_page_furniture(
+                str(srow.get("solution_text") or "").strip())
+            opt_txt = {}
+            for _k, _v in (opts or {}).items():
+                _cv, _n = qp.strip_page_furniture(str(_v or ""))
+                opt_txt[_k] = _cv
+                n_f += _n
+            if n_f or n_fs:
+                reasons.append(
+                    f"stripped {n_f + n_fs} page-furniture line(s) "
+                    f"(reseller stamp / publisher mark / page number)")
             records[qn] = {
                 "q_no": qn,
-                "question_text": str(q.get("stem") or "").strip(),
-                "options": opts,
+                "question_text": stem_txt,
+                "options": opt_txt,
                 "correct_option": amap.get(qn),
-                "solution_text": str(srow.get("solution_text") or "").strip(),
+                "solution_text": sol_txt,
                 "tables": qp._dedupe_tables(srow.get("tables") or []),
                 "has_figure_in_question": bool(q.get("has_figure")),
                 "has_figure_in_solution": bool(srow.get("has_figure")),

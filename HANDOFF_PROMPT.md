@@ -77,8 +77,14 @@ Flow, in order:
    strips, labelled `INTERVAL part i/N … START/CONTINUES` on the image itself.
 5. **Crop → text** — `_extract_from_crops` (`boundary_phased.py:1079`).
    Deterministic parse first (`_geom_item_from_interval`,
-   `boundary_phased.py:989`: PDF text layer, else OCR of the same strip via
-   `ocr_crop_text`, `qbank_pipeline.py:2772`). Gemini only for crops that fail.
+   `boundary_phased.py:989`) from the **PDF text layer only**. Gemini gets
+   every crop whose text layer is not CLEAN.
+
+   There was an OCR fallback here in run-32 and it was **removed in run-34**.
+   On OPH-001 it took `geom_ok` from 0 to 22/23 and cut Gemini calls from 46
+   to ~2 — and the recovered text was unusable: tesseract read the page
+   furniture as body copy (`"12 Sold by @itachibot"` inside a solution, one
+   solution reduced to `". X"`). Do not re-add it without a legibility gate.
 6. **Answer key** — whole pages, dual Gemini read.
 7. **Images** — geometric ownership, not model-guessed.
 8. **Gate + commit** — `_export_gate_violations` (`qbank_pipeline.py`), then
@@ -108,37 +114,56 @@ The `why:` breakdown keys mean:
 Book under test: **OPH**, chapter 1, file pages 3–22, 23 questions.
 The last full run's numbers are below.
 
-### Problem 1 — 5 truncated solutions (this is the priority)
+### Problem 1 — RESOLVED (run-34): the "5 truncated solutions" were a verifier false positive
+
+An earlier run reported:
 
 ```
-[GATE] OPH-001: 1 export-gate violation(s) -- NOT a clean export
-  - phase_unresolved None: solutions phase unresolved: ('exceeded attempts',
-    {'phase': 'Solution', 'total_entries_checked': 23, 'all_verified': False,
-     'mismatches': [
-       {'q_no': 3,  'issue': 'Solution text is missing the full explanation present on the page.', 'severity': 'genuine'},
-       {'q_no': 7,  ...}, {'q_no': 15, ...}, {'q_no': 22, ...}, {'q_no': 23, ...}]})
+phase_unresolved: solutions phase unresolved: ('exceeded attempts', ...
+  q3, q7, q15, q22, q23: 'Solution text is missing the full explanation present on the page.')
 ```
 
-5 of 23 solutions (22%) are incomplete, so the chapter can never be clean.
-The same 5 are the only ones that hit `SANITIZE … stripped leading 'Solution to
-Question N' header`, which suggests the parse boundary is involved.
+Reading the source PDF settled it: those explanations really are that short.
+q7's entire solution is one line ("The canal of Schlemm appears by the 4th
+month after conception.", 63 characters) and q3's is two. The Gemini verifier
+invented missing content. Nothing was truncated.
 
-All 23 solutions came from the deterministic path (`S crops=23 geom_ok=23 |
-why: ocr=23`), so **you can reproduce this with zero Gemini calls**.
+Two permanent guards came out of it:
 
-Two candidate causes — separate them, do not guess:
+- `MIN_SOLUTION_CHARS = 20` in `qbank_pipeline.py`. OPH-001 q3 shipped `". X"`
+  as its whole explanation and passed, because `missing_solution` only tested
+  for an empty string. The book's shortest real explanation is 63 characters,
+  so the margin is wide.
+- The verifier is still the weak link for short answers. If it blocks chapters
+  again on solutions that are genuinely short, the fix belongs in
+  `_filter_verify_mismatches`, not in the extraction path.
 
-- **(a) the crop is cut short.** `header_index.intervals` closes the last block
-  at `file_end`, and `detect_boundaries` scans `ch_last + 2`. Check whether the
-  q3/q7 solution interval actually covers the whole printed solution.
-- **(b) `crop_parse.parse_solution_text` (`crop_parse.py:115`) truncates good
-  input.** Feed it the full text and compare input vs output length.
+### Problem 1b — page furniture and OCR noise reached the export (run-34)
 
-Concrete first step: for q3 and q7, dump (1) the interval
-`{start_page, start_y, end_page, end_y, strips}`, (2) the rendered crop saved to
-a PNG you can look at, (3) the raw text handed to `parse_solution_text` and its
-character count, (4) the parsed result and its character count. Then the answer
-is obvious.
+OPH-001's `questions.jsonl`, checked against the source PDF:
+
+```
+q1 solution  "...leading to\n12 Sold by @itachibot\n\nhypermetropia."
+q7 stem      "...appearsby_\n5 Sold by @itachibot"
+q9 option D  "Middle cerebral artery 6 Sold by @itachibot PRunebdinn IN"
+q9 solution  "...superior hypophyseal artery - ventral...\n©MARROW"
+q2 stem      "oe SS «\ni i ity?\nAt what age would a child attain full a «"
+q3 stem      "A ascarid presen GR the abnormality as shown below"
+```
+
+All shipped as `qa_status: READY` with `[GATE] CLEAN`. Fixed by:
+
+- `strip_page_furniture()` — removes whole lines that are purely the reseller
+  stamp, the publisher mark, or a page number that precedes a stamp. Applied in
+  `_build_records` so the master row and the split row both get clean text.
+  Deliberately conservative: a line carrying real text is never eaten, so
+  q9's inline `"Middle cerebral artery 6 Sold by @itachibot"` survives intact.
+- `_ocr_noise_note()` — flags (never rewrites) fields whose non-ASCII share or
+  alphabetic share says "OCR damage, not prose". Thresholds are per FIELD, so a
+  legitimate `"2.4 cm"` option is not called empty.
+- The garbled watermark variants (`"Cmlistklianm Fm Pir tr rebkiana"`) are
+  **not** pattern-matched — they have no stable spelling and guessing would
+  risk eating real text. They surface through the noise flag instead.
 
 ### Problem 2 — 35% of figures are owned by cross-page carry
 

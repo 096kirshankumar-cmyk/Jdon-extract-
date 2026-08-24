@@ -1478,6 +1478,13 @@ MAX_SOLUTION_IMAGES = 2       # a solution block cites at most a figure or two;
                               # shortcut attached EVERY page image to the one header
                               # the text layer happened to decode).
 MIN_IMAGE_BYTES = 1500        # <1.5 KB webp is virtually always an empty/broken crop
+# RUN-34 (OPH-001 live): q3's solution shipped as the two characters ". X" and
+# the gate called it complete, because missing_solution only tested for an
+# EMPTY string. The book's shortest real explanation is 63 characters ("The
+# canal of Schlemm appears by the 4th month after conception."), so 20 is a
+# very wide margin -- it catches residue without ever flagging a genuine
+# one-line answer.
+MIN_SOLUTION_CHARS = 20
                               # must differ by at least this to decide automatically;
                               # below it both variants are logged for review (no silent picks).
 DANGLING_END_RE = re.compile(r"(:|\u2014|\u2013|\u2022)\s*$")   # ends ':' / em/en-dash / bullet
@@ -1647,6 +1654,87 @@ def _frag_mostly_present(frag, existing, threshold=0.85):
 # ============================================================
 
 
+_PAGE_FURNITURE_RES = (
+    # reseller stamp, with or without the page number in front of it
+    re.compile(r"(?i)^\s*\d{1,4}\s+sold\s+by\s+@\S+\s*$"),
+    re.compile(r"(?i)^\s*sold\s+by\s+@\S+\s*$"),
+    # publisher mark, with or without the copyright glyph
+    re.compile(r"(?i)^\s*(?:\u00a9|\(c\))?\s*marrow\s*$"),
+)
+_BARE_PAGE_NO_RE = re.compile(r"^\s*\d{1,4}\s*$")
+
+
+def strip_page_furniture(text):
+    """Drop page furniture that extraction sweeps into body copy.
+
+    OPH-001 live, straight out of questions.jsonl:
+        q1 solution  "...leading to\\n12 Sold by @itachibot\\n\\nhypermetropia."
+        q7 stem      "...appearsby_\\n5 Sold by @itachibot"
+        q9 option D  "Middle cerebral artery 6 Sold by @itachibot PRunebdinn IN"
+        q9 solution  "...superior hypophyseal artery - ventral...\\n\u00a9MARROW"
+
+    Only whole lines that are PURELY furniture are removed. A line carrying
+    anything else is left untouched -- eating a clause to remove a stamp would
+    be a worse defect than the stamp. A bare page-number line is dropped only
+    when the next non-empty line is a reseller stamp, which is the shape this
+    footer actually takes ("11\\nSold by @itachibot").
+
+    The garbled watermark variants ("Cmlistklianm Fm Pir tr rebkiana") are
+    deliberately NOT matched: they are OCR noise with no stable spelling, and
+    pattern-guessing at them would risk eating real text. Those are reported
+    by _ocr_noise_note instead of silently rewritten.
+
+    Returns (cleaned_text, dropped_line_count)."""
+    src = text or ""
+    if not src.strip():
+        return src, 0
+    lines = src.split("\n")
+    keep, dropped = [], 0
+    for i, ln in enumerate(lines):
+        if any(r.match(ln) for r in _PAGE_FURNITURE_RES):
+            dropped += 1
+            continue
+        if _BARE_PAGE_NO_RE.match(ln):
+            nxt = next((x for x in lines[i + 1:] if x.strip()), "")
+            if any(r.match(nxt) for r in _PAGE_FURNITURE_RES[:2]):
+                dropped += 1
+                continue
+        keep.append(ln)
+    if not dropped:
+        return src, 0
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(keep)).strip()
+    return cleaned, dropped
+
+
+def _ocr_noise_note(text, field):
+    """A review reason when `text` looks like OCR damage rather than prose.
+
+    Nothing here rewrites anything -- the record ships as extracted and a
+    human decides. The thresholds mirror header_index.text_layer_health's
+    DEGRADED band (non-ASCII share, alphabetic share) but are applied per
+    FIELD, because a whole-page health check says nothing about one option
+    label and would call a legitimate "2.4 cm" empty.
+
+    OPH-001 shipped all of these as READY:
+        q2 stem  "oe SS \u00ab\\ni i ity?\\nAt what age would a child attain full a \u00ab"
+        q3 stem  "A ascarid presen GR the abnormality as shown below"
+        q1 opt D "Astigmatic x\u201c es _ ne 0 n\\* \\ \u00bb\\* XW e Niactinn = a ws +."
+    """
+    s = (text or "").strip()
+    if not s:
+        return None
+    n = len(s)
+    weird = sum(1 for c in s if ord(c) > 127 or c in "\u25a0\u25a1\ufffd")
+    letters = sum(1 for c in s if c.isalpha())
+    if n >= 24 and weird / n > 0.02:
+        return (f"{field}: non-ASCII noise {weird}/{n} chars -- looks like OCR "
+                f"damage, not print")
+    if n >= 40 and letters / n < 0.55:
+        return (f"{field}: only {letters}/{n} alphabetic -- looks like OCR "
+                f"damage, not prose")
+    return None
+
+
 def sanitize_solution_text(text, own_qn=None):
     """Strip print furniture that leaks into solution text (run-4 audit):
       1. leading verbatim book headers  ("Solution to Question 2:") that the
@@ -1661,6 +1749,13 @@ def sanitize_solution_text(text, own_qn=None):
     s = text or ""
     if not s.strip():
         return s, notes
+    # RUN-34: page furniture goes first. OPH-001 shipped q1's solution with
+    # "12 Sold by @itachibot" sitting between two clauses, and several others
+    # ended in "\u00a9MARROW".
+    s, _dropped = strip_page_furniture(s)
+    if _dropped:
+        notes.append(f"stripped {_dropped} page-furniture line(s) "
+                     f"(reseller stamp / publisher mark / page number)")
     while True:
         m = re.match(r"\s*Solution\s+to\s+Question\s+\d{1,3}\s*[:.\-]?\s*", s, re.IGNORECASE)
         if not m:
@@ -1799,6 +1894,22 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
         structural_missing.append("solution_text")
     if structural_missing:
         status_reasons.append(f"missing structural fields: {structural_missing}")
+
+    # RUN-34: OCR damage that survived the page-furniture strip. Reported,
+    # never rewritten -- the record ships exactly as extracted and a human
+    # decides. OPH-001 shipped every one of these as READY, which is how a
+    # stem reading "A ascarid presen GR the abnormality" reached the export.
+    _noise = _ocr_noise_note(rec.get("question_text"), "question stem")
+    if _noise:
+        status_reasons.append(_noise)
+    for _letter in sorted(rec.get("options") or {}):
+        _n_opt = _ocr_noise_note((rec.get("options") or {})[_letter],
+                                 f"option {_letter}")
+        if _n_opt:
+            status_reasons.append(_n_opt)
+    _n_sol = _ocr_noise_note(sol_text, "solution")
+    if _n_sol:
+        status_reasons.append(_n_sol)
 
     # image-evidence review: any attached image whose ownership proof is
     # WEAKER than same-page printed geometry. Two distinct classes, reported
@@ -2769,29 +2880,7 @@ def ocr_page_anchors_xy(png, scale, page_h_pt):
     return []
 
 
-def ocr_crop_text(png):
-    """Plain reading-order text of a rendered crop strip. '' when the
-    tesseract binary is missing or OCR yields nothing.
 
-    RUN-32 (OPH-001 live): the run logged `geom_ok=0` on all 46 crops, so
-    every question and solution fell through to Gemini even though the crop
-    path was working. _geom_item_from_interval bails unless the PDF text
-    layer reads CLEAN, and on a book with a garbled or absent text layer that
-    is every page. The SAME rendered pixels already OCR well enough for this
-    module to find header anchors, so the body text is available too -- it
-    just was never asked for. psm 6 (uniform block) then psm 4 (single
-    column); psm 11 sparse is skipped because it scrambles reading order,
-    which matters when options are parsed line by line."""
-    if not shutil.which("tesseract"):
-        return ""
-    for cfg in ("--psm 6", "--psm 4"):
-        try:
-            txt = pytesseract.image_to_string(png, config=cfg)
-        except Exception:
-            continue
-        if (txt or "").strip():
-            return txt
-    return ""
 
 
 
@@ -3883,6 +3972,14 @@ def _export_gate_violations(chapter_records, image_files_by_q, unresolved_ledger
             violations.append(("missing_solution", qn,
                                "no solution_text (header-only model answer "
                                "stripped by sanitize)"))
+        elif len(sol_check.strip()) < MIN_SOLUTION_CHARS:
+            # RUN-34: OPH-001 q3 shipped ". X" as its whole explanation and
+            # passed, because the test above only caught an empty string.
+            violations.append(("solution_too_short", qn,
+                               f"solution_text is only "
+                               f"{len(sol_check.strip())} chars "
+                               f"(< {MIN_SOLUTION_CHARS}): "
+                               f"{sol_check.strip()[:60]!r}"))
         if rec.get("_stem_suspect_reason"):
             # run-13: quarantined suspect stem (kept for review, not deleted)
             # is still a violation -- the chapter must not look clean while a

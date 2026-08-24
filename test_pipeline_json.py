@@ -621,7 +621,7 @@ class Run11ForensicHardeningTests(unittest.TestCase):
     def test_export_gate_catches_missing_stems_and_answers(self):
         recs = {1: {"q_no": 1, "question_text": "stem",
                     "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                    "correct_option": None, "solution_text": "sol"},
+                    "correct_option": None, "solution_text": "The answer is B because the structure develops by the fourth month."},
                 2: {"q_no": 2, "question_text": None,
                     "options": {}, "correct_option": None,
                     "solution_text": None}}
@@ -639,7 +639,7 @@ class Run11ForensicHardeningTests(unittest.TestCase):
     def test_export_gate_clean_when_everything_accounted(self):
         recs = {1: {"q_no": 1, "question_text": "stem",
                     "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                    "correct_option": "B", "solution_text": "sol"}}
+                    "correct_option": "B", "solution_text": "The answer is B because the structure develops by the fourth month."}}
         vio = qp._export_gate_violations(recs, {}, [], "PSY-001")
         self.assertEqual(vio, [])
 
@@ -1024,7 +1024,7 @@ class UnifiedImageOwnershipTests(unittest.TestCase):
     def test_unresolved_image_blocks_clean_gate(self):
         recs = {1: {"q_no": 1, "question_text": "stem",
                     "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                    "correct_option": "B", "solution_text": "sol"}}
+                    "correct_option": "B", "solution_text": "The answer is B because the structure develops by the fourth month."}}
         unresolved = [{"page": 4, "file": "PSY/PSY-p4-7.webp",
                        "method": "all_levels_failed", "confidence": None,
                        "deterministic_junk": False}]
@@ -1035,7 +1035,7 @@ class UnifiedImageOwnershipTests(unittest.TestCase):
     def test_broken_crop_not_gate_violation(self):
         recs = {1: {"q_no": 1, "question_text": "stem",
                     "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                    "correct_option": "B", "solution_text": "sol"}}
+                    "correct_option": "B", "solution_text": "The answer is B because the structure develops by the fourth month."}}
         unresolved = [{"page": 4, "file": "PSY/PSY-p4-414B.webp",
                        "method": "all_levels_failed", "confidence": None,
                        "deterministic_junk": True}]
@@ -1116,7 +1116,7 @@ class Run13FinalAuditFixesTests(unittest.TestCase):
     def test_export_gate_flags_meaningful_unresolved_orphan(self):
         recs = {1: {"q_no": 1, "question_text": "stem",
                     "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                    "correct_option": "B", "solution_text": "sol"}}
+                    "correct_option": "B", "solution_text": "The answer is B because the structure develops by the fourth month."}}
         orphan = {"chapter_id": "PAY-007", "pdf_pages": [105],
                   "item": {"q_no": None, "question_text": None,
                            "options": {"A": "Cannabis-induced psychosis",
@@ -1132,7 +1132,7 @@ class Run13FinalAuditFixesTests(unittest.TestCase):
     def test_export_gate_ignores_empty_orphan_fragment(self):
         recs = {1: {"q_no": 1, "question_text": "stem",
                     "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                    "correct_option": "B", "solution_text": "sol"}}
+                    "correct_option": "B", "solution_text": "The answer is B because the structure develops by the fourth month."}}
         orphan = {"chapter_id": "PAY-017", "pdf_pages": [218],
                   "item": {"q_no": None, "question_text": None, "options": None,
                            "correct_option": None, "solution_text": None,

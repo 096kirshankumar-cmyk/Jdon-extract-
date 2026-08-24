@@ -51,7 +51,7 @@ def _rec(qn, review_reason=None):
     r = {"question_text": f"Stem of q{qn}?",
          "options": {"A": "alpha", "B": "beta", "C": "gamma", "D": "delta"},
          "correct_option": "B",
-         "solution_text": f"Solution of q{qn}."}
+         "solution_text": f"Solution of q{qn}: the structure develops by the fourth month after conception."}
     if review_reason:
         r["_review_reasons"] = [review_reason]
     return r

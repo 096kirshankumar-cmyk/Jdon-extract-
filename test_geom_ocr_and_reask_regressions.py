@@ -85,9 +85,11 @@ class GeomCase(unittest.TestCase):
 
     def tearDown(self):
         qp.pdftotext_page = self._saved["pdftotext_page"]
-        if self._saved["ocr_crop_text"] is not None:
-            qp.ocr_crop_text = self._saved["ocr_crop_text"]
         bph._crop_strip_png = self._saved["crop_strip_png"]
+        # qp.ocr_crop_text no longer exists in production; a test that set it
+        # must delete it or it leaks into later tests and hasattr() lies.
+        if getattr(qp, "ocr_crop_text", None) is not None:
+            del qp.ocr_crop_text
 
     def _text(self, blob):
         qp.pdftotext_page = lambda pdf, page: blob
@@ -108,51 +110,51 @@ class TestTextLayerStillWins(GeomCase):
         self.assertEqual(self.runner._geom_stats.get("text"), 1)
         self.assertNotIn("ocr", self.runner._geom_stats)
 
-    def test_clean_but_incomplete_does_not_waste_time_on_ocr(self):
-        """A readable text layer that fails to parse is a crop_parse coverage
-        gap. OCR of the same words cannot do better, so it must not run."""
+    def test_clean_but_incomplete_still_goes_to_gemini(self):
+        """Readable text that crop_parse cannot parse is a coverage gap, not a
+        missing-text problem -- the crop must reach Gemini."""
         self._text(Q_TEXT.split("\n")[0])   # stem only, no options
-        called = {"n": 0}
-
-        def _spy(img):
-            called["n"] += 1
-            return "anything"
-
-        qp.ocr_crop_text = _spy
         self.assertIsNone(self._run("Question"))
         self.assertEqual(self.runner._geom_stats.get("text_clean_parse_missed"), 1)
-        self.assertEqual(called["n"], 0, "OCR must not run on a CLEAN page")
 
 
-class TestOcrFallback(GeomCase):
-    def test_garbled_text_layer_falls_back_to_ocr(self):
+class TestUnreadableTextGoesToGemini(GeomCase):
+    """RUN-34: the OCR fallback is gone. A crop whose text layer is not CLEAN
+    now falls through to Gemini, which reads the rendered image and does not
+    produce the furniture-laden text tesseract produced on OPH-001."""
+
+    def test_garbled_text_layer_bails_to_gemini(self):
         self._text("7. \u25a0\u25a0\u25a0\u25a0 \ufffd\ufffd\ufffd\ufffd\ufffd\ufffd")
-        self._ocr(Q_TEXT)
-        it = self._run("Question")
-        self.assertIsNotNone(it, "OCR must recover a crop the text layer lost")
-        self.assertEqual(self.runner._geom_stats.get("ocr"), 1)
-
-    def test_empty_text_layer_falls_back_to_ocr_for_solutions(self):
-        self._text("")
-        self._ocr(S_TEXT)
-        it = self._run("Solution")
-        self.assertIsNotNone(it)
-        self.assertEqual(self.runner._geom_stats.get("ocr"), 1)
-
-    def test_no_tesseract_is_reported_not_silently_ignored(self):
-        self._text("")
-        self._ocr("")                        # binary absent -> ''
         self.assertIsNone(self._run("Question"))
-        self.assertEqual(self.runner._geom_stats.get("text_empty_no_ocr"), 1)
+        self.assertEqual(self.runner._geom_stats.get("text_garbled_to_gemini"), 1)
+        self.assertNotIn("ocr", self.runner._geom_stats,
+                         "OCR must not run any more")
 
-    def test_incomplete_ocr_result_is_not_shipped(self):
-        """OCR of a diagram is noisy. An incomplete read must fall through to
-        Gemini, not ship half a question."""
+    def test_empty_text_layer_bails_to_gemini(self):
         self._text("")
-        self._ocr("7. Stem only, options lost in the figure")
-        self.assertIsNone(self._run("Question"))
+        self.assertIsNone(self._run("Solution"))
+        self.assertEqual(self.runner._geom_stats.get("text_empty_to_gemini"), 1)
+
+    def test_degraded_text_layer_bails_to_gemini(self):
+        """DEGRADED is not CLEAN -- it must not be parsed deterministically.
+        Verified against header_index.text_layer_health: letters/n = 0.43,
+        which is above the GARBLED floor (0.35) and below the CLEAN bar."""
+        self._text("7. The canal of Schlemm appears by the 4th month after "
+                   "conception. 12345 67890 11111 22222 33333 44444 --- === "
+                   "*** +++")
         self.assertEqual(
-            self.runner._geom_stats.get("text_empty_ocr_parse_missed"), 1)
+            __import__("header_index").text_layer_health(
+                "7. The canal of Schlemm appears by the 4th month after "
+                "conception. 12345 67890 11111 22222 33333 44444 --- === "
+                "*** +++"),
+            "DEGRADED")
+        self.assertIsNone(self._run("Question"))
+        self.assertEqual(self.runner._geom_stats.get("text_degraded_to_gemini"), 1)
+
+    def test_no_ocr_helper_is_imported_any_more(self):
+        """The helper was removed with the fallback; leaving it would be dead
+        code that implies a path that no longer exists."""
+        self.assertFalse(hasattr(qp, "ocr_crop_text"))
 
     def test_interval_with_no_strips_is_tallied(self):
         self.runner._geom_item_from_interval({"n": 7, "strips": []}, "Question")
