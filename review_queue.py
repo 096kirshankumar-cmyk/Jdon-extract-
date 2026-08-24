@@ -569,12 +569,6 @@ def decision_key(flag) -> str:
     return hashlib.sha1((raw + "|" + det).encode()).hexdigest()[:16]
 
 
-def _chapter_from_qid(q_id):
-    """OBG-003-016 -> OBG-003"""
-    parts = (q_id or "").split("-")
-    return "-".join(parts[:2]) if len(parts) >= 3 else None
-
-
 def _qn_from_qid(q_id):
     try:
         return int((q_id or "").rsplit("-", 1)[1])
@@ -1019,42 +1013,6 @@ def _find_master_row(output_root, q_id: str):
         if r.get("id") == q_id:
             return r
     return None
-
-
-def _json_path_get(row, path):
-    """path like ('question','text') or ('options','A','text')"""
-    cur = row
-    for p in path:
-        if isinstance(cur, list):
-            cur = next((o for o in cur if str(o.get("id")) == str(p)), None)
-        elif isinstance(cur, dict):
-            cur = cur.get(p)
-        else:
-            return None
-        if cur is None:
-            return None
-    return cur
-
-
-def _json_path_set(row, path, value):
-    cur = row
-    for p in path[:-1]:
-        if isinstance(cur, list):
-            cur = next((o for o in cur if str(o.get("id")) == str(p)), None)
-        else:
-            cur = cur.get(p) if isinstance(cur, dict) else None
-        if cur is None:
-            return False
-    last = path[-1]
-    if isinstance(cur, list):
-        tgt = next((o for o in cur if str(o.get("id")) == str(last)), None)
-        if tgt is None:
-            return False
-        return True  # list target handled by caller w/ leaf key
-    if isinstance(cur, dict):
-        cur[last] = value
-        return True
-    return False
 
 
 FIELD_PATHS = {

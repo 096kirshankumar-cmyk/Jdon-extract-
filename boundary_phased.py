@@ -989,9 +989,13 @@ class ChapterRunner:
                 out.append(it)
             else:
                 leftover.append(iv)
-        if leftover:
-            print(f"[BPH] {self.chapter_id}: {pass_name} geom ok={len(out)} "
-                  f"gemini_crops={len(leftover)}")
+        # Always report the split (run-30): it used to print only when
+        # something needed Gemini, so a fully geometric phase -- the best
+        # possible outcome, zero tokens -- looked identical to a phase that
+        # never ran the crop path at all.
+        print(f"[BPH] {self.chapter_id}: {pass_name} crops={len(ivals)} "
+              f"geom_ok={len(out)} (0 Gemini calls) "
+              f"gemini_crops={len(leftover)}")
         batchable, singles = [], []
         for iv in leftover:
             if self._crop_is_batchable(iv, label, leftover):
@@ -1109,6 +1113,10 @@ class ChapterRunner:
         if ivals and label in ("Question", "Solution"):
             # Final rule: stem/options/solution from THAT crop only.
             # No 7-page fallback — empty crop stays empty + flagged.
+            print(f"[BPH] {self.chapter_id}: {pass_name} -> CROP path "
+                  f"({len(ivals)} {label} crop(s) cut from the visual header "
+                  f"index; pages {min(i['start_page'] for i in ivals)}-"
+                  f"{max(i['end_page'] for i in ivals)})")
             cropped = self._extract_from_crops(
                 ivals, prompt_tmpl, label, pass_name, dpi=max(dpi, 130))
             if label == "Solution":
@@ -1117,6 +1125,28 @@ class ChapterRunner:
                 self.notes.append(
                     f"{pass_name}: crop extract empty (no 7-page fallback)")
             return cropped or []
+        # WHY the page path ran must be visible (run-30). Crops are the
+        # designed path for Question/Solution; reaching here means either the
+        # phase is the Answer-key table (whole pages are correct there) or the
+        # visual header scan found no headers of this type, so there was
+        # nothing to cut a crop from. The old code fell through silently, so a
+        # whole book could extract by page images with nothing in the log to
+        # say the crop path never engaged.
+        if label in ("Question", "Solution"):
+            _hdr_n = len(self._visual_headers or [])
+            print(f"[BPH] {self.chapter_id}: {pass_name} -> PAGE path "
+                  f"(FALLBACK: the visual header index produced 0 {label} "
+                  f"crops -- {_hdr_n} header(s) scanned total). Fix the header "
+                  f"scan to get crops back; page images are the degraded "
+                  f"path.")
+            self.notes.append(
+                f"{pass_name}: no {label} crops from the visual header index "
+                f"({_hdr_n} headers scanned) -- degraded to whole-page "
+                f"extraction")
+        else:
+            print(f"[BPH] {self.chapter_id}: {pass_name} -> PAGE path "
+                  f"(answer key is a page-spanning table; crops are cut for "
+                  f"Question/Solution blocks only)")
         out = []
         for chunk in _phase_chunks(pages):
             p = prompt_tmpl.format(chapter_name=self.chapter_id,

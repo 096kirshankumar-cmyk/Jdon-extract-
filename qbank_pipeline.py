@@ -585,12 +585,6 @@ def find_watermark_object_ids(pdf_path):
     return result
 
 
-def find_watermark_object_id(pdf_path, sample_pages=30):
-    """Backward-compatible singular API; new pipeline code uses the set API."""
-    ids = find_watermark_object_ids(pdf_path)
-    return min(ids) if ids else None
-
-
 def _normalise_watermark_ids(value):
     """Accept the new set filter and the legacy single integer argument."""
     if value is None:

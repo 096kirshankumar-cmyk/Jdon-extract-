@@ -354,8 +354,3 @@ def pool():
     if _POOL is None:
         raise NoKeysConfigured("gemini_keys.init(state, MAX_CALLS_PER_DAY) was never called")
     return _POOL
-
-
-def reset_for_tests():
-    global _POOL
-    _POOL = None
