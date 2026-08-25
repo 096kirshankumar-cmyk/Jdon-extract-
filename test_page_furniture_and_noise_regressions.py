@@ -200,6 +200,74 @@ class TestForeignSolutionHeadIsDropped(unittest.TestCase):
         self.assertTrue(any("needs model/review" in n for n in notes), notes)
 
 
+class TestSolutionImgCrossReference(unittest.TestCase):
+    """RUN-44 (OPH-001 q23 live): a solution that explains a figure-based
+    question refers to THAT figure, and the figure is owned by the question
+    side. q23's solution walks the marked diagram and owns no file of its own,
+    which read as a missing figure and flagged the row."""
+
+    def test_solution_token_explained_by_question_figure_is_not_flagged(self):
+        # the stem carries its own [IMG] too, so the question side balances
+        recs = {23: {"question_text": "Which muscles depress the eyeball? [IMG]",
+                     "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                     "correct_option": "A",
+                     "solution_text": "The depressors are [IMG] A and E as marked."}}
+        qp.apply_img_placeholder_reconcile(
+            recs, {23: {"question": ["OPH/OPH-001-023_Q_01.webp"],
+                        "solution": []}})
+        self.assertEqual(recs[23]["_review_reasons"], [],
+                         recs[23]["_review_reasons"])
+
+    def test_more_tokens_than_both_sides_own_is_still_flagged(self):
+        """A solution cannot explain away figures nobody owns."""
+        recs = {23: {"question_text": "Which muscles depress the eyeball? [IMG]",
+                     "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                     "correct_option": "A",
+                     "solution_text": "See [IMG] and also [IMG] and [IMG]."}}
+        qp.apply_img_placeholder_reconcile(
+            recs, {23: {"question": ["OPH/OPH-001-023_Q_01.webp"],
+                        "solution": []}})
+        self.assertTrue(recs[23]["_review_reasons"],
+                        "3 tokens vs 1 owned figure must still flag")
+
+    def test_token_with_no_figure_anywhere_is_still_flagged(self):
+        """OPH-001 q15: the model emitted [IMG] but the book prints no figure
+        for this question at all. That is a hallucination and must flag."""
+        recs = {15: {"question_text": "Which structures are damaged?",
+                     "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                     "correct_option": "C",
+                     "solution_text": "The optic canal transmits [IMG] it."}}
+        qp.apply_img_placeholder_reconcile(
+            recs, {15: {"question": [], "solution": []}})
+        self.assertTrue(any("img_placeholder_count_mismatch" in r
+                            for r in recs[15]["_review_reasons"]),
+                        recs[15]["_review_reasons"])
+
+    def test_figure_attached_but_unreferenced_is_still_flagged(self):
+        """The opposite gap: the allowance is one-directional. A solution that
+        owns a figure its text never mentions is a real defect."""
+        recs = {7: {"question_text": "Stem, no placeholder.",
+                    "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                    "correct_option": "A",
+                    "solution_text": "Solution, no placeholder."}}
+        qp.apply_img_placeholder_reconcile(
+            recs, {7: {"question": [], "solution": ["OPH/OPH-001-007_SOL_01.webp"]}})
+        self.assertTrue(any("img_placeholder_count_mismatch" in r
+                            for r in recs[7]["_review_reasons"]),
+                        recs[7]["_review_reasons"])
+
+    def test_question_side_gets_no_cross_reference_allowance(self):
+        """A question stem cannot borrow the solution's figures."""
+        recs = {5: {"question_text": "See [IMG] the diagram below.",
+                    "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                    "correct_option": "A", "solution_text": "Because."}}
+        qp.apply_img_placeholder_reconcile(
+            recs, {5: {"question": [], "solution": ["OPH/OPH-001-005_SOL_01.webp"]}})
+        self.assertTrue(any("img_placeholder_count_mismatch" in r
+                            for r in recs[5]["_review_reasons"]),
+                        recs[5]["_review_reasons"])
+
+
 class TestOcrNoiseNote(unittest.TestCase):
     def test_normal_prose_is_not_flagged(self):
         self.assertIsNone(qp._ocr_noise_note(REAL_SHORT_SOLUTION, "solution"))

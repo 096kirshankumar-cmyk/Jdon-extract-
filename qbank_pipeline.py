@@ -4321,6 +4321,26 @@ def apply_img_placeholder_reconcile(chapter_records, image_files_by_q):
                 continue
             ok, note = reconcile_img_placeholders(
                 rec.get(field), len(entry.get(side) or []), side=side)
+            if not ok and side == "solution":
+                # RUN-44 (OPH-001 q23 live): a solution that explains a
+                # figure-based question naturally refers to THAT figure, and
+                # the figure is owned by the QUESTION side -- it is drawn in
+                # the stem, not in the explanation. q23's solution walks the
+                # marked diagram ("A- Superior oblique, E- Inferior rectus")
+                # and owns no file of its own, which read as a missing figure
+                # and flagged the row.
+                #
+                # Only when the solution claims MORE figures than it owns.
+                # The opposite gap -- a figure attached with no [IMG] in the
+                # text -- is a different defect and must still flag.
+                n_tok = count_img_placeholders(rec.get(field))
+                n_own = len(entry.get("solution") or [])
+                n_q = len(entry.get("question") or [])
+                if n_q and n_tok > n_own and n_tok <= n_own + n_q:
+                    ok = True
+                    print(f"  [IMG] q{qn} solution: {n_tok} [IMG] token(s) "
+                          f"explained by the question's {n_q} figure(s) -- "
+                          f"cross-reference, not a missing figure")
             if not ok:
                 if note not in reasons:
                     reasons.append(note)

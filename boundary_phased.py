@@ -2981,9 +2981,19 @@ class ChapterRunner:
                 opt_txt[_k] = _cv
                 n_f += _n
             if n_f or n_fs:
-                reasons.append(
-                    f"stripped {n_f + n_fs} page-furniture line(s) "
-                    f"(reseller stamp / publisher mark / page number)")
+                # RUN-44: logged, NOT a review reason. Removing a reseller
+                # stamp or a page number is routine normalisation -- the
+                # content was never ambiguous, we just dropped print furniture
+                # that does not belong in the data. Treating it as review
+                # evidence flagged q14/q18/q19 on OPH-001 for nothing: 3 of
+                # that chapter's 5 REVIEW_NEEDED rows. What DOES belong in
+                # qa_reasons is the neighbouring case -- content that was
+                # removed and might have been real (a previous question's
+                # explanation, a duplicated dump, OCR damage).
+                print(f"  [FURNITURE] {self.subject}-{self.chapter_no:03d}-"
+                      f"{qn:03d}: stripped {n_f + n_fs} page-furniture "
+                      f"line(s) (reseller stamp / publisher mark / page "
+                      f"number)")
             records[qn] = {
                 "q_no": qn,
                 "question_text": stem_txt,
