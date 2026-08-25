@@ -3534,6 +3534,21 @@ class ChapterRunner:
               f"{len(chapter_rows)} questions | qa_status: {qa_ready} READY, "
               f"{qa_rev} REVIEW_NEEDED, {qa_inc} INCOMPLETE "
               f"| lock={'yes' if locked else 'NO (flagged for review)'}")
+        # RUN-43: name every non-READY row and say WHY, in the run log.
+        # Until now the log reported only the count, so "6 REVIEW_NEEDED"
+        # meant opening data/questions.jsonl and reading qa_reasons by hand --
+        # and the split rows do not even carry that field. A count with no
+        # reasons is not actionable: the owner cannot tell a real defect from
+        # a false positive in a check without digging through files.
+        for r in chapter_rows:
+            if r.get("qa_status") == "READY":
+                continue
+            _why = r.get("qa_reasons") or []
+            print(f"  [QA] {r.get('id')} {r.get('qa_status')}"
+                  + ("" if _why else "  (no reason recorded -- bug: a row was "
+                                     "flagged with nothing to say why)"))
+            for _w in _why:
+                print(f"       - {_w}")
         qp.clear_render_cache()
         gc.collect()
         return chapter_rows, locked
