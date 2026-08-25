@@ -243,18 +243,43 @@ class TestSolutionImgCrossReference(unittest.TestCase):
                             for r in recs[15]["_review_reasons"]),
                         recs[15]["_review_reasons"])
 
-    def test_figure_attached_but_unreferenced_is_still_flagged(self):
-        """The opposite gap: the allowance is one-directional. A solution that
-        owns a figure its text never mentions is a real defect."""
+    def test_attached_figure_with_no_token_is_advisory_not_a_review_reason(self):
+        """RUN-45 (OPH-001 q11 live, owner's decision): text with no [IMG]
+        token but files attached is not a defect here. The converter reads
+        images from images[] and attaches them directly; the token is only an
+        inline-positioning hint. The figure is correctly owned, nothing lost."""
+        recs = {11: {"question_text": "A girl is found to have this abnormality.",
+                     "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                     "correct_option": "B",
+                     "solution_text": "Coloboma is most common inferonasally."}}
+        qp.apply_img_placeholder_reconcile(
+            recs, {11: {"question": ["OPH/OPH-001-011_Q_01.webp"],
+                        "solution": []}})
+        self.assertEqual(recs[11]["_review_reasons"], [],
+                         recs[11]["_review_reasons"])
+
+    def test_same_rule_applies_to_the_solution_side(self):
         recs = {7: {"question_text": "Stem, no placeholder.",
                     "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
                     "correct_option": "A",
                     "solution_text": "Solution, no placeholder."}}
         qp.apply_img_placeholder_reconcile(
             recs, {7: {"question": [], "solution": ["OPH/OPH-001-007_SOL_01.webp"]}})
+        self.assertEqual(recs[7]["_review_reasons"], [],
+                         recs[7]["_review_reasons"])
+
+    def test_unequal_nonzero_counts_still_flag(self):
+        """The converter would position images ambiguously: 2 markers, 1 file."""
+        recs = {9: {"question_text": "See [IMG] and [IMG] here.",
+                    "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                    "correct_option": "A",
+                    "solution_text": "Because."}}
+        qp.apply_img_placeholder_reconcile(
+            recs, {9: {"question": ["OPH/OPH-001-009_Q_01.webp"],
+                       "solution": []}})
         self.assertTrue(any("img_placeholder_count_mismatch" in r
-                            for r in recs[7]["_review_reasons"]),
-                        recs[7]["_review_reasons"])
+                            for r in recs[9]["_review_reasons"]),
+                        recs[9]["_review_reasons"])
 
     def test_question_side_gets_no_cross_reference_allowance(self):
         """A question stem cannot borrow the solution's figures."""

@@ -254,16 +254,30 @@ class TestPlaceholderCheckSkipsDeterministicText(unittest.TestCase):
         self.assertEqual(recs[5]["_review_reasons"], [],
                          "a geometric parse has no [IMG] discipline to check")
 
-    def test_model_text_missing_placeholders_is_still_flagged(self):
-        """The check still does its real job: a model read that dropped its
-        [IMG] markers is a genuine defect."""
-        recs = self._rec("Stem with a diagram but no placeholder.", "")
+    def test_model_that_dropped_some_markers_is_still_flagged(self):
+        """The check still does its real job. RUN-45 made "no token at all"
+        advisory (the converter attaches from images[] directly), so the case
+        that must still flag is a model that emitted SOME markers but not
+        enough -- the converter would then position images ambiguously."""
+        recs = self._rec("Stem with [IMG] one diagram but two are owned.", "")
         qp.apply_img_placeholder_reconcile(
-            recs, {5: {"question": ["OPH/OPH-001-005_Q_01.webp"],
+            recs, {5: {"question": ["OPH/OPH-001-005_Q_01.webp",
+                                    "OPH/OPH-001-005_Q_02.webp"],
                        "solution": []}})
         self.assertTrue(any("img_placeholder_count_mismatch" in r
                             for r in recs[5]["_review_reasons"]),
                         recs[5]["_review_reasons"])
+
+    def test_attached_figure_with_no_token_is_advisory(self):
+        """RUN-45 (OPH-001 q11 live, owner's decision): text with no [IMG]
+        token but files attached is advisory only -- the converter reads
+        images[] and attaches directly, the token is just inline positioning."""
+        recs = self._rec("Stem with a diagram but no placeholder.", "")
+        qp.apply_img_placeholder_reconcile(
+            recs, {5: {"question": ["OPH/OPH-001-005_Q_01.webp"],
+                       "solution": []}})
+        self.assertEqual(recs[5]["_review_reasons"], [],
+                         recs[5]["_review_reasons"])
 
     def test_model_text_with_matching_count_is_clean(self):
         recs = self._rec("Stem [IMG] with a diagram.", "")
@@ -274,9 +288,14 @@ class TestPlaceholderCheckSkipsDeterministicText(unittest.TestCase):
 
     def test_sides_are_judged_independently(self):
         """Deterministic question + model-written solution: only the solution
-        side is checked."""
-        recs = {5: {"question_text": "Stem, no placeholder.",
-                    "solution_text": "Solution, no placeholder.",
+        side is checked. The solution side carries a real mismatch (two
+        markers, one owned file) so it must flag, while the deterministic
+        question side is skipped entirely."""
+        # 3 markers against 1 owned file, and the question owns only 1, so
+        # the RUN-44 cross-reference allowance (n_tok <= n_own + n_q) cannot
+        # explain it -- 3 > 1 + 1. It must still flag.
+        recs = {5: {"question_text": "Stem [IMG] with one marker.",
+                    "solution_text": "Solution [IMG] [IMG] [IMG] three.",
                     "_q_text_method": "geometric_text",
                     "_s_text_method": ""}}
         qp.apply_img_placeholder_reconcile(

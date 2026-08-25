@@ -4331,8 +4331,6 @@ def apply_img_placeholder_reconcile(chapter_records, image_files_by_q):
                 # and flagged the row.
                 #
                 # Only when the solution claims MORE figures than it owns.
-                # The opposite gap -- a figure attached with no [IMG] in the
-                # text -- is a different defect and must still flag.
                 n_tok = count_img_placeholders(rec.get(field))
                 n_own = len(entry.get("solution") or [])
                 n_q = len(entry.get("question") or [])
@@ -4342,9 +4340,29 @@ def apply_img_placeholder_reconcile(chapter_records, image_files_by_q):
                           f"explained by the question's {n_q} figure(s) -- "
                           f"cross-reference, not a missing figure")
             if not ok:
-                if note not in reasons:
-                    reasons.append(note)
-                print(f"  [IMG] q{qn} {side}: {note}")
+                # RUN-45 (OPH-001 q11 live, owner's decision): text with NO
+                # [IMG] token at all but files attached is not a defect for
+                # this pipeline's consumer. The converter reads images from
+                # the images[] field and attaches them directly; the token is
+                # only an inline-positioning hint, and "attach without inline
+                # placement" is exactly what the owner wants to happen. The
+                # figure itself is correctly owned -- nothing is lost.
+                #
+                # The OTHER direction stays a real flag: text that DOES
+                # reference a figure nobody owns is a dangling marker (q15 --
+                # the model invented [IMG] for a question the book prints no
+                # figure for), and unequal non-zero counts mean the converter
+                # would position images ambiguously. Both still flag.
+                n_tok = count_img_placeholders(rec.get(field))
+                n_files = len(entry.get(side) or [])
+                if n_tok == 0 and n_files:
+                    print(f"  [IMG] q{qn} {side}: {n_files} figure(s) attached "
+                          f"with no [IMG] token in the text -- advisory only, "
+                          f"the converter attaches from images[] directly")
+                else:
+                    if note not in reasons:
+                        reasons.append(note)
+                    print(f"  [IMG] q{qn} {side}: {note}")
         rec["_review_reasons"] = reasons
 
 
