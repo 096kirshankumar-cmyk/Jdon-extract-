@@ -509,6 +509,13 @@ CRITICAL rule (bleed prevention):
 Solution format aksar: text → image → text. Second text-chunk ko AGLE question 
 ke saath mat jodo, chahe visually next question ke paas dikhe.
 
+CRITICAL rule (PEECHHE ka bleed — OPH-001 q4 live):
+Tumhe ek ISOLATED crop mila hai: "Solution to Question N:" header se shuru,
+agle header tak. Agar crop me us header se PEHLE bhi koi text dikhe, to wo
+PICHHLE question ka solution hai — usse bilkul include mat karo. Sirf "Solution
+to Question N:" ke BAAD ka text lo. Yaad se ya context se pichhla solution
+mat likho — jo crop me nahi dikha raha wo exist nahi karta.
+
 Anchor rule: Naya solution TABHI shuru hota hai jab explicit next question-
 number marker dikhe (jaise "Ans. 12" ya "12."). Jab tak agla number-marker 
 na dikhe, saara text (image ke pehle aur baad dono) USI current question 
