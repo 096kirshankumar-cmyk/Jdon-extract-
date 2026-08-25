@@ -268,6 +268,36 @@ class TestSolutionImgCrossReference(unittest.TestCase):
         self.assertEqual(recs[7]["_review_reasons"], [],
                          recs[7]["_review_reasons"])
 
+    def test_two_or_more_figures_with_no_token_must_flag(self):
+        """RUN-46 (owner's refinement): the single-figure allowance does not
+        extend to two or more. With several figures the [IMG] token is what
+        establishes which image sits where in the reading order, so a missing
+        marker there is a real defect, not a harmless omission."""
+        recs = {5: {"question_text": "A diagram-based question with no marker.",
+                    "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                    "correct_option": "B",
+                    "solution_text": "Two figures explain this."}}
+        qp.apply_img_placeholder_reconcile(
+            recs, {5: {"question": ["OPH/OPH-001-005_Q_01.webp",
+                                    "OPH/OPH-001-005_Q_02.webp"],
+                       "solution": []}})
+        self.assertTrue(any("img_placeholder_count_mismatch" in r
+                            for r in recs[5]["_review_reasons"]),
+                        recs[5]["_review_reasons"])
+
+    def test_exactly_one_figure_with_no_token_is_still_advisory(self):
+        """The boundary case: one figure, one possible position, no marker
+        needed."""
+        recs = {5: {"question_text": "A diagram-based question with no marker.",
+                    "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                    "correct_option": "B",
+                    "solution_text": "One figure explains this."}}
+        qp.apply_img_placeholder_reconcile(
+            recs, {5: {"question": ["OPH/OPH-001-005_Q_01.webp"],
+                       "solution": []}})
+        self.assertEqual(recs[5]["_review_reasons"], [],
+                         recs[5]["_review_reasons"])
+
     def test_unequal_nonzero_counts_still_flag(self):
         """The converter would position images ambiguously: 2 markers, 1 file."""
         recs = {9: {"question_text": "See [IMG] and [IMG] here.",

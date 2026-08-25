@@ -4340,25 +4340,23 @@ def apply_img_placeholder_reconcile(chapter_records, image_files_by_q):
                           f"explained by the question's {n_q} figure(s) -- "
                           f"cross-reference, not a missing figure")
             if not ok:
-                # RUN-45 (OPH-001 q11 live, owner's decision): text with NO
-                # [IMG] token at all but files attached is not a defect for
-                # this pipeline's consumer. The converter reads images from
-                # the images[] field and attaches them directly; the token is
-                # only an inline-positioning hint, and "attach without inline
-                # placement" is exactly what the owner wants to happen. The
-                # figure itself is correctly owned -- nothing is lost.
+                # RUN-45 (OPH-001 q11 live) + RUN-46 (owner's refinement):
+                # text with no [IMG] token is only harmless when the block
+                # owns EXACTLY ONE figure -- there is a single place it can go,
+                # so the converter can attach it from images[] without being
+                # told where. With two or more figures the token is what
+                # establishes which image sits where in the reading order, so
+                # a missing marker there IS a defect and must flag.
                 #
-                # The OTHER direction stays a real flag: text that DOES
-                # reference a figure nobody owns is a dangling marker (q15 --
-                # the model invented [IMG] for a question the book prints no
-                # figure for), and unequal non-zero counts mean the converter
-                # would position images ambiguously. Both still flag.
+                # The other direction always flags: text that references a
+                # figure nobody owns is a dangling marker (q15 -- the model
+                # invented [IMG] for a question the book prints no figure for).
                 n_tok = count_img_placeholders(rec.get(field))
                 n_files = len(entry.get(side) or [])
-                if n_tok == 0 and n_files:
-                    print(f"  [IMG] q{qn} {side}: {n_files} figure(s) attached "
-                          f"with no [IMG] token in the text -- advisory only, "
-                          f"the converter attaches from images[] directly")
+                if n_tok == 0 and n_files == 1:
+                    print(f"  [IMG] q{qn} {side}: 1 figure attached with no "
+                          f"[IMG] token -- advisory only, a single figure "
+                          f"needs no inline position")
                 else:
                     if note not in reasons:
                         reasons.append(note)
