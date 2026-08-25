@@ -86,6 +86,36 @@ class TestStripPageFurniture(unittest.TestCase):
         self.assertEqual(n, 0)
         self.assertEqual(out, src)
 
+    def test_leading_bare_page_number_is_removed_even_without_a_stamp(self):
+        """RUN-41 (OPH-001 q15 live): a solution header at the bottom of a
+        page puts the footer under it; the model transcribed the footer as a
+        bare '18' line BEFORE the real content. The next-line-is-stamp rule
+        missed it and the page number shipped READY."""
+        out, n = qp.strip_page_furniture(
+            "18\n\nIn the given clinical scenario, a fracture of the optic "
+            "canal is most likely to damage the ophthalmic artery.")
+        self.assertEqual(n, 1)
+        self.assertFalse(out.startswith("18"))
+        self.assertTrue(out.startswith("In the given clinical scenario"))
+
+    def test_leading_page_number_with_blank_lines_between_is_removed(self):
+        out, n = qp.strip_page_furniture("12\n\n12\n\nReal content here.")
+        self.assertEqual(n, 2)
+        self.assertEqual(out, "Real content here.")
+
+    def test_leading_stamp_then_content_is_removed(self):
+        out, n = qp.strip_page_furniture(
+            "14 Sold by @itachibot\n\nSol body of q7...")
+        self.assertEqual(n, 1)
+        self.assertTrue(out.startswith("Sol body of q7"))
+
+    def test_mid_text_bare_number_still_survives(self):
+        """A lone digit line AFTER real content is ambiguous (list item) --
+        the conservative rule stays."""
+        out, n = qp.strip_page_furniture("The types are:\n1\n2\nDone.")
+        self.assertEqual(n, 0)
+        self.assertIn("\n1\n", out)
+
     def test_empty_input(self):
         self.assertEqual(qp.strip_page_furniture(""), ("", 0))
         self.assertEqual(qp.strip_page_furniture(None), ("", 0))

@@ -183,8 +183,15 @@ class TestCropsAreSentOneAtATime(unittest.TestCase):
     ("One image per printed item ... Transcribe ONLY that interval"), and is
     how OPH-001 q4 came back with q3's explanation prepended."""
 
-    def test_batch_size_is_one(self):
-        self.assertEqual(bph.CROP_BATCH_SIZE, 1)
+    def test_batch_size_default_is_three(self):
+        """RUN-41: CROP_BATCH_SIZE is env-configurable with a default of 3.
+        One-crop-per-call (~2 Gemini calls per question) made a full 600-page
+        question bank unbatchable inside the 480/day quota. The safe class
+        (text-only single-page Question crops) batches; solutions and figure
+        crops stay isolated via _crop_is_batchable."""
+        self.assertEqual(bph.CROP_BATCH_SIZE, int(
+            __import__("os").environ.get("QBANK_CROP_BATCH", "3")))
+        self.assertGreater(bph.CROP_BATCH_SIZE, 1)
 
     def test_each_crop_gets_its_own_call(self):
         ivals = [{"n": i, "start_page": 4 + i, "end_page": 4 + i,
@@ -218,7 +225,9 @@ class TestCropsAreSentOneAtATime(unittest.TestCase):
                 [{"n": 1, "start_page": 4, "end_page": 4,
                   "strips": [{"page": 4, "y_hi": 9.0, "y_lo": 0.0}]}],
                 "{chapter_name}{start}{end}", "Question", "Q", dpi=130)
-        self.assertIn("one Gemini call each", buf.getvalue())
+        out = buf.getvalue()
+        self.assertIn("1 isolated", out)
+        self.assertIn("never batched", out)
 
 
 if __name__ == "__main__":

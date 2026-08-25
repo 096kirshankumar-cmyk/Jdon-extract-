@@ -1696,6 +1696,21 @@ def strip_page_furniture(text):
         return src, 0
     lines = src.split("\n")
     keep, dropped = [], 0
+    # RUN-41: drop LEADING bare page-number line(s) -- crop-top residue from
+    # a footer sitting under a bottom-of-page header. Only lines before any
+    # real content qualify; a lone digit line anywhere later is ambiguous
+    # (a numbered list item may legitimately be a bare digit line).
+    while lines:
+        head = lines[0].strip()
+        if not head:
+            lines = lines[1:]          # leading blank: harmless, drop
+            continue
+        if _BARE_PAGE_NO_RE.match(head) or any(r.match(head)
+                                               for r in _PAGE_FURNITURE_RES):
+            dropped += 1
+            lines = lines[1:]
+        else:
+            break
     for i, ln in enumerate(lines):
         if any(r.match(ln) for r in _PAGE_FURNITURE_RES):
             dropped += 1

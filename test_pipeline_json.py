@@ -181,9 +181,11 @@ class SolutionFigureMappingTests(unittest.TestCase):
         self.assertEqual(owned[2]["solution"], ["PSY/PSY-001-002_SOL_01.webp"])
 
     def test_under_detected_headers_no_longer_swallow_the_page(self):
-        # ONE decoded header but FIVE figures below it (the old code dumped
-        # all five onto that one solution) -> cap at MAX_SOLUTION_IMAGES,
-        # the rest stay unclaimed for the model/manual pass.
+        # ONE decoded header but FIVE figures below it. Since 2026-08-24 the
+        # design is "geometry owns the file": every figure under the proven
+        # block is claimed (NO hard count cap -- refusing the 3rd+ was data
+        # loss for real multi-figure solutions); high piles get the soft
+        # review_suggested: high_image_count flag instead of being dropped.
         pdf = self.tmp / "one_block.pdf"
         _write_test_pdf(pdf, [
             ("Solution to Question 3:", 72, 700, 12),
@@ -191,8 +193,8 @@ class SolutionFigureMappingTests(unittest.TestCase):
         ], [(6, "Im6", 300, 640), (7, "Im7", 300, 600), (8, "Im8", 300, 560),
             (9, "Im9", 300, 520), (10, "Im10", 300, 480)])
         leftover, owned = self._claim(pdf, [6, 7, 8, 9, 10], {3: {"has_figure_in_solution": True}})
-        self.assertGreaterEqual(len(owned[3]["solution"]), qp.MAX_SOLUTION_IMAGES)
-        self.assertEqual(len(leftover), 3)
+        self.assertEqual(len(owned[3]["solution"]), 5)   # all 5 claimed
+        self.assertEqual(leftover, [])                   # nothing left unclaimed
 
     def test_figure_above_all_headers_is_not_guessed(self):
         # figure drawn ABOVE the only header -> no deterministic owner

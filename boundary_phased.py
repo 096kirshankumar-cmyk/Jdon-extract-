@@ -89,7 +89,18 @@ PAGE_CHUNK = 7            # boundary detect only; Q/S extract uses crops
 # that actually matters here: an item cannot be contaminated by a neighbour it
 # was never shown. Raise it only if quota forces the trade, and expect
 # cross-item bleed to come back with it.
-CROP_BATCH_SIZE = 1
+#
+# RUN-41: full-book quota math made the trade mandatory. At CROP_BATCH_SIZE=1
+# a 600+ page question bank (23 questions/chapter) spends ~2 Gemini calls per
+# question (Q+S) -> ~1500+ calls/book vs the 480/day free-tier budget: a whole
+# book cannot finish in a day. _crop_is_batchable() only batches the SAFE
+# class -- text-only, single-page QUESTION crops (solutions and anything with
+# figures stay 1-per-call), and _gemini_crop_batch anchors every item to its
+# own interval q_no with an explicit "Expected q_nos" list, so a batched item
+# still cannot absorb a neighbour: wrong-q_no items are rejected at intake and
+# the verify loop re-checks each item against its own page. Default 3 cuts the
+# Q-phase call count ~3x while keeping every solution crop isolated.
+CROP_BATCH_SIZE = int(os.environ.get("QBANK_CROP_BATCH", "3"))
 # Set to a directory to write every crop image Gemini is sent, named
 # <chapter>_<Q|S><q_no>_part<i>.png. The only way to tell a wrong block
 # boundary from a model that added text -- you have to look at the crop.
@@ -1127,6 +1138,16 @@ class ChapterRunner:
             print(f"[BPH] {self.chapter_id}: {pass_name} sending "
                   f"{len(work)} isolated crop(s), one Gemini call each "
                   f"(CROP_BATCH_SIZE=1: no neighbour in context)")
+        else:
+            # RUN-41: batched mode keeps the call-count visible too. Only the
+            # safe class (text-only single-page Question crops) is batched;
+            # solutions and figure/multi-page/edge crops stay isolated.
+            print(f"[BPH] {self.chapter_id}: {pass_name} sending {len(work)} "
+                  f"Gemini call(s) (batch={CROP_BATCH_SIZE}: "
+                  f"{len(batchable)} batchable -> "
+                  f"{(len(batchable) + CROP_BATCH_SIZE - 1) // CROP_BATCH_SIZE} "
+                  f"batch(es), {len(singles)} isolated; figures and solution "
+                  f"crops never batched)")
         retry_singles = []
         def _keep_shippable(kept, tag):
             """RUN-31: one place that decides what may ship, so the batch
@@ -1331,8 +1352,20 @@ class ChapterRunner:
                     # not the content. OCR the same pages (deterministic) and
                     # structure the text with the same phase rules. Items are
                     # marked _ocr -> REVIEW_NEEDED rows, never trusted silent.
-                    ocr_kept = self._ocr_fallback(chunk, prompt_tmpl, label,
-                                                  pass_name)
+                    # RUN-42: guarded. The fallback is a best-effort recovery
+                    # and must never take the chapter run down with it -- a
+                    # missing pdftoppm/tesseract, or a second model block
+                    # inside the fallback, used to propagate out of run()
+                    # entirely. Degrading to an unresolved phase (blocker row,
+                    # chapter left undone, retried next run) is the contract.
+                    try:
+                        ocr_kept = self._ocr_fallback(chunk, prompt_tmpl,
+                                                      label, pass_name)
+                    except Exception as ocr_e:
+                        ocr_kept = None
+                        self.notes.append(
+                            f"{pass_name} phase unresolved: OCR fallback "
+                            f"failed ({type(ocr_e).__name__}: {ocr_e})")
                     if ocr_kept:
                         out.extend(ocr_kept)
                         items = ocr_kept
@@ -1785,13 +1818,23 @@ class ChapterRunner:
         bleed_line = BLEED_LINE if phase_name == "Solution" else ""
         prompt = VERIFY_PROMPT.format(phase_name=phase_name, bleed_line=bleed_line)
         # BUG 6: verify the SAME text we will ship (normalized options /
-        # sanitized solutions), never a pre-sanitize draft.
+        # sanitized solutions), never a pre-sanitize draft. RUN-41: page
+        # furniture is stripped here too -- a footer page-number residue
+        # ("18") in a solution was flagged by verify as a mismatch, then
+        # dropped as severity=minor and SHIPPED READY (OPH-001 q15). If the
+        # payload is already clean, verify sees no residue to argue about.
         payload_items = []
         for it in items:
             it2 = dict(it)
             if phase_name == "Question":
                 opts, _ = _norm_options(it.get("options"))
-                it2["options"] = opts
+                opts_clean = {}
+                for _l, _t in (opts or {}).items():
+                    _t2, _ = qp.strip_page_furniture(str(_t or ""))
+                    opts_clean[_l] = _t2
+                stem2, _ = qp.strip_page_furniture(str(it.get("stem") or ""))
+                it2["stem"] = stem2
+                it2["options"] = opts_clean
             elif phase_name == "Solution":
                 st, _ = qp.sanitize_solution_text(
                     it.get("solution_text"), own_qn=it.get("_qn"))
@@ -2332,7 +2375,30 @@ class ChapterRunner:
                     missing_pages.setdefault(qn, p)
         # Boilerplate (Sol 8/9) is NOT a mislabel. Do not re-ask on
         # similarity. Page-interval mismatch is flagged at commit.
+        # LABEL-MISASSIGNMENT (ANAT-001 live): the model can write one
+        # question's solution INTO another with NO embedded marker, so C1
+        # cannot split and both verify and cross-check pass silently. The
+        # dup detector (80-char floor skips short shared boilerplate) forces
+        # a boundary-proof re-ask of BOTH q_nos; if it persists, the commit
+        # gate flags duplicate_solution (BLOCKER) and the zip stays shut.
         dup_force = set()
+        if phase_name == "Solution":
+            for a, b, sim in self._solution_dup_pairs(items):
+                self.notes.append(
+                    f"Solution: q{a} and q{b} solution texts are near-"
+                    f"duplicates ({int(sim * 100)}%) -- forced re-ask "
+                    f"(label misassignment suspect)")
+                for qn in (a, b):
+                    dup_force.add(qn)
+                    if qn not in have:
+                        continue
+                    pg = next((p for p, s in hdrs.items() if qn in s), None)
+                    if pg is None:
+                        it = next((i for i in items
+                                   if i.get("_qn") == qn), None)
+                        spr = (it or {}).get("source_page_range") or []
+                        pg = _safe_int(spr[0]) if spr else None
+                    missing_pages.setdefault(qn, pg)
         if not missing_pages:
             return items
         qns = sorted(missing_pages)
