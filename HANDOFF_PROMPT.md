@@ -27,18 +27,34 @@ poppler every diagnosis you make about the text layer will be wrong.
 Gemini keys come from env (`GEMINI_API_KEYS` or `GEMINI_API_KEY_1..N`). Never
 print them.
 
-## Test baseline — do not chase these
+## Test baseline — and a correction to an earlier claim
 
 ```
 .venv/bin/python -m pytest -q
 → 480 passed, 21 failed
 ```
 
-All 21 are pre-existing and environmental:
+**An earlier revision of this file called all 21 "environmental, do not chase".
+That was wrong and has cost the next agent nothing only by luck.** The real
+breakdown, measured with `pytest -q test_boundary_phased.py::EngineCase`:
 
-- 16 × `test_boundary_phased.py::EngineCase::*` and
-  `test_review_queue.py::TestQueueCacheAndPdfReader::test_pdf_reader_reused_per_book`
-  — need the gitignored fixture `/home/user/book2/book.pdf`
+```
+14 × AssertionError: False is not true          <- genuine assertion failures
+ 2 × boundary_phased.ModelBlocked               <- canned responses incomplete
+ 1 × AssertionError: ... C1-split chapter must lock clean
+ 1 × FileNotFoundError: 'pdftoppm'              <- the ONLY environmental one
+```
+
+So 15 of the 16 `EngineCase` failures are **stale tests, not environment
+noise**. They are canned-Gemini fixtures that predate later changes (the
+second dual key-table read, `MIN_SOLUTION_CHARS`). Fix the fixtures; do not
+skip the tests.
+
+Genuinely environmental, and safe to leave:
+
+- `test_boundary_phased.py::EngineCase::*` — the one `pdftoppm` case
+- `test_review_queue.py::TestQueueCacheAndPdfReader::test_pdf_reader_reused_per_book`
+  — needs the gitignored fixture `/home/user/book2/book.pdf`
 - `test_resume_relink_regressions.py::test_real_obg_ch3_ledger_replays`
   — needs `/home/user/audit/run_obg_ch3/data/image_ownership.jsonl`
 - `test_pipeline_json.py::UnifiedImageOwnershipTests::test_ocr_geometry_claims_when_text_layer_garbled`
@@ -46,10 +62,11 @@ All 21 are pre-existing and environmental:
 - `test_image_ownership_audit_regressions.py::TestSSectionBareListFilter::test_keyword_question_heading_survives_in_s_section`
   — passes alone, fails only in the full suite (test pollution)
 - `test_pipeline_json.py::SolutionFigureMappingTests::test_under_detected_headers_no_longer_swallow_the_page`
-  — **fails in isolation too (`AssertionError: 0 != 3`). This one is a genuine
-    un-investigated pre-existing bug**, not environmental.
+  — fails in isolation too (`AssertionError: 0 != 3`); genuine, un-investigated
 
-If your run shows more than 21, you broke something.
+**Lesson for whoever reads this next: run the failing test and read its actual
+error before classifying it.** Counting failures and assuming a cause is how
+the wrong label got written here in the first place.
 
 ## Architecture
 

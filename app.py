@@ -1236,7 +1236,7 @@ def download_master_review():
     # happened (matches the existing 'Download results' UX where
     # /make-zip prints a one-liner).
     try:
-        manifest = json.loads(
+        manifest = _json.loads(
             (out / "MASTER_REVIEW" / "MASTER_REVIEW_MANIFEST.json").read_text(
                 encoding="utf-8"))
         log(f"📒 MASTER_REVIEW: {manifest.get('total_chapters', 0)} chapter(s), "
@@ -2188,8 +2188,8 @@ def review_lookup():
                                           back=back_url)
     miss_hint = None
     if term and not cards:
-        qn_m = re.search(r"(?:^|-)(\d{1,3})$", term)
-        ch_m = re.match(r"^([A-Za-z]+)-(\d{3})", term)
+        qn_m = _re.search(r"(?:^|-)(\d{1,3})$", term)
+        ch_m = _re.match(r"^([A-Za-z]+)-(\d{3})", term)
         ch = ch_m.group(0) if ch_m else (chapter or None)
         all_rows = review_queue.lookup_questions(out, "", None)
         pool = [r for r in all_rows if r.get("chapter_id") == ch] if ch else all_rows

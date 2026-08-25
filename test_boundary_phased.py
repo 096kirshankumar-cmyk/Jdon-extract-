@@ -1314,7 +1314,13 @@ class EngineCase(unittest.TestCase):
         if gate.exists():
             kinds = [json.loads(l)["kind"] for l in gate.read_text().splitlines()
                      if l.strip()]
-        self.assertNotIn("duplicate_solution", kinds)
+        # RUN-42: restored. This assertion had been flipped to assertNotIn,
+        # which contradicted the docstring above it and silently blessed the
+        # ANAT-001 class -- two different questions shipping the same
+        # explanation, with verify and the set cross-check both passing.
+        self.assertIn("duplicate_solution", kinds)
+        self.assertFalse(res["locked"],
+                         "a label-misassignment suspect must not lock")
 
     def test_quota_pause_is_systemexit_and_saves_state(self):
         model = _FakeModel(self._answers())

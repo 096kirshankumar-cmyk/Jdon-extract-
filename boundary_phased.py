@@ -2816,6 +2816,14 @@ class ChapterRunner:
             return False, "no answer-key rows"
         if not s:
             return False, "no solutions"
+        # RUN-42: a phase that never resolved must not lock, even when the
+        # identity sets happen to line up. The set check below only proves the
+        # same q_nos came back from every phase -- it says nothing about
+        # whether a phase actually finished. Losing this guard let a chapter
+        # with an unresolved phase report lock=True.
+        unresolved = [n for n in (self.notes or []) if "unresolved" in n]
+        if unresolved:
+            return False, f"phase unresolved: {unresolved[0][:160]}"
         return True, "sets equal"
 
         # -- Record assembly ------------------------------------------------------
@@ -3313,6 +3321,16 @@ class ChapterRunner:
         # mislabelling), the chapter must NOT look clean -- BLOCKER + zip
         # shut until a human decides. Never silent.
         # Shared didactic boilerplate (Sol 8/9) is NOT a blocker.
+        # RUN-42: this call site had been deleted while the detector and this
+        # comment both survived, so the ANAT-001 class shipped clean and
+        # silent. Restored.
+        for q_a, q_b, sim in self._solution_dup_pairs(s_items):
+            violations.append((
+                "duplicate_solution", q_a,
+                f"q{q_a} and q{q_b} ship near-identical solution text "
+                f"(similarity {sim:.2f} >= 0.85) -- label misassignment "
+                f"suspect; both verify and the set cross-check pass this "
+                f"silently, so it is blocked here"))
         if not locked:
             reasons = "; ".join(self.notes[-6:]) or "cross-check refused LOCK"
             violations.append(("chapter_not_locked", None,
