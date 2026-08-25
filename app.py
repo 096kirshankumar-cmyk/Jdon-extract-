@@ -2188,7 +2188,6 @@ def review_lookup():
                                           back=back_url)
     miss_hint = None
     if term and not cards:
-        qn_m = _re.search(r"(?:^|-)(\d{1,3})$", term)
         ch_m = _re.match(r"^([A-Za-z]+)-(\d{3})", term)
         ch = ch_m.group(0) if ch_m else (chapter or None)
         all_rows = review_queue.lookup_questions(out, "", None)
@@ -2285,7 +2284,7 @@ document.querySelectorAll('button[data-imop]').forEach(function(b){
 </script>
 </body></html>
 """, f=f, term=term, chapter=chapter or "", auto_chapter=auto_chapter,
-    fstat=fstat, cards=cards)
+    fstat=fstat, cards=cards, miss_hint=miss_hint)
 
 
 @app.route("/review/upload-image", methods=["POST"])
