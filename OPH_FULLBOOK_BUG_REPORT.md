@@ -165,7 +165,12 @@ crop to p420-422 and still failed.
 
 ## What is NOT broken (verified against the source PDF)
 
-**OPH-001 is correct.** Compared line-by-line against the source:
+**CORRECTION.** An earlier revision of this report said "OPH-001 is correct".
+That was based on comparing only q1-q6. The digest shows OPH-001-007 and
+OPH-001-017 both carry `contaminated_question`, so OPH-001 is NOT clean. Only
+q1-q6 were verified, and they are correct.
+
+**OPH-001 q1-q6, verified line-by-line against the source:**
 
 | Check | Result |
 |---|---|
@@ -201,3 +206,68 @@ abnormality"`, `"oe SS «\ni i ity?"`). The Gemini crop path fixed it.
   proxy failed intermittently. Bug counts above are therefore lower bounds.
 - The remaining ~42 BLOCKERs (122 total minus the ~80 from Bug 1) were not
   individually enumerated.
+
+
+---
+
+# Complete cause taxonomy
+
+Every distinct reason string in the digest, grouped. Counts are instances
+observed across the readable chunks (2 of 14 digest chunks, 1 of 17 log
+chunks), so they are lower bounds.
+
+## BLOCKER causes
+
+| # | Reason | Cause | Instances seen |
+|---|---|---|---|
+| 1 | `missing_answer` | Answer-key table not read. `_attach_key_evidence` got only `key_table_ocr` and the dual Gemini read contributed nothing | OPH-004 q1-20, OPH-008 q1-26, OPH-016 q1-22, OPH-018 q1-14, OPH-022 q1-24, OPH-011 partial. **~110 instances, the dominant cause** |
+| 2 | `bad_options` + "option X text reconstructed from the solution's opening sentence" | Options not extracted (letters present, text empty), then a fallback **fabricates** text from the solution's first sentence | OPH-002-003, -008, OPH-004-*, OPH-011-025/-030/-033/-034, OPH-020-007, OPH-025-002, OPH-027-009 |
+| 3 | `missing_solution` | Solution empty or header-only; `sanitize` strips "Solution to Question N:" to nothing | OPH-002-002, OPH-004-020, OPH-011-033/-034, OPH-018-015, OPH-019-011/-012 |
+| 4 | `duplicate_solution` | Two questions ship near-identical solutions. Caught by the gate restored in `d0202ad` | OPH-008-002 (**similarity 1.00**), OPH-022-001 (0.95) |
+| 5 | `img_placeholder_count_mismatch` | `[IMG]` token count disagrees with owned file count | many, both sides |
+| 6 | `figure_page_mismatch` | Figure attached to a question many pages away | OPH-002-002 (p44 vs anchors [24,34]), OPH-019-012 (p439 vs [425,435]) |
+| 7 | `missing_declared_figure_question` | Model declared a figure, none attached, and the book prints one | OPH-008-001 (figure on p155) |
+| 8 | `answer_suspect` / key-letter flip | Solution opens on one option's content but `correct_option` is a different letter | OPH-007-006 (D vs B), OPH-008-021 (C vs D), OPH-008-024 (A vs B, C vs B), OPH-021-014 (A vs D), OPH-023-016 (C vs D) |
+| 9 | `solution_too_short` | Solution under `MIN_SOLUTION_CHARS` | OPH-007-010 (5 chars: `'[IMG]'`) |
+| 10 | C1 split at printed header boundary | A solution contained another question's header, so it was split | OPH-002-002, OPH-018-014, OPH-019-001/-011/-012, OPH-022-019 |
+| 11 | `verify exceeded attempts after one widened-crop retry` | The model could not produce usable text even after a widened crop | OPH-004-019, OPH-011-033 |
+
+## REVIEW causes
+
+| # | Reason | Cause | Instances seen |
+|---|---|---|---|
+| 1 | `img_placeholder_count_mismatch (solution): 1 [IMG] token, 0 files` | Solution text references a figure that nobody owns. **The dominant REVIEW cause.** Either the figure is owned by the question side and the cross-reference allowance did not cover it, or the model invented the marker | OPH-002-001/-006/-014/-020, OPH-005-015/-029, OPH-007-010/-019/-024, OPH-004-003/-005/-013, OPH-008-009/-026, OPH-016-018, OPH-022-003/-018 |
+| 2 | `contaminated_question` | `question_text` is not a stem — 80-94% of its tokens also appear in the same row's solution. Cross-field contamination | **OPH-001-007 (89%), OPH-001-017 (80%)**, OPH-002-029 (94%) |
+| 3 | `image_unresolved` | A figure the book prints was not claimed by any owner after every ownership level | OPH-002 p23, OPH-005 p101, OPH-006 p117 |
+| 4 | `ocr_noise_solution` | Solution contains page-level OCR noise lines | OPH-007-001 (`['141']`) |
+| 5 | `image_owner_gate_miss` | Export-gate wrong-owner suspect surfaced into review | OPH-002-002 |
+| 6 | `qa_incomplete` / `missing_answer` / `missing_solution` / `bad_options` | The BLOCKER causes re-surfaced as review rows | one row per affected question |
+
+## What the counts mean
+
+The 122 BLOCKER / 350 REVIEW totals are **not 472 independent problems**. They
+collapse into the causes above, and one cause dominates:
+
+- **~110 of the 122 BLOCKERs are cause 1** — the answer-key table. Fixing it
+  removes roughly 90% of the blockers in one change.
+- **Most of the 350 REVIEW rows are cause 1 re-surfaced** (each missing answer
+  also creates a review row) plus REVIEW cause 1 (the `[IMG]` token mismatch).
+- The genuinely distinct review problems are causes 2, 3 and 4:
+  **contaminated questions (3 seen), unresolved figures (3 seen), OCR noise
+  (1 seen).** That is a small number, and each is a different defect.
+
+## Priority
+
+1. **Answer-key table** — one fix removes ~110 blockers and most of the review
+   rows. Needs one run with `bbe4221` to identify which of the three
+   sub-causes it is.
+2. **`contaminated_question`** — question_text holding solution text. Three
+   instances including two in OPH-001. This is a real extraction defect, not a
+   false positive.
+3. **Option-text fabrication** — a fallback invents option text from the
+   solution. Fabrication should probably not exist at all.
+4. **`image_unresolved`** — three figures the book prints were not owned.
+5. **`[IMG]` token mismatch** — needs a decision on whether a solution
+   referencing the question's figure should be explained automatically
+   (RUN-44 does this when the question owns a figure; these cases are where it
+   does not).
