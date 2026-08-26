@@ -941,8 +941,15 @@ class ChapterRunner:
         recs = self._visual_headers or []
         if not recs:
             return []
-        file_end = getattr(self, "_scan_last", None) or getattr(
-            self, "_ch_last", None)
+        # Never close an interval into the next chapter. Boundary detection
+        # scans ch_last+2 to observe nearby headers, but those extra pages are
+        # only diagnostic context. OPH-018 q14 proved the failure: its final
+        # solution crop included page 422, the next chapter's "Diseases of the
+        # Orbit" page, because the last visual interval was closed at the
+        # scan end instead of the chapter end. A crop must be bounded by the
+        # chapter range; continuation pages inside that range remain intact.
+        file_end = getattr(self, "_ch_last", None) or getattr(
+            self, "_scan_last", None)
         if label == "Question":
             return header_index.intervals(recs, header_index.T_QUESTION,
                                           file_end=file_end)

@@ -119,6 +119,20 @@ class T(unittest.TestCase):
         self.assertIn(hi.text_layer_health("■□�" * 40 + "xxxx????"),
                       ("GARBLED", "DEGRADED"))
 
+    def test_visual_intervals_stop_at_chapter_end_not_scan_context(self):
+        """The scanner may inspect two context pages, but the final crop must
+        not swallow the next chapter into the last solution."""
+        r = bph.ChapterRunner("x.pdf", "OPH", 18, "/tmp", model=object(),
+                              state={})
+        r._ch_last = 421
+        r._scan_last = 423
+        r._visual_headers = [
+            {"page": 420, "y": 700, "type": header_index.T_SOLUTION, "n": 14},
+        ]
+        iv = r._visual_intervals("Solution")[0]
+        self.assertEqual(iv["end_page"], 421)
+        self.assertEqual([s["page"] for s in iv["strips"]], [420, 421])
+
     def test_crop_batchable_text_only_not_last_or_crosspage(self):
         mid = {"n": 3, "strips": [{"page": 6, "y_hi": 400, "y_lo": 200}]}
         last = {"n": 5, "strips": [{"page": 7, "y_hi": 300, "y_lo": 0}]}
