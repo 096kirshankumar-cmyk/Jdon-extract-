@@ -1351,7 +1351,8 @@ def qns_printed_on_page(pdf_path, true_page, chapter_records):
 def _transient_gemini_err(err_text):
     t = err_text.lower()
     return ("500" in t or "503" in t or "internal error" in t
-            or "high demand" in t or "unavailable" in t)
+            or "high demand" in t or "unavailable" in t
+            or "deadline exceeded" in t or "deadline_exceeded" in t)
 
 
 

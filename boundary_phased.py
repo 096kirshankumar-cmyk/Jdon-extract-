@@ -894,7 +894,16 @@ class ChapterRunner:
                 raise QuotaPaused()
             if qp._transient_gemini_err(err):
                 time.sleep(20)                   # one bounded transient retry
-                resp = self._generate_content(files)
+                try:
+                    resp = self._generate_content(files)
+                except Exception as retry_e:
+                    # A second deadline/internal failure is a phase-level
+                    # unresolved result, not a reason to crash the whole
+                    # chapter. Callers already convert an empty response into
+                    # an honest ledger/QA failure and continue safely.
+                    print(f"[BPH] bounded Gemini retry failed: "
+                          f"{type(retry_e).__name__}: {retry_e}")
+                    return ""
                 qp.note_call(self.state)
                 return _resp_text(resp)
             raise
