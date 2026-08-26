@@ -271,3 +271,76 @@ collapse into the causes above, and one cause dominates:
    referencing the question's figure should be explained automatically
    (RUN-44 does this when the question owns a figure; these cases are where it
    does not).
+
+---
+
+# Deep analysis from the complete run log (47 chunks)
+
+Run: 2026-08-25 21:48 → 22:52+. Commit `b0b7889` was pushed 21:47, one minute
+before the container started at 21:48:17, so whether the deploy included it is
+uncertain.
+
+## Finding 1 — the answer key is intermittent, not uniformly broken
+
+| Chapter | Key result | Outcome |
+|---|---|---|
+| OPH-001 | `key dual Gemini agree=23/23` | worked |
+| OPH-006 | 15 READY, 0 REVIEW, 0 INCOMPLETE | worked |
+| OPH-007 | `key dual Gemini agree=25/25` | worked |
+| OPH-004 | `missing_answer` on all 20 | failed |
+| OPH-008 | `missing_answer` on all 26 | failed |
+| OPH-016 | `missing_answer` on all 22 | failed |
+| OPH-018 | `key evidence for 5 row(s) (key_table_ocr)` vs 14 questions | failed |
+| OPH-022 | `missing_answer` on all 24 | failed |
+
+**This changes the diagnosis.** It is not "the key reader is broken" — it works
+perfectly on some chapters. It is **intermittent**, which points at the
+key-table crop or the table's printed position on specific pages, not at the
+reading logic. OPH-007's key spanned two pages (`key_region=[140, 141]`) and
+still worked, so multi-page tables are not the trigger.
+
+This run predates `bbe4221`, which added the per-method breakdown and warning
+that separate the three sub-causes.
+
+## Finding 2 — the q4 bleed fix is not holding
+
+```
+[SANITIZE] OPH-006-003: dropped 284 chars of the PREVIOUS question's solution
+           that bled into this crop (embedded 'Solution to Question 3' header
+           names this question)
+```
+
+OPH-001 q4 was clean in this same run, but OPH-006 q3 bled 284 characters. The
+amount has varied 696 → 121 → 0 → 284 across runs, consistent with model
+recitation rather than a crop-boundary error. `sanitize_solution_text` catches
+every instance so **no bled text has ever shipped** — but cleanup is not a fix.
+
+## Finding 3 — unresolved figures are real and few
+
+```
+[GATE] OPH-006: 1 export-gate violation(s) -- NOT a clean export
+- unresolved_image 117: OPH/OPH-p117-319.webp (method=none confidence=?)
+[IMG] OPH-006: attribution 9 crop-interval / 0 block-position / 0 carry /
+       0 model / 1 unclaimed
+```
+
+Three across the book (OPH-002 p23, OPH-005 p101, OPH-006 p117) — figures the
+book prints that no ownership level claimed.
+
+## Finding 4 — the discard path works as designed
+
+```
+[BPH] OPH-007: Q: q16 after retry DISCARDED 1 unusable item(s) -- left missing
+       rather than shipped as a guess
+```
+
+## Revised priority
+
+1. **Intermittent key-table failure** — ~110 blockers. Needs one run with
+   `bbe4221` on a failing chapter (OPH-004 or OPH-018) so the warning line
+   identifies the sub-cause.
+2. **Model recitation into the next solution** — `sanitize` catches every
+   instance so nothing bad ships, but it is not fixed at the source.
+3. **Three unresolved figures** — small, each needs its own look.
+4. **`contaminated_question`** (3) and **option-text fabrication** — real
+   extraction defects, independent of the above.
