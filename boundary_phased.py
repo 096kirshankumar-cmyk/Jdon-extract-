@@ -2199,6 +2199,20 @@ class ChapterRunner:
                 txt = ""
             if not txt.strip():
                 continue                      # scanned page: no opinion
+            # Detect a key table before rejecting a generally garbled page.
+            # OPH-004 p73 has a garbled question text layer but preserves the
+            # table header and all key rows as readable PDF text.
+            key_header = (self._KEYHEAD_QNO_TXT.search(txt)
+                          and self._KEYHEAD_COR_TXT.search(txt))
+            key_rows = [(int(m.group(1)), m.group(2).upper())
+                        for m in self._KEYROW_TXT.finditer(txt)]
+            if (key_header and len(key_rows) >= 6
+                    and len({n for n, _ in key_rows}) >= 6
+                    and max(n for n, _ in key_rows)
+                    - min(n for n, _ in key_rows)
+                    <= 3 * len(key_rows)):
+                key_cands.append(p)
+                key_max[p] = max(n for n, _ in key_rows)
             health = header_index.text_layer_health(txt)
             if health in ("EMPTY", "GARBLED"):
                 self.notes.append(f"p{p} text-layer {health} -- not printed")
@@ -2277,7 +2291,7 @@ class ChapterRunner:
                     if prow and cnums and min(cnums) == max(prow) + 1:
                         key_cands.insert(0, prev)
                         key_max[prev] = max(prow)
-        if read_pages == 0:
+        if read_pages == 0 and not key_cands:
             return None                       # scanned book: no printed signal
         self._printed_q_hdrs = q_hdrs
         self._printed_s_hdrs = s_hdrs
@@ -2533,9 +2547,19 @@ class ChapterRunner:
                 printed["q"] = vis["q_pages"] or printed.get("q") or set()
                 printed["s"] = vis["s_pages"] or printed.get("s") or set()
                 kreg = header_index.key_region_pages(self._visual_headers)
-                if kreg:
+                # Prefer a key span proven by the printed text-layer table
+                # over a visual OCR inference.  On OPH-004 the dense table is
+                # on p73, while the visual healer conservatively injects a
+                # synthetic key header on the preceding Q page (p72) after
+                # missing the tiny "Answer Key" band.  Letting that synthetic
+                # marker overwrite the printed probe sent the key crop to a
+                # page containing the last question, not the grid.  Evidence
+                # precedence is explicit: a real table header + rows wins;
+                # visual inference is only a fallback when no printed span
+                # was found.
+                if not printed.get("keys") and kreg:
                     printed["keys"] = kreg
-                elif vis["key_pages"]:
+                elif not printed.get("keys") and vis["key_pages"]:
                     printed["keys"] = sorted(vis["key_pages"])
                 print(f"[BPH] {self.chapter_id}: VISUAL header index "
                       f"Q{sorted(vis['q_ns'])} S{sorted(vis['s_ns'])} "

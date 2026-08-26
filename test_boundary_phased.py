@@ -666,6 +666,27 @@ class EngineCase(unittest.TestCase):
         self.assertEqual(row["solution"]["text"], "Corrected by fix with a sufficiently long explanation body.")
         self.assertEqual(row["qa_status"], "READY")
 
+    def test_garbled_page_with_key_header_still_proves_key_zone(self):
+        """OPH-004 regression: p73 has garbled question text, but the PDF
+        text layer still contains the key-table header and all rows.  The
+        general GARBLED classification must not discard this stronger,
+        table-specific evidence (or let a synthetic p72 marker win)."""
+        r = self._runner(_FakeModel([]))
+        orig = qp.pdftotext_page
+        rows = "\n".join(f"{i} {chr(96 + (i % 4 + 1))}" for i in range(1, 15))
+        garbled = ("Š" * 80 + "\nAnswer Key\n"
+                   "Question No.        Correct Option\n" + rows)
+        qp.pdftotext_page = lambda pdf, p: {
+            72: "Question 20:\n" + "�" * 80,
+            73: garbled,
+            74: "15 a\nDetailed Explanations\nSolution to Question 1:",
+        }.get(p, "")
+        try:
+            zones = r._printed_zones(67, 86)
+        finally:
+            qp.pdftotext_page = orig
+        self.assertEqual(zones["keys"], [73, 74])
+
     def test_printed_key_grid_continuation_page(self):
         """OBG ch2 live: key grid rows 1-14 print on p37; the grid's last row
         ('15 b') prints at the TOP of p38 before 'Detailed Explanations'.
