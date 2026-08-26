@@ -847,6 +847,25 @@ class ChapterRunner:
     # ------------------------------------------------------------------
     # THE model-call choke point
     # ------------------------------------------------------------------
+    def _generate_content(self, files):
+        """Call Gemini with a bounded transport timeout.
+
+        A stalled HTTP request used to leave a whole-book run alive forever
+        with no checkpoint (the OPH-001 full-book run stopped after announcing
+        its Q batches and never reached state.json). The SDK supports
+        request_options; the fallback keeps the seam-compatible fake models
+        used by the regression suite working.
+        """
+        kwargs = {"safety_settings": qp.SAFETY_SETTINGS,
+                  "request_options": {"timeout": 180}}
+        try:
+            return self.model.generate_content(files, **kwargs)
+        except TypeError as exc:
+            if "request_options" not in str(exc):
+                raise
+            return self.model.generate_content(
+                files, safety_settings=qp.SAFETY_SETTINGS)
+
     def _gen(self, files):
         """files: ordered parts (text strings and/or image dicts). Returns
         response text. Raises QuotaPaused when the day's pool is spent."""
@@ -856,14 +875,12 @@ class ChapterRunner:
             qp.save_state(self.state)
             raise QuotaPaused()
         try:
-            resp = self.model.generate_content(
-                files, safety_settings=qp.SAFETY_SETTINGS)
+            resp = self._generate_content(files)
             qp.note_call(self.state)
             return _resp_text(resp)
         except ModelBlocked:
             time.sleep(MODEL_BLOCK_SLEEP)      # one bounded retry: a
-            resp = self.model.generate_content(   # recitation/safety block
-                files, safety_settings=qp.SAFETY_SETTINGS)  # is prompt-roll bound
+            resp = self._generate_content(files)  # recitation/safety retry
             qp.note_call(self.state)
             return _resp_text(resp)            # still blocked -> raise through
         except Exception as e:
@@ -877,8 +894,7 @@ class ChapterRunner:
                 raise QuotaPaused()
             if qp._transient_gemini_err(err):
                 time.sleep(20)                   # one bounded transient retry
-                resp = self.model.generate_content(
-                    files, safety_settings=qp.SAFETY_SETTINGS)
+                resp = self._generate_content(files)
                 qp.note_call(self.state)
                 return _resp_text(resp)
             raise
