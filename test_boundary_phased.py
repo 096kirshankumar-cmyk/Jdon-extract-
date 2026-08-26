@@ -248,6 +248,22 @@ class T(unittest.TestCase):
         for banned in ("apply_edit(", "apply_image_op(", "apply_orphan_merge("):
             self.assertNotIn(banned, src)
 
+    def test_blank_option_is_not_fabricated_from_solution(self):
+        """A missing option is a real extraction gap, not permission to copy
+        the solution's first sentence into the option field."""
+        rec = {
+            "question_text": "Which option is correct?",
+            "options": {"A": "", "B": "wrong", "C": "other", "D": "none"},
+            "correct_option": "A",
+            "solution_text": "The printed answer is not enough evidence to recreate option A.",
+        }
+        row = qp.build_final_question("OPH", "OPH-001", 1, 1, rec,
+                                      {"question": [], "solution": []})
+        opts = {x["id"]: x["text"] for x in row["options"]}
+        self.assertEqual(opts["A"], "")
+        self.assertEqual(row["qa_status"], "INCOMPLETE")
+        self.assertTrue(any("not reconstructed" in x for x in row["qa_reasons"]))
+
     def test_norm_options_shapes_never_crash(self):
         """OBG ch2 live finding (2026-08-22): 'options' came back as a LIST
         and _build_records died with AttributeError, killing the chapter.

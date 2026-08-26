@@ -1897,20 +1897,19 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
     option_rows = [{"id": str(k).strip().upper(), "text": v,
                     "images": valid_images(opt_imgs.get(str(k).strip().upper(), []), "option")}
                    for k, v in (rec["options"] or {}).items()]
-    # Last-resort release backfill: targeted retry above requests all options
-    # when one is blank. If OCR/model extraction still leaves the *correct*
-    # option blank, preserve usability with the solution's opening sentence
-    # and make the repair conspicuous for validator/manual review.
+    # A missing option must remain missing.  The previous release copied the
+    # solution's opening sentence into a blank correct option, which fabricated
+    # content and could make an incomplete row look structurally complete.
+    # Extraction is provenance-only: targeted retries may recover the printed
+    # option, otherwise the export gate/qa layer flags it for a human.
     correct_id = str(rec.get("correct_option") or "").strip().upper()
     _build_flags = []
     for opt in option_rows:
         if opt["id"] == correct_id and not str(opt.get("text") or "").strip():
-            first = re.split(r"(?<=[.!?])\s+", sol_text.strip(), maxsplit=1)[0].strip()
-            if first:
-                opt["text"] = first
-                _build_flags.append(f"option {correct_id} text reconstructed "
-                                    "from the solution's opening sentence")
-                print(f"  [OPTION_BACKFILLED] {qid}: correct option {correct_id} reconstructed from solution opening")
+            _build_flags.append(
+                f"option {correct_id} text missing; not reconstructed from solution")
+            print(f"  [OPTION_MISSING] {qid}: correct option {correct_id} "
+                  "is blank; left unchanged for review")
     # Correct clearly mislabelled "Option X:" explanation lines only when the
     # description overlaps another option at least twice as strongly.
     opt_text = {o["id"]: str(o.get("text") or "") for o in option_rows}
