@@ -2823,8 +2823,28 @@ class ChapterRunner:
             v.get("method") in ("key_table_ocr", "key_dual_gemini")
             for v in ev.values())
         if ev:
-            print(f"[BPH] {self.chapter_id}: key evidence for "
-                  f"{len(ev)} row(s) ({','.join(sorted({v['method'] for v in ev.values()}))})")
+            # RUN-47: report the per-method breakdown, not just a total.
+            # OPH-018 logged "key evidence for 5 row(s) (key_table_ocr)" for a
+            # 14-question chapter and nothing said whether the dual Gemini
+            # read had run at all, or run and returned nothing, or disagreed.
+            # OPH-001 got agree=23/23 on the same code, so the difference is
+            # per-chapter and this line is what separates the causes.
+            by_method = {}
+            for v in ev.values():
+                m = v.get("method") or "?"
+                by_method[m] = by_method.get(m, 0) + 1
+            breakdown = " ".join(f"{m}={c}"
+                                 for m, c in sorted(by_method.items()))
+            conflicts = sorted(n for n, v in ev.items()
+                               if v.get("method") == "key_conflict")
+            print(f"[BPH] {self.chapter_id}: key evidence for {len(ev)} "
+                  f"row(s): {breakdown} | key pages {sorted(a_pages or [])}"
+                  + (f" | CONFLICT rows {conflicts}" if conflicts else ""))
+            if "key_dual_gemini" not in by_method:
+                print(f"[BPH] {self.chapter_id}: WARNING -- the dual Gemini "
+                      f"key read contributed NOTHING; every answer came from "
+                      f"{breakdown}. Check the key-table crop and the table's "
+                      f"printed position on pages {sorted(a_pages or [])}.")
         return ev
 
     def _write_audit_artifacts(self, ch_first, ch_last, q_items, a_items, s_items):
