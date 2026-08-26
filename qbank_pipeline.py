@@ -1904,6 +1904,14 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
     # option, otherwise the export gate/qa layer flags it for a human.
     correct_id = str(rec.get("correct_option") or "").strip().upper()
     _build_flags = []
+    sol_text, _unbacked = strip_unbacked_img_markers(
+        sol_text, len(sol_images))
+    if _unbacked:
+        _build_flags.append(
+            f"removed {_unbacked} unbacked [IMG] marker(s) from solution; "
+            "no solution figure exists in the owned interval")
+        print(f"  [IMG_MARKER_CLEANUP] {qid}: removed {_unbacked} "
+              "unbacked solution marker(s); image ownership remains empty")
     for opt in option_rows:
         if opt["id"] == correct_id and not str(opt.get("text") or "").strip():
             _build_flags.append(
@@ -4253,6 +4261,25 @@ _IMG_PLACEHOLDER_RE = re.compile(r"\[IMG\]", re.I)
 
 def count_img_placeholders(text):
     return len(_IMG_PLACEHOLDER_RE.findall(text or ""))
+
+
+def strip_unbacked_img_markers(text, n_files):
+    """Remove model-only image markers when geometry proves that the block
+    owns no image files.
+
+    A marker is layout metadata, not medical content.  On OPH-008 q9 the
+    isolated crop visibly contains text and a table but no figure; Gemini
+    nevertheless emitted ``[IMG]``.  Keeping that invented marker makes the
+    exported text claim a nonexistent asset.  We remove only this
+    unambiguous zero-file case; when one or more files exist, marker/file
+    ordering remains unresolved and the strict mismatch check is retained.
+    Returns (clean_text, removed_count).
+    """
+    n_files = int(n_files or 0)
+    n = count_img_placeholders(text)
+    if n_files != 0 or n == 0:
+        return text or "", 0
+    return _IMG_PLACEHOLDER_RE.sub("", text or ""), n
 
 
 def reconcile_img_placeholders(text, n_files, side=None):

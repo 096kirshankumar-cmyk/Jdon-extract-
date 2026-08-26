@@ -262,6 +262,22 @@ class T(unittest.TestCase):
         for banned in ("apply_edit(", "apply_image_op(", "apply_orphan_merge("):
             self.assertNotIn(banned, src)
 
+    def test_unbacked_solution_img_marker_is_removed_and_flagged(self):
+        """A model-invented [IMG] marker with zero owned files must not ship
+        as a claim of a nonexistent figure; cleanup is deterministic and the
+        event remains visible for review."""
+        rec = {
+            "question_text": "Which finding is shown?",
+            "options": {"A": "one", "B": "two", "C": "three", "D": "four"},
+            "correct_option": "A",
+            "solution_text": "The finding is described here. [IMG]",
+        }
+        row = qp.build_final_question("OPH", "OPH-001", 1, 1, rec,
+                                      {"question": [], "solution": []})
+        self.assertNotIn("[IMG]", row["solution"]["text"])
+        self.assertEqual(row["qa_status"], "REVIEW_NEEDED")
+        self.assertTrue(any("unbacked" in x for x in row["qa_reasons"]))
+
     def test_blank_option_is_not_fabricated_from_solution(self):
         """A missing option is a real extraction gap, not permission to copy
         the solution's first sentence into the option field."""
