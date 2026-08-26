@@ -1919,10 +1919,17 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
         scores = {k: len(words & set(re.findall(r"\w+", v.lower()))) for k, v in opt_text.items() if v}
         best = max(scores, key=scores.get) if scores else label
         if best != label and scores.get(best, 0) >= 2 * max(1, scores.get(label, 0)):
-            print(f"  [LABEL_CORRECTED] {qid}: Option {label} -> Option {best}")
+            # Do not rewrite a printed/model label based on token overlap.
+            # Overlap can identify a suspect mismatch, but it cannot prove
+            # which label the source intended. Preserve the extracted text and
+            # surface the evidence for human review instead of silently
+            # changing content.
+            print(f"  [LABEL_SUSPECT] {qid}: Option {label} may point to "
+                  f"Option {best}'s content -- preserved unchanged")
             _build_flags.append(f"printed 'Option {label}:' explanation line "
-                                f"points at option {best}'s content")
-            return f"Option {best}: {desc}"
+                                f"may point at option {best}'s content; "
+                                "preserved unchanged for review")
+            return m.group(0)
         return m.group(0)
     sol_text = re.sub(r"(?m)Option\s+([A-D])\s*:\s*([^\n]+)", relabel, sol_text)
 
