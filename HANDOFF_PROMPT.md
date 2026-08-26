@@ -6,7 +6,7 @@ you do not redo work that is already on this branch.
 
 - Repo: `https://github.com/096kirshankumar-cmyk/Jdon-extract-`
 - Branch: `arena/01a03242-jdon-extract`
-- Start from: **`35011b8`**
+- Start from: **`1bf236f`**
 
 ## Environment
 
@@ -217,3 +217,68 @@ the product owner's:
    `lock=yes`, and a REVIEW_NEEDED count you can account for line by line.
 3. One chapter from a second book, same reporting.
 4. `pytest -q` at 503 passed / 0 failed.
+
+
+---
+
+# CURRENT STATE — read this first, it supersedes the older sections above
+
+Full-book run analysed: 631 questions, 122 BLOCKER / 350 REVIEW / 252 NOISE.
+Complete cause taxonomy is in `OPH_FULLBOOK_BUG_REPORT.md`. Read that before
+anything else.
+
+## The one bug worth fixing first: intermittent answer-key failure
+
+**~110 of the 122 BLOCKERs are this single cause.** But it is NOT uniform:
+
+| Chapter | Result | |
+|---|---|---|
+| OPH-001 | `key dual Gemini agree=23/23` | worked |
+| OPH-006 | 15 READY, 0 flagged | worked |
+| OPH-007 | `key dual Gemini agree=25/25`, key on 2 pages | worked |
+| OPH-004 / 008 / 016 / 022 | every question `missing_answer` | failed |
+| OPH-018 | `key evidence for 5 row(s) (key_table_ocr)` vs 14 questions | failed |
+
+So "the key reader is broken" is the wrong diagnosis. It is intermittent,
+which points at the key-table crop or the table's printed position on specific
+pages. OPH-007's key spanned two pages and still worked, so multi-page tables
+are not the trigger.
+
+**YOUR FIRST TASK.** Run ONE failing chapter (OPH-004 or OPH-018) and report
+these four lines:
+
+```bash
+grep "key evidence for\|WARNING -- the dual\|key dual Gemini\|CONFLICT rows\|USED zones" <log>
+```
+
+Commit `bbe4221` added the per-method breakdown and the explicit warning
+precisely because the old log could not distinguish the three sub-causes:
+the crop did not render; it rendered and Gemini returned nothing; it rendered
+and the two reads disagreed. **Do not guess which — get the line first.**
+
+## Second: the solution bleed is model recitation, not a crop error
+
+```
+[SANITIZE] OPH-006-003: dropped 284 chars of the PREVIOUS question's solution
+```
+
+The dropped amount has varied 696 → 121 → 0 → 284 across runs on the same
+input. A fixed crop cannot produce different amounts, so the model is writing
+text that is not in the image. `sanitize_solution_text` catches every instance
+so nothing bad has ever shipped, but cleanup is not a fix. `b0b7889` added a
+prompt rule; it reduces the bleed but does not eliminate it.
+
+## Third: small, distinct, real
+
+- **3 unresolved figures** the book prints: OPH-002 p23, OPH-005 p101,
+  OPH-006 p117.
+- **`contaminated_question`** — question_text holding its own solution's text
+  (OPH-001-007 at 89%, OPH-001-017 at 80%, OPH-002-029 at 94%).
+- **Option-text fabrication** — a fallback invents option text from the
+  solution's opening sentence. Decide whether this fallback should exist.
+
+## Correction to an earlier claim in this file
+
+An earlier revision said OPH-001 was correct. Only q1-q6 were compared against
+the source PDF, and those are correct. OPH-001-007 and OPH-001-017 both carry
+`contaminated_question`, so OPH-001 is not clean.
