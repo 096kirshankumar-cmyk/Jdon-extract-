@@ -165,9 +165,6 @@ class TestResumeRelink(RelinkEnv):
         self.assertEqual(notes[0]["kind"], "OPT_C")
         self.assertEqual(opages.get(f), 61)
 
-    @unittest.skipUnless(
-        Path("/home/user/audit/run_obg_ch3/data/image_ownership.jsonl").exists(),
-        "production OBG ch3 ledger fixture absent (developer-machine data)")
     def test_real_obg_ch3_ledger_replays(self):
         """Replay the ACTUAL production ledger from the paused+resumed
         OBG ch3 run: every claimed/shared solution figure re-attaches to

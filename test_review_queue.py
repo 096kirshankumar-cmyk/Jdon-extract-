@@ -651,7 +651,6 @@ class TestQueueCacheAndPdfReader(QEnv):
         self.assertIsNot(a, b)                                 # rebuilt
         self.assertEqual(b["counts"]["resolved"], 1)           # new decision visible
 
-    @unittest.skipUnless(os.path.exists(BOOK2), "book2 absent")
     def test_pdf_reader_reused_per_book(self):
         rq._PDF_READERS.clear()
         rq._pdf_reader("/home/user/book2/book.pdf")

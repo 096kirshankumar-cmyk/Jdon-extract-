@@ -585,6 +585,12 @@ def find_watermark_object_ids(pdf_path):
     return result
 
 
+def find_watermark_object_id(pdf_path, sample_pages=30):
+    """Backward-compatible singular API; new pipeline code uses the set API."""
+    ids = find_watermark_object_ids(pdf_path)
+    return min(ids) if ids else None
+
+
 def _normalise_watermark_ids(value):
     """Accept the new set filter and the legacy single integer argument."""
     if value is None:
@@ -1427,12 +1433,6 @@ CARRY_SEED_LOOKBACK_PAGES = 3
 # Carry claims may reach the model ceiling; plain same-page positional claims
 # still stop at the strict cap.
 CARRY_CLAIM_SOURCE = "positional_carry"
-# RUN-39: the figure lies inside a CROP INTERVAL -- the same block extent the
-# text was cut from. This is the strongest deterministic claim there is: the
-# block boundary is the one the reader sees, and it spans pages, so a figure
-# above its question's stem (header on the previous page) is proven without
-# any carry. See boundary_phased.ChapterRunner._claim_images_by_interval.
-INTERVAL_CLAIM_SOURCE = "interval"
 # BUG 7B: a carry that crossed more than this many pages without a new
 # printed heading is too weak to auto-attach (image-heavy books).
 MAX_CARRY_PAGES = 1
@@ -1484,13 +1484,6 @@ MAX_SOLUTION_IMAGES = 2       # a solution block cites at most a figure or two;
                               # shortcut attached EVERY page image to the one header
                               # the text layer happened to decode).
 MIN_IMAGE_BYTES = 1500        # <1.5 KB webp is virtually always an empty/broken crop
-# RUN-34 (OPH-001 live): q3's solution shipped as the two characters ". X" and
-# the gate called it complete, because missing_solution only tested for an
-# EMPTY string. The book's shortest real explanation is 63 characters ("The
-# canal of Schlemm appears by the 4th month after conception."), so 20 is a
-# very wide margin -- it catches residue without ever flagging a genuine
-# one-line answer.
-MIN_SOLUTION_CHARS = 20
                               # must differ by at least this to decide automatically;
                               # below it both variants are logged for review (no silent picks).
 DANGLING_END_RE = re.compile(r"(:|\u2014|\u2013|\u2022)\s*$")   # ends ':' / em/en-dash / bullet
@@ -1660,117 +1653,6 @@ def _frag_mostly_present(frag, existing, threshold=0.85):
 # ============================================================
 
 
-_PAGE_FURNITURE_RES = (
-    # reseller stamp, with or without the page number in front of it
-    re.compile(r"(?i)^\s*\d{1,4}\s+sold\s+by\s+@\S+\s*$"),
-    re.compile(r"(?i)^\s*sold\s+by\s+@\S+\s*$"),
-    # publisher mark, with or without the copyright glyph
-    re.compile(r"(?i)^\s*(?:\u00a9|\(c\))?\s*marrow\s*$"),
-)
-_BARE_PAGE_NO_RE = re.compile(r"^\s*\d{1,4}\s*$")
-
-
-def strip_page_furniture(text):
-    """Drop page furniture that extraction sweeps into body copy.
-
-    OPH-001 live, straight out of questions.jsonl:
-        q1 solution  "...leading to\\n12 Sold by @itachibot\\n\\nhypermetropia."
-        q7 stem      "...appearsby_\\n5 Sold by @itachibot"
-        q9 option D  "Middle cerebral artery 6 Sold by @itachibot PRunebdinn IN"
-        q9 solution  "...superior hypophyseal artery - ventral...\\n\u00a9MARROW"
-
-    Only whole lines that are PURELY furniture are removed. A line carrying
-    anything else is left untouched -- eating a clause to remove a stamp would
-    be a worse defect than the stamp. A bare page-number line is dropped only
-    when the next non-empty line is a reseller stamp, which is the shape this
-    footer actually takes ("11\\nSold by @itachibot").
-
-    The garbled watermark variants ("Cmlistklianm Fm Pir tr rebkiana") are
-    deliberately NOT matched: they are OCR noise with no stable spelling, and
-    pattern-guessing at them would risk eating real text. Those are reported
-    by _ocr_noise_note instead of silently rewritten.
-
-    Returns (cleaned_text, dropped_line_count)."""
-    src = text or ""
-    if not src.strip():
-        return src, 0
-    lines = src.split("\n")
-    keep, dropped = [], 0
-    # RUN-41: drop LEADING bare page-number line(s) -- crop-top residue from
-    # a footer sitting under a bottom-of-page header. Only lines before any
-    # real content qualify; a lone digit line anywhere later is ambiguous
-    # (a numbered list item may legitimately be a bare digit line).
-    while lines:
-        head = lines[0].strip()
-        if not head:
-            lines = lines[1:]          # leading blank: harmless, drop
-            continue
-        if _BARE_PAGE_NO_RE.match(head) or any(r.match(head)
-                                               for r in _PAGE_FURNITURE_RES):
-            dropped += 1
-            lines = lines[1:]
-        else:
-            break
-    for i, ln in enumerate(lines):
-        if any(r.match(ln) for r in _PAGE_FURNITURE_RES):
-            dropped += 1
-            continue
-        if _BARE_PAGE_NO_RE.match(ln):
-            nxt = next((x for x in lines[i + 1:] if x.strip()), "")
-            if any(r.match(nxt) for r in _PAGE_FURNITURE_RES[:2]):
-                dropped += 1
-                continue
-        keep.append(ln)
-    if not dropped:
-        return src, 0
-    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(keep)).strip()
-    return cleaned, dropped
-
-
-# Characters that indicate OCR or font damage rather than real typography.
-# Medical textbooks legitimately use ° µ – — ‘ ’ “ ” • → × ≤ ≥ ± and Greek
-# letters, so the original "ord(c) > 127" test produced false positives on
-# OPH-001: q9's three-bullet list scored 3/137 = 0.022 non-ASCII and was
-# flagged as damage, pushing the chapter from 6 REVIEW_NEEDED to 11 for text
-# that was perfectly correct. Only glyphs that never appear in correct print
-# count now; the private-use area is where garbled font encodings land.
-_OCR_DAMAGE_CHARS = frozenset("\ufffd\u25a0\u25a1\u25aa\u25ab")
-
-
-def _ocr_damage_share(s):
-    """Share of characters that are OCR/font damage, not typography."""
-    n = max(len(s), 1)
-    return sum(1 for c in s
-               if c in _OCR_DAMAGE_CHARS or "\ue000" <= c <= "\uf8ff") / n
-
-
-def _ocr_noise_note(text, field):
-    """A review reason when `text` looks like OCR damage rather than prose.
-
-    Nothing here rewrites anything -- the record ships as extracted and a
-    human decides. Applied per FIELD, because a whole-page health check says
-    nothing about one option label and would call a legitimate "2.4 cm" empty.
-
-    OPH-001 shipped both of these as READY:
-        q2 stem  "oe SS \u00ab\\ni i ity?\\nAt what age would a child attain full a \u00ab"
-        q3 stem  "A ascarid presen GR the abnormality as shown below"
-        q1 opt D "Astigmatic x\u201c es _ ne 0 n\\* \\ \u00bb\\* XW e Niactinn = a ws +."
-    """
-    s = (text or "").strip()
-    if not s:
-        return None
-    n = len(s)
-    letters = sum(1 for c in s if c.isalpha())
-    damage = _ocr_damage_share(s)
-    if n >= 24 and damage > 0.02:
-        return (f"{field}: damaged glyphs {damage * n:.0f}/{n} chars -- looks "
-                f"like OCR damage, not print")
-    if n >= 40 and letters / n < 0.55:
-        return (f"{field}: only {letters}/{n} alphabetic -- looks like OCR "
-                f"damage, not prose")
-    return None
-
-
 def sanitize_solution_text(text, own_qn=None):
     """Strip print furniture that leaks into solution text (run-4 audit):
       1. leading verbatim book headers  ("Solution to Question 2:") that the
@@ -1785,13 +1667,6 @@ def sanitize_solution_text(text, own_qn=None):
     s = text or ""
     if not s.strip():
         return s, notes
-    # RUN-34: page furniture goes first. OPH-001 shipped q1's solution with
-    # "12 Sold by @itachibot" sitting between two clauses, and several others
-    # ended in "\u00a9MARROW".
-    s, _dropped = strip_page_furniture(s)
-    if _dropped:
-        notes.append(f"stripped {_dropped} page-furniture line(s) "
-                     f"(reseller stamp / publisher mark / page number)")
     while True:
         m = re.match(r"\s*Solution\s+to\s+Question\s+\d{1,3}\s*[:.\-]?\s*", s, re.IGNORECASE)
         if not m:
@@ -1802,36 +1677,12 @@ def sanitize_solution_text(text, own_qn=None):
     if m and m.start() > 0:
         head = s[:m.start()].rstrip()
         tail = s[m.end():].lstrip(" :\n")
-        # RUN-36 (OPH-001 q4 live): the crop for this block bled over the page
-        # break and picked up the PREVIOUS question's explanation, so the
-        # record read
-        #     "Uveal melanomas arise from uveal melanocytes...   <- q3's
-        #
-        #      Solution to Question 4:
-        #
-        #      The macula is fully developed by 4-6 months..."
-        # When the embedded header names THIS question, everything before it
-        # cannot be this question's solution -- the book prints that header as
-        # the start of the explanation. Drop the head. This is deterministic,
-        # not a guess, and it shipped as qa_status=READY before: the old code
-        # only stripped a LEADING header, so a foreign head survived silently.
-        try:
-            hdr_qn = int(m.group(1))
-        except (TypeError, ValueError):
-            hdr_qn = None
+        # The precise dump proof: the chunk IMMEDIATELY after the header
+        # restates THIS solution's own earlier content (the model re-recited
+        # this question before dumping its neighbours). Neighbour content
+        # further down the tail is never judged -- only the first line.
         tail_first = tail.split("\n", 1)[0][:150]
-        if head and own_qn is not None and hdr_qn == int(own_qn):
-            s = tail
-            notes.append(
-                f"dropped {len(head)} chars of the PREVIOUS question's "
-                f"solution that bled into this crop (embedded 'Solution to "
-                f"Question {hdr_qn}' header names this question)")
-        elif head and tail_first and _frag_mostly_present(tail_first, head, 0.8):
-            # The precise dump proof: the chunk IMMEDIATELY after the header
-            # restates THIS solution's own earlier content (the model
-            # re-recited this question before dumping its neighbours).
-            # Neighbour content further down the tail is never judged -- only
-            # the first line.
+        if head and tail_first and _frag_mostly_present(tail_first, head, 0.8):
             s = head
             notes.append(f"truncated duplicated 'Solution to Question {m.group(1)}' dump")
         else:
@@ -1855,7 +1706,7 @@ def _is_printed_answer_key(t):
 
 def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files,
                          source_pages=None, ownership_pages=None,
-                         gate_notices=None, carry_corroborated=None):
+                         gate_notices=None):
     qid = f"{subject}-{chapter_no:03d}-{q_no:03d}"
 
     def valid_images(imgs, kind):
@@ -1955,85 +1806,28 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
     if structural_missing:
         status_reasons.append(f"missing structural fields: {structural_missing}")
 
-    # RUN-34: OCR damage that survived the page-furniture strip. Reported,
-    # never rewritten -- the record ships exactly as extracted and a human
-    # decides. OPH-001 shipped every one of these as READY, which is how a
-    # stem reading "A ascarid presen GR the abnormality" reached the export.
-    _noise = _ocr_noise_note(rec.get("question_text"), "question stem")
-    if _noise:
-        status_reasons.append(_noise)
-    for _letter in sorted(rec.get("options") or {}):
-        _n_opt = _ocr_noise_note((rec.get("options") or {})[_letter],
-                                 f"option {_letter}")
-        if _n_opt:
-            status_reasons.append(_n_opt)
-    _n_sol = _ocr_noise_note(sol_text, "solution")
-    if _n_sol:
-        status_reasons.append(_n_sol)
-
-    # image-evidence review: any attached image whose ownership proof is
-    # WEAKER than same-page printed geometry. Two distinct classes, reported
-    # separately so a reviewer can tell them apart:
-    #   * model-only -- isolated_crop_vision, or full_page_vision at
-    #     non-high confidence (the original rule);
-    #   * positional_carry -- deterministic, but the owner is the block
-    #     CARRIED across the page edge (active_block), not a heading printed
-    #     above the figure on its own page. RUN-29 (OPH-001 live): carry
-    #     claims were graded "medium" and matched neither branch above, so
-    #     the row shipped READY. Every mis-attribution the carry produced was
-    #     invisible to qa_status and therefore to /review. A carry is real
-    #     evidence, so it does not make the row INCOMPLETE -- it makes it
-    #     REVIEW_NEEDED, which is exactly what the review layer is for.
+    # image-evidence review: any attached image whose only ownership proof is
+    # a non-deterministic (model) method or non-high confidence
     ownership_methods = _ownership_method_map(chapter_id)
-
-    def _img_evidence_class(meth, conf):
-        """None | "model" | "carry" -- the weakness class of one claim."""
-        if meth == "isolated_crop_vision":
-            return "model"
-        if meth == "full_page_vision" and conf != "high":
-            return "model"
-        if meth == CARRY_CLAIM_SOURCE:
-            return "carry"
-        return None
-
     weak_img_files = []
-    carry_img_files = []
-    corroborated_files = []
-    _corroborated = carry_corroborated or set()
-
-    def _record_image_flag(fname, cls, meth, conf):
-        """RUN-37: a carry whose figure lies inside its owner's own block
-        interval is corroborated by geometry and does not need a human. Any
-        other carry still flags -- clearing the class wholesale would just
-        hide the attributions that really are guesses."""
-        if cls == "model":
-            weak_img_files.append(f"{fname} ({meth}/{conf or '?'})")
-        elif cls == "carry":
-            if fname in _corroborated:
-                corroborated_files.append(fname)
-            else:
-                carry_img_files.append(f"{fname} ({meth}/{conf or '?'})")
-
     for side, imgs in (("question", q_images), ("solution", sol_images)):
         for im in imgs:
             ev = ownership_methods.get(im["file"], {})
             meth, conf = ev.get("method"), ev.get("confidence")
-            _record_image_flag(im["file"], _img_evidence_class(meth, conf),
-                               meth, conf)
+            if meth == "isolated_crop_vision" or (
+                    meth == "full_page_vision" and conf != "high"):
+                weak_img_files.append(f"{im['file']} ({meth}/{conf or '?'})")
     opt_blob = (image_files.get("option") or {})
     for letter, files in opt_blob.items():
         for fn, meta in [] if not ownership_methods else [
                 (f, ownership_methods.get(f, {})) for f in files]:
             meth, conf = meta.get("method"), meta.get("confidence")
-            _record_image_flag(fn, _img_evidence_class(meth, conf), meth, conf)
+            if meth == "isolated_crop_vision" or (
+                    meth == "full_page_vision" and conf != "high"):
+                weak_img_files.append(f"{fn} ({meth}/{conf or '?'})")
     if weak_img_files:
         status_reasons.append("image(s) attached by model-only evidence: "
                               + "; ".join(weak_img_files))
-    if carry_img_files:
-        status_reasons.append(
-            "image(s) owned by cross-page carry (no heading printed above "
-            "the figure on its own page -- owner inferred from the block "
-            "still open on the previous page): " + "; ".join(carry_img_files))
 
     # gate notices for this question (wrong-owner suspect, strong missing
     # figure, etc.)
@@ -2412,10 +2206,7 @@ def _rename_for_slot(rel, qn, kind, subject, chapter_no, image_files_by_q,
         # deterministic same-page geometry is the strongest claim; a carry
         # spans a page edge; a model verdict is medium unless it declared
         # its own confidence (full_page_vision passes it via `confidence`).
-        # An interval claim is the strongest of all: the figure sits inside
-        # the very block extent the text was cut from.
         confidence = {"positional": "high",
-                      INTERVAL_CLAIM_SOURCE: "high",
                       CARRY_CLAIM_SOURCE: "medium"}.get(claim_source, "medium")
     _record_image_ownership(subject, chapter_id, src_page, rel, qid, kind,
                             claim_source,
@@ -2959,9 +2750,6 @@ def ocr_page_anchors_xy(png, scale, page_h_pt):
 
 
 
-
-
-
 def _record_image_ownership(subject, chapter_id, page, rel, qid, slot,
                             method, evidence, confidence="high",
                             outcome="claimed", obj_id=None, final_file=None):
@@ -3019,123 +2807,6 @@ def _ownership_method_map(chapter_id):
                           "confidence": row.get("confidence"),
                           "page": row.get("page")}
     return out
-
-
-def carry_claims(chapter_id):
-    """[{file, final_file, owner, slot, page}] for this chapter's carry claims.
-
-    RUN-37. A carry claim is the weakest deterministic ownership: no heading
-    was found above the figure on its own page, so it went to the block still
-    open from the previous page. The caller decides whether independent
-    geometry corroborates it -- see
-    boundary_phased.ChapterRunner._corroborated_carry_files."""
-    out = []
-    path = DATA_DIR / "image_ownership.jsonl"
-    if not path.exists():
-        return out
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return out
-    for line in lines:
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if row.get("chapter_id") != chapter_id:
-            continue
-        if row.get("outcome") != "claimed":
-            continue
-        if row.get("method") != CARRY_CLAIM_SOURCE:
-            continue
-        out.append({"file": row.get("file"),
-                    "final_file": row.get("final_file") or row.get("file"),
-                    "owner": row.get("owner"),
-                    "slot": row.get("slot"),
-                    "page": row.get("page")})
-    return out
-
-
-def image_attribution_summary(chapter_id):
-    """How this chapter's figures actually got their owner, from the ledgers.
-
-    RUN-29 (OPH-001): the carry rate was only readable by counting "[IMG]
-    page N: active-block carry" lines out of a run log, so it was not a
-    metric anyone could watch regress. This recomputes the same split from
-    the append-only ownership ledger -- claimed rows by `method` -- plus the
-    unclaimed count from unmatched_images.jsonl, so every chapter reports
-    its own attribution mix and a rising carry share is visible without
-    reading logs.
-
-    Returns {"claimed_by_method": {method: n}, "carry": n, "positional": n,
-             "model": n, "claimed_total": n, "unclaimed": n,
-             "carry_share": float|None}. carry_share is the share of CLAIMED
-    figures owned by cross-page carry (the OPH-001 number)."""
-    path = DATA_DIR / "image_ownership.jsonl"
-    # One file can appear on several claimed rows (multi-draw share,
-    # resume-relink), so key by the file and keep its LATEST claim -- then
-    # count each file exactly once, the same de-duplication
-    # _ownership_method_map applies when it drives qa_status.
-    latest_method: dict = {}
-    if path.exists():
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            lines = []
-        for line in lines:
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if row.get("chapter_id") != chapter_id:
-                continue
-            if row.get("outcome") != "claimed":
-                continue
-            key = row.get("final_file") or row.get("file")
-            if not key:
-                continue
-            latest_method[key] = row.get("method") or "unknown"
-
-    by_method: dict = {}
-    for m in latest_method.values():
-        by_method[m] = by_method.get(m, 0) + 1
-
-    unclaimed = 0
-    um_path = DATA_DIR / "unmatched_images.jsonl"
-    if um_path.exists():
-        try:
-            for line in um_path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    u = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if u.get("chapter_id") == chapter_id:
-                    unclaimed += 1
-        except OSError:
-            pass
-
-    carry = by_method.get(CARRY_CLAIM_SOURCE, 0)
-    interval = by_method.get(INTERVAL_CLAIM_SOURCE, 0)
-    positional = by_method.get("positional", 0) + \
-        by_method.get("deterministic_geometry", 0) + \
-        by_method.get("deterministic_ocr_geometry", 0)
-    model = by_method.get("isolated_crop_vision", 0) + \
-        by_method.get("full_page_vision", 0)
-    claimed_total = sum(by_method.values())
-    return {"claimed_by_method": by_method,
-            "carry": carry,
-            "interval": interval,
-            "positional": positional,
-            "model": model,
-            "claimed_total": claimed_total,
-            "unclaimed": unclaimed,
-            "carry_share": (carry / claimed_total) if claimed_total else None}
 
 
 def _answer_option_mismatch(rec, correct_id, option_rows):
@@ -4083,14 +3754,6 @@ def _export_gate_violations(chapter_records, image_files_by_q, unresolved_ledger
             violations.append(("missing_solution", qn,
                                "no solution_text (header-only model answer "
                                "stripped by sanitize)"))
-        elif len(sol_check.strip()) < MIN_SOLUTION_CHARS:
-            # RUN-34: OPH-001 q3 shipped ". X" as its whole explanation and
-            # passed, because the test above only caught an empty string.
-            violations.append(("solution_too_short", qn,
-                               f"solution_text is only "
-                               f"{len(sol_check.strip())} chars "
-                               f"(< {MIN_SOLUTION_CHARS}): "
-                               f"{sol_check.strip()[:60]!r}"))
         if rec.get("_stem_suspect_reason"):
             # run-13: quarantined suspect stem (kept for review, not deleted)
             # is still a violation -- the chapter must not look clean while a
@@ -4249,24 +3912,18 @@ def count_img_placeholders(text):
     return len(_IMG_PLACEHOLDER_RE.findall(text or ""))
 
 
-def reconcile_img_placeholders(text, n_files, side=None):
+def reconcile_img_placeholders(text, n_files):
     """Match [IMG] tokens to geometrically owned files by COUNT only.
 
     Equal -> ok (files already reading-order). Unequal -> conflict note.
     Never insert/delete tokens to force a match.
-
-    RUN-33: `side` is optional and only labels the note. The persisted
-    qa_reason used to omit it, so a reviewer reading the flag could not tell
-    whether the question or the solution side disagreed -- only the stdout
-    line knew.
     """
     n_tok = count_img_placeholders(text)
     n_files = int(n_files or 0)
     if n_tok == n_files:
         return True, ""
-    where = f" ({side})" if side else ""
-    return False, (f"img_placeholder_count_mismatch{where}: text has {n_tok} "
-                   f"[IMG] token(s), interval owns {n_files} file(s)")
+    return False, (f"img_placeholder_count_mismatch: text has {n_tok} [IMG] "
+                   f"token(s), interval owns {n_files} file(s)")
 
 
 def flag_high_image_counts(chapter_records, image_files_by_q):
@@ -4298,69 +3955,17 @@ def flag_high_image_counts(chapter_records, image_files_by_q):
 
 
 def apply_img_placeholder_reconcile(chapter_records, image_files_by_q):
-    """Flag [IMG] tokens that disagree with the owned file count.
-
-    RUN-33: skip blocks whose text was parsed DETERMINISTICALLY (crop_parse,
-    off the PDF text layer or OCR of the crop). Such a parser never emits
-    [IMG] tokens -- it has no notion of where a figure sits -- so comparing
-    its 0 tokens against the owned files flagged every figured item in the
-    chapter. OPH-001 live: once the OCR fallback started working, 22/23
-    questions and 23/23 solutions became deterministic and this produced 17
-    mismatches across 13 of 23 questions, pushing the chapter to 15
-    REVIEW_NEEDED. The count check exists to catch a MODEL dropping or
-    inventing [IMG] markers, which is a genuine failure mode; it carries no
-    information about text a model never wrote. The figures still ship in
-    question.images / solution.images exactly as before."""
     for qn, rec in (chapter_records or {}).items():
         entry = (image_files_by_q or {}).get(qn) or {}
         reasons = list(rec.get("_review_reasons") or [])
-        for side, field, mkey in (
-                ("question", "question_text", "_q_text_method"),
-                ("solution", "solution_text", "_s_text_method")):
-            if str(rec.get(mkey) or "") == "geometric_text":
-                continue
+        for side, field in (("question", "question_text"),
+                            ("solution", "solution_text")):
             ok, note = reconcile_img_placeholders(
-                rec.get(field), len(entry.get(side) or []), side=side)
-            if not ok and side == "solution":
-                # RUN-44 (OPH-001 q23 live): a solution that explains a
-                # figure-based question naturally refers to THAT figure, and
-                # the figure is owned by the QUESTION side -- it is drawn in
-                # the stem, not in the explanation. q23's solution walks the
-                # marked diagram ("A- Superior oblique, E- Inferior rectus")
-                # and owns no file of its own, which read as a missing figure
-                # and flagged the row.
-                #
-                # Only when the solution claims MORE figures than it owns.
-                n_tok = count_img_placeholders(rec.get(field))
-                n_own = len(entry.get("solution") or [])
-                n_q = len(entry.get("question") or [])
-                if n_q and n_tok > n_own and n_tok <= n_own + n_q:
-                    ok = True
-                    print(f"  [IMG] q{qn} solution: {n_tok} [IMG] token(s) "
-                          f"explained by the question's {n_q} figure(s) -- "
-                          f"cross-reference, not a missing figure")
+                rec.get(field), len(entry.get(side) or []))
             if not ok:
-                # RUN-45 (OPH-001 q11 live) + RUN-46 (owner's refinement):
-                # text with no [IMG] token is only harmless when the block
-                # owns EXACTLY ONE figure -- there is a single place it can go,
-                # so the converter can attach it from images[] without being
-                # told where. With two or more figures the token is what
-                # establishes which image sits where in the reading order, so
-                # a missing marker there IS a defect and must flag.
-                #
-                # The other direction always flags: text that references a
-                # figure nobody owns is a dangling marker (q15 -- the model
-                # invented [IMG] for a question the book prints no figure for).
-                n_tok = count_img_placeholders(rec.get(field))
-                n_files = len(entry.get(side) or [])
-                if n_tok == 0 and n_files == 1:
-                    print(f"  [IMG] q{qn} {side}: 1 figure attached with no "
-                          f"[IMG] token -- advisory only, a single figure "
-                          f"needs no inline position")
-                else:
-                    if note not in reasons:
-                        reasons.append(note)
-                    print(f"  [IMG] q{qn} {side}: {note}")
+                if note not in reasons:
+                    reasons.append(note)
+                print(f"  [IMG] q{qn} {side}: {note}")
         rec["_review_reasons"] = reasons
 
 

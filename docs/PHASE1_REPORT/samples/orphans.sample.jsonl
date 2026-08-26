@@ -1,0 +1,2 @@
+{"subject": "PSY", "chapter_id": "PSY-007", "source_pages": [101, 102], "pass": "Q", "reason": "unconfirmed_discontinuous_qno", "fragment": "A foreign question whose q_no could not be anchored.", "carry_q_no": null, "cut_part": null, "last_qn_in_batch": 2}
+{"subject": "PSY", "chapter_id": "PSY-007", "source_pages": [103], "pass": "Q", "reason": "q_id_unresolved", "fragment": "{'A': 'Option A', 'B': 'Option B', 'C': 'Option C', 'D': 'Option D'}", "carry_q_no": 2, "cut_part": "options", "last_qn_in_batch": 3}

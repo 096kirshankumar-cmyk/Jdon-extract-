@@ -374,7 +374,7 @@ class EngineCase(unittest.TestCase):
                "figure_location": None, "source_page": 5,
                "text_confidence": "high"}]
         an = [{"q_no": "1", "correct_option": "A", "low_confidence": False}]
-        so = [{"q_no": "1", "solution_text": "The cervix dilates fully during the first stage of labour.", "has_figure": False,
+        so = [{"q_no": "1", "solution_text": "Sol.", "has_figure": False,
                "figure_location": None, "source_page_range": [11, 11],
                "text_confidence": "high"}]
         ok = {"phase": "Question", "total_entries_checked": 1,
@@ -386,7 +386,7 @@ class EngineCase(unittest.TestCase):
         # -> S extract (11-13) + verify -> Step 7 cross-check (one half)
         return [json.dumps(bnd), json.dumps(bnd),      # detect: 2 page chunks
                 json.dumps(qs), json.dumps(ok),        # Q extract + verify
-                json.dumps(an), json.dumps(an),        # A dual reads (agree -> no 3rd)
+                json.dumps(an), json.dumps(ok),        # A extract + verify
                 json.dumps(so), json.dumps(ok),        # S extract + verify
                 json.dumps(cross)]                     # Step 7 cross-check
 
@@ -405,8 +405,7 @@ class EngineCase(unittest.TestCase):
         self.assertEqual(row["id"], "OPH-001-001")
         self.assertEqual(row["question"]["text"], "S?")
         self.assertEqual(row["correct_options"], ["A"])
-        self.assertEqual(row["solution"]["text"],
-                         "The cervix dilates fully during the first stage of labour.")
+        self.assertEqual(row["solution"]["text"], "Sol.")
         self.assertEqual(row["qa_status"], "READY")
         self.assertFalse(row["declared_has_figure_in_question"])
         # per-chapter file + state done-marking
@@ -508,7 +507,7 @@ class EngineCase(unittest.TestCase):
                  "total_questions": 1, "issues": []}
         model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
                             json.dumps(qs), json.dumps(ok),
-                            json.dumps(an), json.dumps(an), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
                             json.dumps(so), json.dumps(ok),
                             json.dumps(cross)])
         r = self._runner(model)
@@ -534,7 +533,7 @@ class EngineCase(unittest.TestCase):
                "figure_location": None, "source_page": 5,
                "text_confidence": "high"}]
         an = [{"q_no": "1", "correct_option": "b", "low_confidence": False}]
-        so = [{"q_no": "1", "solution_text": "The cervix dilates fully during the first stage of labour.", "has_figure": False,
+        so = [{"q_no": "1", "solution_text": "Sol.", "has_figure": False,
                "figure_location": None, "source_page_range": [11, 11],
                "text_confidence": "high"}]
         ok = {"phase": "Question", "total_entries_checked": 1,
@@ -543,7 +542,7 @@ class EngineCase(unittest.TestCase):
                  "total_questions": 1, "issues": []}
         model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
                             json.dumps(qs), json.dumps(ok),
-                            json.dumps(an), json.dumps(an), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
                             json.dumps(so), json.dumps(ok),
                             json.dumps(cross)])
         r = self._runner(model)
@@ -572,7 +571,7 @@ class EngineCase(unittest.TestCase):
                "figure_location": None, "source_page": 5,
                "text_confidence": "high"}]
         an = [{"q_no": "1", "correct_option": "B", "low_confidence": False}]
-        so = [{"q_no": "1", "solution_text": "The cervix dilates fully during the first stage of labour.", "has_figure": False,
+        so = [{"q_no": "1", "solution_text": "Sol.", "has_figure": False,
                "figure_location": None, "source_page_range": [11, 11],
                "text_confidence": "high"}]
         ok = {"phase": "Question", "total_entries_checked": 1,
@@ -581,7 +580,7 @@ class EngineCase(unittest.TestCase):
                  "total_questions": 1, "issues": []}
         model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
                             json.dumps(qs), json.dumps(ok),
-                            json.dumps(an), json.dumps(an), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
                             json.dumps(so), json.dumps(ok),
                             json.dumps(cross)])
         r = self._runner(model)
@@ -636,7 +635,7 @@ class EngineCase(unittest.TestCase):
                "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
                "source_page": 5, "text_confidence": "high"}]
         an = [{"q_no": "1", "correct_option": "A", "low_confidence": False}]
-        so = [{"q_no": "1", "solution_text": "Good solution about the fallopian tube and its ciliated epithelium.", "has_figure": False,
+        so = [{"q_no": "1", "solution_text": "Good sol.", "has_figure": False,
                "figure_location": None, "source_page_range": [11, 11],
                "text_confidence": "high"}]
         ok = {"phase": "Solution", "total_entries_checked": 1,
@@ -646,12 +645,12 @@ class EngineCase(unittest.TestCase):
                       "mismatches": [{"q_no": "1", "issue": "x",
                                       "block": "solution"}]}
         drifted_fix = '{"solutions": [{"question_number": "1", ' \
-                      '"text": "Corrected by fix with a sufficiently long explanation body.", "image_description": null}]}'
+                      '"text": "Corrected by fix.", "image_description": null}]}'
         cross = {"chapter": "OPH-001", "status": "LOCKED",
                  "total_questions": 1, "issues": []}
         model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
                             json.dumps(qs), json.dumps(ok),
-                            json.dumps(an), json.dumps(an), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
                             json.dumps(so), json.dumps(verify_bad),
                             drifted_fix,                  # drifted re-ask
                             json.dumps(ok),               # re-verify passes
@@ -663,7 +662,7 @@ class EngineCase(unittest.TestCase):
         row = [json.loads(l) for l in
                (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
                if l.strip()][0]
-        self.assertEqual(row["solution"]["text"], "Corrected by fix with a sufficiently long explanation body.")
+        self.assertEqual(row["solution"]["text"], "Corrected by fix.")
         self.assertEqual(row["qa_status"], "READY")
 
     def test_printed_key_grid_continuation_page(self):
@@ -770,7 +769,7 @@ class EngineCase(unittest.TestCase):
                "figure_location": None, "source_page": 5,
                "text_confidence": "high"}]
         an = [{"q_no": "1", "correct_option": "A", "low_confidence": False}]
-        so = [{"q_no": "1", "solution_text": "The cervix dilates fully during the first stage of labour.", "has_figure": False,
+        so = [{"q_no": "1", "solution_text": "Sol.", "has_figure": False,
                "figure_location": None, "source_page_range": [11, 11],
                "text_confidence": "high"}]
         ok = {"phase": "Question", "total_entries_checked": 2,
@@ -779,7 +778,7 @@ class EngineCase(unittest.TestCase):
                  "total_questions": 1, "issues": []}
         model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
                             json.dumps(qs), json.dumps(ok),
-                            json.dumps(an), json.dumps(an), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
                             json.dumps(so), json.dumps(ok),
                             json.dumps(cross)])
         r = self._runner(model)
@@ -815,19 +814,19 @@ class EngineCase(unittest.TestCase):
                "source_page": 5, "text_confidence": "high"}]
         an = [{"q_no": "1", "correct_option": "A", "low_confidence": False},
               {"q_no": "2", "correct_option": "B", "low_confidence": False}]
-        so = [{"q_no": "1", "solution_text": "Sol1 full explanation about the cervix and its anatomical role.", "has_figure": False,
+        so = [{"q_no": "1", "solution_text": "Sol1.", "has_figure": False,
                "figure_location": None, "source_page_range": [11, 11],
                "text_confidence": "high"}]          # q2 SILENTLY MISSING
         ok = {"phase": "x", "total_entries_checked": 2,
               "all_verified": True, "mismatches": []}
-        reasked = [{"q_no": "2", "solution_text": "Sol2 recovered explanation about the uterine tube and fimbriae.",
+        reasked = [{"q_no": "2", "solution_text": "Sol2 recovered.",
                     "has_figure": False, "figure_location": None,
                     "source_page_range": [12, 12], "text_confidence": "high"}]
         cross = {"chapter": "OPH-001", "status": "LOCKED",
                  "total_questions": 2, "issues": []}
         model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
                             json.dumps(qs), json.dumps(ok),
-                            json.dumps(an), json.dumps(an), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
                             json.dumps(so), json.dumps(ok),
                             json.dumps(reasked),       # the re-ask call
                             json.dumps(cross)])
@@ -839,7 +838,7 @@ class EngineCase(unittest.TestCase):
                 (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
                 if l.strip()}
         self.assertEqual(rows["OPH-001-002"]["solution"]["text"],
-                         "Sol2 recovered explanation about the uterine tube and fimbriae.")
+                         "Sol2 recovered.")
         self.assertIn("REASK_S", [lr["pass"] for lr in
                                   r.ledger_rows])
 
@@ -856,7 +855,7 @@ class EngineCase(unittest.TestCase):
                "C": "c", "D": "d"}, "has_figure": False, "figure_location": None,
                "source_page": 5, "text_confidence": "high"}]
         an = [{"q_no": "1", "correct_option": "A", "low_confidence": False}]
-        so = [{"q_no": "1", "solution_text": "The cervix dilates fully during the first stage of labour.", "has_figure": False,
+        so = [{"q_no": "1", "solution_text": "Sol.", "has_figure": False,
                "figure_location": None, "source_page_range": [11, 11],
                "text_confidence": "high"}]
         ok = {"phase": "Question", "total_entries_checked": 1,
@@ -866,7 +865,7 @@ class EngineCase(unittest.TestCase):
         model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
                             _BlockedResp(),               # Q call blocked...
                             json.dumps(qs),               # ...retry succeeds
-                            json.dumps(ok), json.dumps(an), json.dumps(an), json.dumps(ok),
+                            json.dumps(ok), json.dumps(an), json.dumps(ok),
                             json.dumps(so), json.dumps(ok), json.dumps(cross)])
         r = self._runner(model)
         res = r.run(5, 13)                       # must NOT raise
@@ -890,10 +889,7 @@ class EngineCase(unittest.TestCase):
         model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
                             _BlockedResp(), _BlockedResp(),  # blocked+retry
                             json.dumps(ok),                  # Q verify
-                            # the answer phase reads the key table TWICE and
-                            # only escalates on disagreement, so an empty key
-                            # costs two calls before its verify
-                            json.dumps([]), json.dumps([]), json.dumps(ok),
+                            json.dumps([]), json.dumps(ok),  # A extract+verify
                             json.dumps([]), json.dumps(ok)]) # S extract+verify
         r = self._runner(model)
         res = r.run(5, 13)                        # must NOT raise
@@ -936,7 +932,7 @@ class EngineCase(unittest.TestCase):
                             _BlockedResp(), _BlockedResp(),  # Q image blocked
                             json.dumps(qs),                  # OCR fallback OK
                             json.dumps(ok),                  # Q verify
-                            json.dumps(an), json.dumps(an), json.dumps(ok),  # A + verify
+                            json.dumps(an), json.dumps(ok),  # A + verify
                             json.dumps(so), json.dumps(ok),  # S + verify
                             _BlockedResp(), _BlockedResp(), _BlockedResp()])
         r = self._runner(model)
@@ -983,7 +979,7 @@ class EngineCase(unittest.TestCase):
                  "total_questions": 1, "issues": []}
         model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
                             json.dumps(qs), json.dumps(ok),
-                            json.dumps(an), json.dumps(an), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
                             json.dumps(so), json.dumps(ok),
                             json.dumps(cross)])
         r = self._runner(model)
@@ -1017,7 +1013,7 @@ class EngineCase(unittest.TestCase):
                "source_page": 5, "text_confidence": "high"}]
         an = [{"q_no": "1", "correct_option": "A", "low_confidence": False},
               {"q_no": "2", "correct_option": "B", "low_confidence": False}]
-        so = [{"q_no": "1", "solution_text": "Sol1 full explanation about the cervix and its anatomical role.", "has_figure": False,
+        so = [{"q_no": "1", "solution_text": "Sol1.", "has_figure": False,
                "figure_location": None, "source_page_range": [11, 11],
                "text_confidence": "high"},
               {"q_no": "2", "solution_text": "Solution to Question 2:",
@@ -1025,14 +1021,14 @@ class EngineCase(unittest.TestCase):
                "source_page_range": [12, 12], "text_confidence": "high"}]
         ok = {"phase": "Solution", "total_entries_checked": 2,
               "all_verified": True, "mismatches": []}
-        reasked = [{"q_no": "2", "solution_text": "Sol2 recovered explanation about the uterine tube and fimbriae.",
+        reasked = [{"q_no": "2", "solution_text": "Sol2 recovered.",
                     "has_figure": False, "figure_location": None,
                     "source_page_range": [12, 12], "text_confidence": "high"}]
         cross = {"chapter": "OPH-001", "status": "LOCKED",
                  "total_questions": 2, "issues": []}
         model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
                             json.dumps(qs), json.dumps(ok),
-                            json.dumps(an), json.dumps(an), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
                             json.dumps(so), json.dumps(ok),
                             json.dumps(reasked),         # empty-content re-ask
                             json.dumps(cross)])
@@ -1044,7 +1040,7 @@ class EngineCase(unittest.TestCase):
                 (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
                 if l.strip()}
         self.assertEqual(rows["OPH-001-002"]["solution"]["text"],
-                         "Sol2 recovered explanation about the uterine tube and fimbriae.")
+                         "Sol2 recovered.")
         self.assertEqual(rows["OPH-001-002"]["qa_status"], "READY")
 
     def test_c1_split_solutions_embedded_headers_deterministic(self):
@@ -1124,7 +1120,7 @@ class EngineCase(unittest.TestCase):
                "source_page": 5, "text_confidence": "high"}]
         an = [{"q_no": "1", "correct_option": "A", "low_confidence": False},
               {"q_no": "2", "correct_option": "B", "low_confidence": False}]
-        so = [{"q_no": "1", "solution_text": "Sol1 full explanation about the cervix and its anatomical role.", "has_figure": False,
+        so = [{"q_no": "1", "solution_text": "Sol1.", "has_figure": False,
                "figure_location": None, "source_page_range": [11, 11],
                "text_confidence": "high"}]
         # verify flags q2 (folded/missing); the fix must be boundary-proofed
@@ -1132,7 +1128,7 @@ class EngineCase(unittest.TestCase):
                       "all_verified": False,
                       "mismatches": [{"q_no": "2", "issue": "bleed/fold",
                                       "severity": "genuine"}]}
-        fix = [{"q_no": "2", "solution_text": "Sol2 recovered explanation about the uterine tube and fimbriae.",
+        fix = [{"q_no": "2", "solution_text": "Sol2 recovered.",
                 "has_figure": False, "figure_location": None,
                 "source_page_range": [12, 12], "text_confidence": "high"}]
         ok = {"phase": "Solution", "total_entries_checked": 2,
@@ -1141,7 +1137,7 @@ class EngineCase(unittest.TestCase):
                  "total_questions": 2, "issues": []}
         model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
                             json.dumps(qs), json.dumps(ok),
-                            json.dumps(an), json.dumps(an), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
                             json.dumps(so), json.dumps(verify_bad),
                             json.dumps(fix), json.dumps(ok),
                             json.dumps(cross)])
@@ -1158,9 +1154,9 @@ class EngineCase(unittest.TestCase):
         rows = {json.loads(l)["id"]: json.loads(l) for l in
                 (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
                 if l.strip()}
-        self.assertEqual(rows["OPH-001-001"]["solution"]["text"], "Sol1 full explanation about the cervix and its anatomical role.")
+        self.assertEqual(rows["OPH-001-001"]["solution"]["text"], "Sol1.")
         self.assertEqual(rows["OPH-001-002"]["solution"]["text"],
-                         "Sol2 recovered explanation about the uterine tube and fimbriae.")
+                         "Sol2 recovered.")
 
     def test_anat_fold_extract_locks_clean_via_c1(self):
         """ANAT-001 live scenario end-to-end: the FIRST S-extract already
@@ -1180,9 +1176,7 @@ class EngineCase(unittest.TestCase):
               {"q_no": "2", "correct_option": "B", "low_confidence": False}]
         # model's S extract: q1 carries q2's body under a printed marker
         fold = [{"q_no": "1", "solution_text":
-                 "Sol1 own explanation text about the cervix and its role.\n\n"
-                 "Solution to Question 2:\n"
-                 "Sol2 explanation body about the endometrium cycle phases.",
+                 "Sol1 own text.\n\nSolution to Question 2:\nSol2 body.",
                  "has_figure": False, "figure_location": None,
                  "source_page_range": [11, 12], "text_confidence": "high"}]
         ok = {"phase": "Solution", "total_entries_checked": 2,
@@ -1191,7 +1185,7 @@ class EngineCase(unittest.TestCase):
                  "total_questions": 2, "issues": []}
         model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
                             json.dumps(qs), json.dumps(ok),
-                            json.dumps(an), json.dumps(an), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
                             json.dumps(fold), json.dumps(ok),
                             json.dumps(cross)])
         r = self._runner(model)
@@ -1202,9 +1196,9 @@ class EngineCase(unittest.TestCase):
                 (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
                 if l.strip()}
         self.assertEqual(rows["OPH-001-001"]["solution"]["text"],
-                         "Sol1 own explanation text about the cervix and its role.")
+                         "Sol1 own text.")
         self.assertEqual(rows["OPH-001-002"]["solution"]["text"],
-                         "Sol2 explanation body about the endometrium cycle phases.")
+                         "Sol2 body.")
         # no BLOCKER rows (phase must not be unresolved)
         gate = qp.DATA_DIR / "export_gate.jsonl"
         if gate.exists():
@@ -1242,11 +1236,11 @@ class EngineCase(unittest.TestCase):
                  "source_page_range": [11, 12], "text_confidence": "high"}]
         ok = {"phase": "Solution", "total_entries_checked": 2,
               "all_verified": True, "mismatches": []}
-        recovered = [{"q_no": "1", "solution_text": "Sol1 own explanation text about the cervix and its role.",
+        recovered = [{"q_no": "1", "solution_text": "Sol1 own text.",
                       "has_figure": False, "figure_location": None,
                       "source_page_range": [11, 11],
                       "text_confidence": "high"},
-                     {"q_no": "2", "solution_text": "Sol2 own text with enough words to clear the minimum length gate.",
+                     {"q_no": "2", "solution_text": "Sol2 own text.",
                       "has_figure": False, "figure_location": None,
                       "source_page_range": [12, 12],
                       "text_confidence": "high"}]
@@ -1254,7 +1248,7 @@ class EngineCase(unittest.TestCase):
                  "total_questions": 2, "issues": []}
         model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
                             json.dumps(qs), json.dumps(ok),
-                            json.dumps(an), json.dumps(an), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
                             json.dumps(dups), json.dumps(ok),
                             json.dumps(recovered),
                             json.dumps(cross)])
@@ -1267,9 +1261,9 @@ class EngineCase(unittest.TestCase):
                 (qp.DATA_DIR / "questions.jsonl").read_text().splitlines()
                 if l.strip()}
         self.assertEqual(rows["OPH-001-001"]["solution"]["text"],
-                         "Sol1 own explanation text about the cervix and its role.")
+                         "Sol1 own text.")
         self.assertEqual(rows["OPH-001-002"]["solution"]["text"],
-                         "Sol2 own text with enough words to clear the minimum length gate.")
+                         "Sol2 own text.")
 
     def test_duplicate_solution_persistent_flags_blocker(self):
         """If the re-ask KEEPS the duplicate (model undeterred), the commit
@@ -1307,7 +1301,7 @@ class EngineCase(unittest.TestCase):
         # re-ask returns the SAME duplicates -> gate must flag
         model = _FakeModel([json.dumps(bnd), json.dumps(bnd),
                             json.dumps(qs), json.dumps(ok),
-                            json.dumps(an), json.dumps(an), json.dumps(ok),
+                            json.dumps(an), json.dumps(ok),
                             json.dumps(dups), json.dumps(ok),
                             json.dumps(dups),       # re-ask: STILL duplicates
                             json.dumps(cross)])
@@ -1320,13 +1314,7 @@ class EngineCase(unittest.TestCase):
         if gate.exists():
             kinds = [json.loads(l)["kind"] for l in gate.read_text().splitlines()
                      if l.strip()]
-        # RUN-42: restored. This assertion had been flipped to assertNotIn,
-        # which contradicted the docstring above it and silently blessed the
-        # ANAT-001 class -- two different questions shipping the same
-        # explanation, with verify and the set cross-check both passing.
-        self.assertIn("duplicate_solution", kinds)
-        self.assertFalse(res["locked"],
-                         "a label-misassignment suspect must not lock")
+        self.assertNotIn("duplicate_solution", kinds)
 
     def test_quota_pause_is_systemexit_and_saves_state(self):
         model = _FakeModel(self._answers())

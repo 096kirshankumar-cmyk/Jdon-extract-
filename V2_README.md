@@ -15,6 +15,8 @@
 | Dump-tail clipping | sanitize (own-dup only) + sweep step 2b (chapter donor guard) | **+ S-pass parser clip** (`clip_pass_solutions`) with sibling-donor proof; sweep 2b retained as final net |
 | Carry-forward | single carry | **per-pass carries** (Q-carry, S-carry) + section boundary hard-resets BOTH |
 | Orphans | provenance incl. batch window | **+ `pass` tag** (which pass produced the fragment) |
+| RPM bursts | reactive 65s backoff on 429 | **+ proactive pacing**: 5s gap between every Gemini request (≤12 RPM sustained — 429s stop firing at all; both v1/v2) |
+| Output layout | one flat `questions.jsonl` | **+ per-chapter files** `data/by_chapter/{CH}.jsonl` (written the moment a chapter fully closes) **+ subject bundle** `subjects/{SUBJECT}/` (chapters.json + questions.jsonl + chapters/) |
 | Output root | `/data/qbank_output` | `/data/qbank_output_v2` (v1 data 100% untouched); smoke tests go to `…_v2test/` |
 
 ## Task-4 clipping — deliberate deviation from the naive snippet

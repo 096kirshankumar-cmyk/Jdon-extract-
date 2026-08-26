@@ -1,0 +1,323 @@
+{
+  "run": "2026-08-05 full-book PSY run (Z AI secondary-review log)",
+  "commit_that_generated_the_log": "a6b12d7 (run-11 build)",
+  "commit_evidence": [
+    "Log shows OLD retry message '[RETRY] blocked contaminated stem for qN (stem text substantially contained in this record's own solution) -- kept for review, still stem-missing' WITHOUT the run-12 '; next round will ask for the stem region ONLY' suffix (0fcd8c5 changed this).",
+    "Log hit the hard 500 RPD quota ('limit: 500, model: gemini-3.1-flash-lite') and stopped mid-run -- MAX_CALLS_PER_DAY was still 1400 in a6b12d7; 0fcd8c5 set it to 480.",
+    "Log does NOT contain '_should_run_q_pass' behavior (Q-pass still ran on pure-solution windows, e.g. '[GEMINI:Q] pages 13-17 | items: 1 | orphans buffered: 1' where the Q-pass read solution pages)."
+  ],
+  "current_code_commit": "0fcd8c5 + this investigation's test additions (104 tests)",
+  "pattern_verdicts": {
+    "A_contaminated_stem_loop": {
+      "verdict": "CONFIRMED as OLD-RUN bug; ALREADY FIXED in current code (0fcd8c5)",
+      "code_path": "_stem_reject_reason (token-containment) -> chapter_integrity_sweep step 5 -> targeted_retry stem fill -> merge stem write",
+      "log_evidence": "[SWEEP] q3: stripped contaminated stem ... [RETRY] blocked contaminated stem for q3 ... still stem-missing (round 1 AND 2) ... [RESCUE] page 14: q4 -> 0 field(s) filled ... [GATE] missing_stem q4/q10",
+      "root_cause": "solutions RESTATE question-shaped stems; the >=80% token-containment rule flagged good short stems as contaminated; the merge/stem-conflict resolver then let contaminated solution-prose replace a valid stem; retry re-asked the same pages and the guard blocked the same text every round -> dead-end.",
+      "current_fix": "_stem_reject_reason narrowed (declarative/>250-char only); merge never lets a contaminated stem replace a valid one; targeted_retry switches to a STEM-REGION-ONLY prompt after one block; Q-pass skipped on pure-solution windows (upstream source) with 1-page cross-section overlap at the Q/S boundary.",
+      "final_output_impact": "VERIFIED from log: ch1 q4/q10, ch2 q25, ch7 q1/q23-26, ch11 q1/q17, ch16 q2/q10, ch21 q1, ch23 q10 exported stem-less (export-gate missing_stem). These were final-output damage in the OLD run.",
+      "tests_reproduce": "Run12StemContaminationTests (8) + ZAIVerificationTests.test_solution_restating_stem_with_regarding_is_kept"
+    },
+    "B_qno_none_fragments": {
+      "verdict": "PARTIALLY CONFIRMED (data preserved in orphans.jsonl, not lost from disk); NOT a current-code bug to fix by attaching",
+      "code_path": "merge_question_records (q_no=None -> skipped -> orphans buffer) -> recover_orphans (rules 0-4)",
+      "log_evidence": "[WARN] Gemini returned an item with no q_no ... options {'A': 'Cannabis-induced psychosis'...} (ch7, pages 104-107) ... [ORPHAN] Could not determine owner ... kept in orphans.jsonl",
+      "root_cause": "fragments with real options/tables but no q_no have NO provable owner in the current data model (no page coordinates, no preceding/following printed anchors retained). recover_orphans rule 3 needs last_qn_in_batch (None when the whole window is q_no=None); rule 0 handles answer-key TABLES deterministically; option-only fragments stay unresolved.",
+      "final_output_impact": "ch7 q23-26 exported with empty options/answer (gate-flagged bad_options + missing_answer) -- the fragment's options were NOT in the final record. But they ARE preserved in orphans.jsonl (not deleted).",
+      "why_not_attached": "Z AI's 'nearest active question' would corrupt Layout 1 (page boundary between stem and options) and Layout 2 (answer-key table). Current code never guesses; ownership without proof stays unresolved (per the task rule).",
+      "current_state": "safe; a full fix requires per-fragment page-coordinate + anchor provenance (documented remaining uncertainty).",
+      "tests_reproduce": "ZAIVerificationTests.test_qno_none_options_buffered_not_attached_not_dropped + test_qno_none_answer_key_table_consumed_not_attached"
+    },
+    "C_export_gate_semantics": {
+      "verdict": "CONFIRMED as intentional audit-only soft warning; NOT a bug",
+      "code_path": "_export_gate_violations -> chapter-end [GATE] log + data/export_gate.jsonl; make_zip() in app.py includes the audit artifacts; ZIP is NOT hard-blocked",
+      "log_evidence": "[GATE] chapter 1: 2 export-gate violation(s) -- NOT a clean export: ... followed by '[PSY] chapter 1 ... done -> 26 questions'",
+      "rationale": "rows must be written for resumability (chapters_done -> state.json -> next run skips); the gate surfaces every violation loudly in the log AND in data/export_gate.jsonl, which is included in the ZIP so reviewers see exactly what is incomplete. Hard-blocking the ZIP would prevent downloading partial results for review -- contrary to the free-tier resume workflow.",
+      "final_output_impact": "the ZIP contains chapters with missing_stem/bad_options AND the export_gate.jsonl audit trail; intentional.",
+      "tests_reproduce": "Run11ForensicHardeningTests export-gate tests"
+    },
+    "D_drain_crop_ocr_merge": {
+      "verdict": "FALSE (no overwrite; Z AI's suspicion refuted from code)",
+      "code_path": "drain_failed_pages: every crop-ladder merge AND OCR-fallback merge uses merge_question_records(..., fill_only=True); the OCR splice uses _novel_solution_tail (append-only, never replaces)",
+      "log_evidence": "ch17 p218: '[DRAIN] page-218.jpg TOP half: 2 item(s)' ... '[OCR_FALLBACK] page-218.jpg: normalized 1 OCR item(s)' ... 'chapter 17 done -> 14 questions (0 missing answer, 0 missing solution)' + '[GATE] chapter 17: export gate CLEAN'",
+      "root_cause": "none (no overwrite path exists); the 2 crop items and the 1 OCR item merged fill-only; the final chapter was complete and gate-clean.",
+      "final_output_impact": "none (verified from log: ch17 gate CLEAN).",
+      "tests_reproduce": "ZAIVerificationTests.test_drain_ocr_merge_never_overwrites_crop_items"
+    },
+    "E_image_figure_map_count_mismatch": {
+      "verdict": "CONFIRMED as by-design safe-skip; NOT data loss",
+      "code_path": "claim_figure_map_images exact-count guard -> skip map -> leftovers flow to claim_page_images (positional) + 4th-pass model attribution + unresolved_images.jsonl",
+      "log_evidence": "[IMG] figure-map count mismatch (2 declared vs 4 extracted) -- skipping model figure-map claim; left for positional/model passes (ch3 p38) ... the 4th pass then attributed p38-80 -> PSY-003-013, p39-85 -> PSY-003-014; tiny crops (414B/1306B) refused by the broken-crop guard and kept unresolved",
+      "root_cause": "Gemini's declared figure count can differ from extract_real_images' count because the model sees tiny/watermark-ish objects the extractor drops (<5000px or watermark) -- the exact-count guard intentionally skips the WHOLE map rather than mis-aligning entries.",
+      "final_output_impact": "none (images resolved via positional + 4th pass, or kept in unresolved_images.jsonl / unmatched with model verdicts -- never discarded since run-11 conservative-decorative).",
+      "tests_reproduce": "FigureMapTests.test_count_mismatch_skips_entirely"
+    }
+  },
+  "fixes_implemented_this_pass": [],
+  "note": "No new code fixes were needed this pass: the log is from a6b12d7 (run-11 build), and the two genuine bug classes it exhibits (contaminated-stem dead-end; 500-RPD quota crash) were already fixed in 0fcd8c5. This pass added the Z-AI production-shaped regression tests (4) locking in the safe behavior, bringing the suite to 104.",
+  "tests_added_this_pass": [
+    "ZAIVerificationTests.test_solution_restating_stem_with_regarding_is_kept",
+    "ZAIVerificationTests.test_qno_none_options_buffered_not_attached_not_dropped",
+    "ZAIVerificationTests.test_qno_none_answer_key_table_consumed_not_attached",
+    "ZAIVerificationTests.test_drain_ocr_merge_never_overwrites_crop_items"
+  ],
+  "test_result": "104/104 green",
+  "commit": "see git log for the test-addition commit hash",
+  "still_requires_new_railway_run": [
+    "Redeploy the current commit (0fcd8c5 + tests) and re-run the SAME PSY PDF from a fresh reset to certify the export gates (the old-run missing_stem chapters ch1/2/7/11/16/21/23 should now resolve via the stem-region-only retry + Q-pass skip + merge protection).",
+    "Verify MAX_CALLS_PER_DAY=480 stops the day gracefully (no hard 429) across a multi-day run.",
+    "Confirm ch13's malformed-JSON A-pass no longer reports unresolved_page_A (pass_recovered fix).",
+    "RC-2 (q_no=None option-fragment reconciliation via page-coordinate provenance) remains the open design item; it needs a data-model change, not a heuristic."
+  ],
+  "run_13_image_ownership": {
+    "title": "Page-4 class: question-side figure never deterministically owned; isolated-crop 4th pass mislabels it decorative; gate prints CLEAN",
+    "root_cause": [
+      "L1 geometry reads question headings from the PDF text layer (pypdf visitor + pdftotext); the book's QUESTION-page body font has a broken ToUnicode map, so both text tools return no question headings (the same garble that broke the pre-run-9 pdftotext path).",
+      "image_positions_on_page ignored Form-XObject-wrapped images (flat walk, Image-subtype-only Do) -> no position -> geometry cannot own the figure even on clean-text pages.",
+      "4th pass (attribute_orphan_image) shows Gemini ONLY the isolated crop + a stem list: no page layout, no printed anchors -> unreliable 'decorative' verdicts.",
+      "Export gate never consulted unresolved_images.jsonl (only claimed assets) -> [GATE] CLEAN with a source-verified Q1 figure unresolved (false negative).",
+      "Synthetic tests passed because _write_test_pdf uses clean Helvetica text, direct Do placement and no isolated-crop 4th pass -> could not reproduce production."
+    ],
+    "fix": [
+      "image_positions_on_page: recursive Form-XObject walk with CTM composition (cycle-guarded) + drawn w/h from cm scale.",
+      "NEW L2 claim_block_images_ocr: closest-heading-above geometry from tesseract on the rendered page (pdftoppm/PyMuPDF) - deterministic, zero API cost, immune to text-layer garble.",
+      "NEW L3 full_page_vision_ownership: rendered page with highlighted+labeled bboxes; layout-only JSON verdicts; one call per page (all leftovers batched); adjacent pages for edge-touching figures; replaces isolated-crop as primary fallback.",
+      "Provenance ledger data/image_ownership.jsonl for every automatic assignment (owner/slot/method/evidence/confidence).",
+      "Export gate + qbank_validator flag unresolved images (unresolved_image / image_unresolved); deterministic_junk (broken crop < MIN_IMAGE_BYTES) excluded; model 'decorative' alone never clears a chapter."
+    ],
+    "tests_added": [
+      "test_form_wrapped_image_position_parsed_with_drawn_size",
+      "test_garbled_text_layer_question_image_claimed_by_full_page_vision",
+      "test_vision_never_overrides_deterministic_geometry",
+      "test_ocr_geometry_claims_when_text_layer_garbled",
+      "test_ocr_anchor_line_matching_converts_coordinates",
+      "test_unresolved_image_blocks_clean_gate",
+      "test_broken_crop_not_gate_violation",
+      "RealPdfOptInFixtureTests.test_page4_pypdf_dump_and_image_position (opt-in, requires fixtures/PSY.pdf)"
+    ],
+    "test_result": "112 tests OK (1 skipped: opt-in real-PDF fixture)",
+    "still_requires_new_railway_run": [
+      "Fresh run must show page 4 'OCR block position -> PSY-p4-7 -> PSY-001-001 (question)' or 'full-page vision: ... -> PSY-001-001' instead of 'ambiguous printed owners'.",
+      "No question-side figure may end in unresolved_images.jsonl as 'model-declared decorative'.",
+      "Export gate must list unresolved_image for any figure that still cannot be owned (never CLEAN-with-unresolved).",
+      "Confirm data/image_ownership.jsonl rows with method deterministic_ocr_geometry / full_page_vision for question-side figures."
+    ]
+  },
+  "run_14_final_audit": {
+    "run": "fresh PAY production run 2026-08-06 (33 chapters)",
+    "validator_summary": "90 flag(s) across 25/33 chapters (log final line)",
+    "export_gate_violations_from_log": {
+      "ch2": [
+        "missing_stem 25",
+        "missing_stem 26",
+        "bad_options 25",
+        "bad_options 26",
+        "missing_answer 25",
+        "missing_answer 26"
+      ],
+      "ch7": [
+        "bad_options 23-26",
+        "missing_answer 23-26",
+        "missing_stem 24,26",
+        "unresolved_image 104"
+      ],
+      "ch16": [
+        "unresolved_image 209"
+      ],
+      "ch18": [
+        "bad_options 13",
+        "missing_answer 13"
+      ],
+      "ch19": [
+        "bad_options 11,12",
+        "missing_answer 11,12"
+      ],
+      "ch24": [
+        "bad_options 12,13",
+        "missing_answer 12,13"
+      ],
+      "ch25": [
+        "unresolved_image 291"
+      ],
+      "ch26": [
+        "missing_stem 1",
+        "bad_options 11 (A,B,C only)"
+      ],
+      "ch28": [
+        "unresolved_image 319",
+        "unresolved_image 316"
+      ]
+    },
+    "root_causes": [
+      {
+        "id": "A14-1",
+        "title": "Q-pass skipped on question pages (section planner labels whole chapter S; _should_run_q_pass False on S windows)",
+        "affected": "ch2/7/11/16/18/19/24/25/28/30/32 mass [question]+[options] retries; tails lost (ch2 q25-26, ch7 q23-26, ch18 q13, ch19 q11-12, ch24 q12-13)",
+        "fix": "window_has_question_content (OCR question anchors on rendered pages) forces do_q=True on S windows; ocr_page_anchors psm 6->4->11 fallback",
+        "confidence": "PROVEN (log: [GEMINI:Q] lines missing on question windows)"
+      },
+      {
+        "id": "A14-2",
+        "title": "Export gate CLEAN while unresolved meaningful orphans exist (ch11/17/33)",
+        "affected": "ch11, ch17, ch33 (1-3 unresolved orphans each)",
+        "fix": "gate flags meaningful unresolved orphans as orphan_unresolved",
+        "confidence": "PROVEN"
+      },
+      {
+        "id": "A14-3",
+        "title": "Sweep stripped stems to None; retry could not refill (ch26 q1, ch7 q24/q26)",
+        "affected": "ch26 q1 missing_stem; ch7 q24/26",
+        "fix": "stem quarantine: keep text + _stem_suspect_reason; fill_only retry replaces; gate/validator flag suspect_stem",
+        "confidence": "PROVEN"
+      },
+      {
+        "id": "A14-4",
+        "title": "L3 full-page vision silently skipped when image positions missing (p104 class)",
+        "affected": "p104, p209-454, p291, p319, p316",
+        "fix": "loud skip logs + method vision_skipped_no_position in unresolved ledger",
+        "confidence": "PROVEN in code; page-level parse gap needs PDF"
+      },
+      {
+        "id": "A14-5",
+        "title": "q_no=None tail options fragment (ch7 q23-26)",
+        "affected": "ch7 q23-26 options=[]",
+        "fix": "SCHEMA_PROMPT_Q within-page continuation clause",
+        "confidence": "PARTIALLY PROVEN (prompt-level mitigation; deterministic orphan alignment is a design item)"
+      }
+    ],
+    "tests_added": [
+      "Run13FinalAuditFixesTests x10 (q-activation, gate orphans, stem quarantine, vision logging, prompt clause, psm fallback)"
+    ],
+    "test_result": "122 tests OK (1 skipped: opt-in real-PDF fixture)",
+    "requires_zip_verification": [
+      "exact validator flag breakdown by kind (validation_report.json)",
+      "numbering_gap analysis (ch7 14 questions vs q23-26 records)",
+      "chapters.json page ranges (chapter-boundary overlap hypothesis)",
+      "stale PAY/PSY artifact check in the ZIP",
+      "ch16/18/19/24 answers vs source (cross-chapter answer contamination check)"
+    ]
+  },
+  "run_14b_output_audit": {
+    "output_source": "Drive folder Output (chapters.json + export_gate.jsonl + image_ownership.jsonl + integrity_flags.jsonl + orphans.jsonl + page_ledger.jsonl + PAY-001..033.jsonl)",
+    "verified": {
+      "chapters": "33 chapters, all PAY, NO stale PSY artifacts (chapters.json clean)",
+      "image_ownership": "17 records, all high confidence, full provenance (page4->PAY-001-001 question via full_page_vision; p213 via deterministic_ocr_geometry)",
+      "export_gate": "33 violations across 9 chapters (ch2/7/16/18/19/24/25/26/28) -- matches log",
+      "page_ledger_proof": "PAY-007 has ZERO Q-pass rows (whole chapter labeled S from text-layer); PAY-002 has no Q on pages 22-30; PAY-016/18/19/24/25/28/30/32 similarly Q-skipped on question pages",
+      "orphans": "4 meaningful unclaimed fragments (PAY-011 p149 tables; PAY-017 p218 DRAIN options A/C/D; PAY-033 p356 option-D tail)"
+    },
+    "confirmed_data_loss": {
+      "PAY-002": "q25/26 solution-only phantom records (ch1 spill -- ch1 q25/26 already shipped); stems/options/answers never extracted",
+      "PAY-007": "q23/25 question_text == solution_text verbatim (contamination missed by question-shape narrowing)",
+      "PAY-026": "q1 real stem rejected 3x as contaminated (retry x2 + rescue) -> missing_stem"
+    },
+    "fixes_implemented": [
+      "Q-coverage safety net: q_covered_pages per chapter; S-windows with never-Q-covered pages run Q-pass when rendered-page OCR shows question anchors (OCR unavailable -> run)",
+      "page_has_question_content helper (per-page OCR question-anchor test)",
+      "drop_phantom_solution_only_records: solution-only records dropped ONLY with cross-chapter duplicate proof (prior questions.jsonl same q_no + >=50% solution similarity); preserved to dropped_phantom_records.jsonl",
+      "_stem_reject_reason: reverse-containment rule -- stem == own solution verbatim rejected regardless of question shape (ch7 q23/25); real restated stems still pass (ch26 q1)",
+      "recover_orphans rule 5: verified-duplicate fragments (option tail re-sent) consumed deterministically (PAY-033 p356 class)"
+    ],
+    "tests_added": [
+      "test_phantom_solution_only_record_dropped_and_preserved",
+      "test_solution_only_record_without_prior_duplicate_kept",
+      "test_q_pass_record_with_solution_only_not_dropped",
+      "test_stem_identical_to_solution_rejected_verbatim",
+      "test_real_stem_restated_in_solution_not_rejected",
+      "test_orphan_option_tail_duplicate_consumed",
+      "test_page_has_question_content_uses_ocr",
+      "test_page_has_question_content_false_on_pure_solutions"
+    ],
+    "test_result": "130 tests OK (1 skipped: opt-in real-PDF fixture)",
+    "still_requires_railway_run": [
+      "ch7 must show Q-pass rows on pages 100-107 and records q1-22 (or book-true count) with no numbering gap",
+      "ch2 must show Q-pass on pages 22-30 and no q25/26 phantom records (dropped_phantom_records.jsonl entries instead)",
+      "ch16/18/19/24/25/28/30/32 Q-pass on question pages -> mass retry dependence gone",
+      "no question_text == solution_text in any record",
+      "export gate: only genuine unresolved images/orphans remain"
+    ]
+  },
+  "run_16_sigkill_oom": {
+    "symptom": "Fresh Railway run terminated around Chapter 11: 'Worker (pid:3) was sent SIGKILL! Perhaps out of memory?' (gunicorn message)",
+    "verdict": "CONFIRMED OOM (kernel OOM-killer), not a gunicorn guess",
+    "proof_from_code": [
+      "_RENDER_CACHE was an unbounded module-global dict: every render_page_png call stored a full-page PIL RGB image (~6.3 MB at 150 dpi letter).",
+      "Call sites that render per page: window_has_question_content/page_has_question_content (Q-activation OCR on every S-window), claim_block_images_ocr (L2 OCR geometry), full_page_vision_ownership (L3 page + 2 context pages per call).",
+      "The PAY run's ledger shows ~150 pages rendered by chapter 11 (pages 3..160) -> ~950 MB held permanently; Railway free containers have 512 MB -> OOM-kill at chapter 11 matches the timeline exactly.",
+      "full_page_vision_ownership MUTATED the cached render (ImageDraw.Draw on the cached object) so re-renders returned highlighted copies and the drawn image stayed in memory.",
+      "PyMuPDF doc objects never explicitly closed; pdftoppm temp dirs (with a ~6 MB PNG each) leaked on disk."
+    ],
+    "fixes": [
+      "Bounded LRU render cache: _RENDER_CACHE_MAX=10 (~65 MB worst case at 150 dpi) with oldest-eviction; render_cache_size()/clear_render_cache() helpers.",
+      "clear_render_cache() + gc.collect() at chapter end + peak-RSS telemetry line ([MEM] chapter N committed: peak RSS X MB) so Railway logs show memory without waiting for SIGKILL.",
+      "full_page_vision_ownership draws on page_img.copy() -- the cache keeps the clean render.",
+      "render_page_png closes the PyMuPDF doc in finally and removes the pdftoppm temp dir after loading.",
+      "Resume safety: questions.jsonl is now rewritten ATOMICALLY per chapter (rewrite_questions_file: drop this chapter's old rows, append fresh, dedupe keep-LAST by id, os.replace). main()/app.py/test_v2_chapter.py pass the PATH instead of an append handle. A worker death at ANY point leaves the file = last committed chapter; a resume can never duplicate records (old append-mode deduped only at the end of a full book -> mid-book deaths left duplicates)."
+    ],
+    "resume_verification": "process_pdf skips chapters in progress['chapters_done'] (saved AFTER the atomic rewrite); a death between rewrite and save_state re-runs the chapter which REPLACES its rows (no dup); a death after save_state skips it. Both paths are duplication-free.",
+    "tests_added": [
+      "test_render_cache_bounded_lru_evicts_oldest",
+      "test_render_cache_stress_200_pages_stays_bounded",
+      "test_clear_render_cache_empties",
+      "test_full_page_vision_draws_on_copy_not_cache",
+      "test_rewrite_removes_partial_chapter_and_dedups",
+      "test_rewrite_twice_same_chapter_no_duplication",
+      "test_render_temp_dirs_are_removed"
+    ],
+    "test_result": "137 tests OK (1 skipped: opt-in real-PDF fixture)",
+    "still_requires_railway_run": [
+      "Fresh run must NOT SIGKILL; [MEM] lines must show bounded peak RSS (<< 512 MB).",
+      "Resume after a kill must produce exactly-once rows per chapter (no duplicates in questions.jsonl)."
+    ]
+  },
+  "run_17_code_audit": {
+    "bugs_fixed": [
+      {
+        "id": "B17-1",
+        "title": "routed_pages excluded from ALL Gemini passes -> questions on mixed sensitive pages silently lost (no drain: page never failed)",
+        "fix": "_batch_after_routing: only S-pass skips routed pages (solutions already OCR-recovered); Q/A always run"
+      },
+      {
+        "id": "B17-2",
+        "title": "qbank_validator._stem_contamination_reason used pre-run-12 naive containment -> flagged GOOD question-shaped stems (ch26 q1 class) as contaminated_question on every re-run (false positives)",
+        "fix": "synced to pipeline _stem_reject_reason: question-shape narrowing + reverse-containment verbatim rule"
+      }
+    ],
+    "dead_code_removed": [
+      "answer_key_rows_seen (empty stub)",
+      "looks_like_solution_style_stem (+ SOLUTION_STYLE_STEM_RE)",
+      "claim_solution_page_images (pre-run-9 compat wrapper)",
+      "_record_chapter_ledger (unused)"
+    ],
+    "duplicates_removed": [
+      "second copy of image order_key (reuses _order_imgs_by_position)",
+      "separate repair_option_labels (inline in build_final_question already)"
+    ],
+    "cleanups": [
+      "_page_crops closes PIL handle",
+      "unused wdt variable removed",
+      "pyflakes-clean on production files"
+    ],
+    "lines": "qbank_pipeline 6324 -> 6260 (-64 lines of dead/duplicate code)",
+    "tests_added": [
+      "Run17CodeAuditTests.test_routed_pages_skipped_only_by_s_pass",
+      "Run17CodeAuditTests.test_no_routed_pages_batch_unchanged",
+      "ValidatorContaminationTests.test_real_restated_stem_not_flagged",
+      "ValidatorContaminationTests.test_verbatim_stem_solution_flagged"
+    ],
+    "test_result": "141 tests OK (1 skipped: opt-in real-PDF fixture)"
+  },
+  "run_18_zip_isolation": {
+    "symptom": "Railway download ZIP contains previous run's output JSONs even after Reset",
+    "root_cause": "reset_output() archived only data/, assets/, state.json; subjects/ (build_subject_bundle per-subject chapter JSONs + questions.jsonl) survived reset and make_zip() rglob packaged it into the next export",
+    "fix": [
+      "app._entries_to_archive(out): reset archives EVERYTHING except _archive (data, assets, subjects, state.json, strays)",
+      "app._zip_skip(rel): make_zip never exports _archive/, *.bak-*, output_results.zip (self)",
+      "reset_output uses _entries_to_archive; make_zip uses _zip_skip"
+    ],
+    "user_manual_changes": "commits b3e543b + 16cc70d (qbank_pipeline.py run-18 regex/tiebreaker improvements) merged cleanly",
+    "tests_added": [
+      "ZipResetIsolationTests x4 (entries_to_archive includes subjects/excludes archive, reset moves subjects into archive, zip skip rules, end-to-end zip no stale archive entries)"
+    ],
+    "test_result": "145 tests OK (1 skipped: opt-in real-PDF fixture)"
+  }
+}

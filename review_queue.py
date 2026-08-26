@@ -382,6 +382,27 @@ def group_review_rows(output_root, rows, views):
     out.sort(key=lambda c: (c["_rank"], str(c.get("chapter_id") or ""),
                             c.get("q_id") or ""))
     return out
+    """Which chapter of <subject> contains file-page <page>? chapters.json
+    ranges when present, else the split rows' source_pages min/max. Used so
+    the human types only the question NUMBER, never the chapter id."""
+    out = Path(output_root)
+    cj = out / "subjects" / subject / "chapters.json"
+    if cj.exists():
+        try:
+            for c in json.loads(cj.read_text()):
+                a, b = c.get("file_start"), c.get("file_end")
+                if a and b and int(a) <= page <= int(b):
+                    return c.get("chapter_id")
+        except Exception:
+            pass
+    for chd in sorted((out / "split" / subject).glob("*")):
+        pages = []
+        for r in _read_jsonl(chd / "questions.jsonl"):
+            pages += [p for p in (r.get("source_pages") or [])
+                      if isinstance(p, int)]
+        if pages and min(pages) <= page <= max(pages):
+            return chd.name
+    return None
 
 
 def chapter_for_page(output_root, subject, page):
@@ -546,6 +567,12 @@ def decision_key(flag) -> str:
         flag.get("source") or ""))
     det = hashlib.sha1(str(flag.get("detail", "")).encode()).hexdigest()[:8]
     return hashlib.sha1((raw + "|" + det).encode()).hexdigest()[:16]
+
+
+def _chapter_from_qid(q_id):
+    """OBG-003-016 -> OBG-003"""
+    parts = (q_id or "").split("-")
+    return "-".join(parts[:2]) if len(parts) >= 3 else None
 
 
 def _qn_from_qid(q_id):
@@ -992,6 +1019,42 @@ def _find_master_row(output_root, q_id: str):
         if r.get("id") == q_id:
             return r
     return None
+
+
+def _json_path_get(row, path):
+    """path like ('question','text') or ('options','A','text')"""
+    cur = row
+    for p in path:
+        if isinstance(cur, list):
+            cur = next((o for o in cur if str(o.get("id")) == str(p)), None)
+        elif isinstance(cur, dict):
+            cur = cur.get(p)
+        else:
+            return None
+        if cur is None:
+            return None
+    return cur
+
+
+def _json_path_set(row, path, value):
+    cur = row
+    for p in path[:-1]:
+        if isinstance(cur, list):
+            cur = next((o for o in cur if str(o.get("id")) == str(p)), None)
+        else:
+            cur = cur.get(p) if isinstance(cur, dict) else None
+        if cur is None:
+            return False
+    last = path[-1]
+    if isinstance(cur, list):
+        tgt = next((o for o in cur if str(o.get("id")) == str(last)), None)
+        if tgt is None:
+            return False
+        return True  # list target handled by caller w/ leaf key
+    if isinstance(cur, dict):
+        cur[last] = value
+        return True
+    return False
 
 
 FIELD_PATHS = {
@@ -1736,28 +1799,12 @@ def build_final_zip(output_root, dest=None):
                 if row.get("file"):
                     referenced.add(row["file"])
 
-    # RUN-29 (OPH-001): what the package ACTUALLY contains, verdict-wise.
-    # The queue gate proves every flag was DECIDED -- not that every row is
-    # clean. A REVIEW_NEEDED row a human approved or ignored ships unchanged,
-    # and `record_decision` has no exclude action, so this count can be
-    # non-zero on a legitimately built file. Stating it in the receipt makes
-    # the delivered zip self-documenting instead of relying on a reviewer
-    # remembering which rows were flagged. "UNLABELLED" covers split files
-    # written before qa_status propagated.
-    shipped_status: dict = {}
-    if split_root.exists():
-        for qf in sorted(split_root.glob("*/*/questions.jsonl")):
-            for row in _read_jsonl(qf):
-                st = row.get("qa_status") or "UNLABELLED"
-                shipped_status[st] = shipped_status.get(st, 0) + 1
-
     receipt = {
         "built_at": _now(), "output_root": out_root.name,
         "chapters": len(manifest_files), "subjects": sorted(subjects),
         "images_shipped": len(referenced),
         "review_decisions": len(receipts),
         "human_edits": len(edits),
-        "shipped_qa_status_counts": shipped_status or None,
         "gate": "queue clear — built only after every flag was resolved",
     }
 

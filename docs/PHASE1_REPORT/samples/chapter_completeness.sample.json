@@ -1,0 +1,40 @@
+{
+  "chapter_id": "PSY-007",
+  "subject": "PSY",
+  "chapter_no": 7,
+  "ts": "2026-08-08T11:47:26Z",
+  "question_records": 6,
+  "answer_records": 6,
+  "solution_records": 6,
+  "image_manifest_records": 3,
+  "incomplete_questions": 2,
+  "incomplete_answers": 1,
+  "incomplete_solutions": 1,
+  "unresolved_qid_count": 1,
+  "unresolved_qid_q_nos": [
+    6
+  ],
+  "orphan_count": 2,
+  "unresolved_image_count": 0,
+  "q_id_grade_counts": {
+    "RESOLVED": 3,
+    "PROVISIONAL": 1,
+    "UNRESOLVED": 0,
+    "RESOLVED_ANCHORED": 2
+  },
+  "extraction_status_counts": {
+    "COMPLETE": 14,
+    "INCOMPLETE": 4
+  },
+  "pass_provenance_summary": {
+    "A_PASS": 5,
+    "Q_PASS": 6,
+    "S_PASS": 5
+  },
+  "phase2_pending_anchors": {
+    "neighbor_run": "design doc §3.1: run-18 GUARD's connected-run analysis",
+    "carry_forward_origin": "design doc §3.1: compute_carry() output per window",
+    "ocr_stem_match": "design doc §3.1: only populated when text layer was garbled",
+    "ocr_solution_header_match": "design doc §3.1: only populated when text layer was garbled"
+  }
+}
