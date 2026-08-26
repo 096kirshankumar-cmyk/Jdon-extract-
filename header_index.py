@@ -124,6 +124,34 @@ def scan_page(pdf_path, page, dpi=150):
             "conf": float(conf), "snippet": text[:160],
             "method": "render_ocr",
         })
+
+    # The rendered OCR is the primary detector, but dense pages can merge a
+    # real furniture header into nearby garbled glyphs (OPH-004 p78: OCR read
+    # "Solution to Question 6" as "...a", even though the PDF visitor kept
+    # the exact header).  Add only exact line-level visitor evidence as a
+    # deterministic recovery; it does not read body content or infer a
+    # boundary.  De-duplicate a header already found by pixel OCR.
+    try:
+        for y, words in qp._page_word_lines(pdf_path, page):
+            text = " ".join(t for _x, t in words)
+            hit = classify_line(text)
+            if not hit:
+                continue
+            typ, n = hit
+            if any(r["type"] == typ and r.get("n") == n
+                   and abs(float(r["y"]) - float(y)) <= 10.0
+                   for r in recs):
+                continue
+            x = float(words[0][0]) if words else 0.0
+            recs.append({
+                "page": int(page), "y": float(y), "type": typ, "n": n,
+                "bbox": [x, float(y), x + 200, float(y) + 12],
+                "conf": 100.0, "snippet": text[:160],
+                "method": "text_visitor_header_recovery",
+            })
+    except Exception:
+        pass
+    recs.sort(key=lambda r: -float(r["y"]))
     return recs
 
 
