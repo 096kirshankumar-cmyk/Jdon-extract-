@@ -63,6 +63,11 @@ class AuditEnv(unittest.TestCase):
         qp._declared_image_allowance.clear()
         qp._OCR_ANCHOR_CACHE.clear()
         qp._OCR_ANCHOR_XY.clear()
+        # union_block_headers_on_page caches per (pdf, page, dpi, section,
+        # rec_sig); a previous test's stubbed scan for the SAME key would
+        # otherwise be replayed here (order-dependent failures).
+        qp._UNION_HEADER_CACHE.clear()
+        qp._UNION_DROP_LOGGED.clear()
         self._patches = {}
 
     def tearDown(self):

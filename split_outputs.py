@@ -966,9 +966,38 @@ def _source_pages_for(qn: int, qn_source_pages) -> list:
     return []
 
 
+def _apply_row_status(out: dict, status: dict | None) -> dict:
+    """Copy the question's pipeline verdict onto a split row.
+
+    RUN-29 (OPH-001): the split layer -- and therefore final_export.zip, whose
+    whitelist is exactly these files -- carried only `extraction_status`, a
+    STRUCTURAL check (stem + 4 options). `qa_status` (READY / REVIEW_NEEDED /
+    INCOMPLETE) and its `qa_reasons` lived solely in data/questions.jsonl,
+    which build_final_zip does not ship. A REVIEW_NEEDED row was therefore
+    byte-identical to a READY one in the delivery package: the review flag
+    existed only in the workshop copy.
+
+    `status` is the per-QUESTION verdict copied verbatim from the master row
+    built by qbank_pipeline.build_final_question -- this layer never
+    re-derives it, so the two views cannot drift. It is the same value on all
+    three files of a question (per-question, not per-file); None when the
+    caller has no master rows to copy from (e.g. the standalone
+    tools/full_book_split.py path), in which case nothing is added and the
+    row schema is unchanged.
+    """
+    if not status:
+        return out
+    out["qa_status"] = status.get("qa_status")
+    reasons = status.get("qa_reasons") or []
+    if reasons:
+        out["qa_reasons"] = list(reasons)
+    out["manual_review"] = bool(status.get("manual_review"))
+    return out
+
+
 def _build_question_row(qn: int, rec: dict, chapter_id: str, subject: str,
                         chapter_no: int, image_files: dict,
-                        ownership_pages=None) -> dict:
+                        ownership_pages=None, status: dict | None = None) -> dict:
     q_id = f"{subject}-{chapter_no:03d}-{int(qn):03d}"
     options = rec.get("options") or {}
     option_rows = []
@@ -1027,11 +1056,11 @@ def _build_question_row(qn: int, rec: dict, chapter_id: str, subject: str,
     out["extraction_status"], missing = _classify_question_completeness(rec)
     if missing:
         out["missing_fields"] = missing
-    return out
+    return _apply_row_status(out, status)
 
 
 def _build_answer_row(qn: int, rec: dict, chapter_id: str, subject: str,
-                      chapter_no: int) -> dict:
+                      chapter_no: int, status: dict | None = None) -> dict:
     q_id = f"{subject}-{chapter_no:03d}-{int(qn):03d}"
     correct = rec.get("correct_option")
     qa = rec.get("q_no_anchors") or {}
@@ -1051,12 +1080,12 @@ def _build_answer_row(qn: int, rec: dict, chapter_id: str, subject: str,
     out["extraction_status"], missing = _classify_answer_completeness(rec)
     if missing:
         out["missing_fields"] = missing
-    return out
+    return _apply_row_status(out, status)
 
 
 def _build_solution_row(qn: int, rec: dict, chapter_id: str, subject: str,
                         chapter_no: int, image_files: dict,
-                        ownership_pages=None) -> dict:
+                        ownership_pages=None, status: dict | None = None) -> dict:
     q_id = f"{subject}-{chapter_no:03d}-{int(qn):03d}"
     tables = rec.get("tables") or []
     sol_imgs = [
@@ -1085,7 +1114,7 @@ def _build_solution_row(qn: int, rec: dict, chapter_id: str, subject: str,
     out["extraction_status"], missing = _classify_solution_completeness(rec)
     if missing:
         out["missing_fields"] = missing
-    return out
+    return _apply_row_status(out, status)
 
 
 def _classify_question_completeness(rec: dict) -> tuple:
@@ -1211,14 +1240,21 @@ def write_split_outputs(*, chapter_id: str, subject: str, chapter_no: int,
                         pdf_path: str, page_files,
                         reconciled: dict,
                         output_root,
-                        ownership_pages=None) -> dict:
+                        ownership_pages=None,
+                        row_status: dict | None = None) -> dict:
     """Write all seven per-chapter files atomically. chapter_completeness.json
     is written LAST as the "this chapter's split is fully on disk" signal.
     Returns the chapter_completeness.json content (the per-chapter summary
-    the design requires)."""
+    the design requires).
+
+    row_status: {q_no: {"qa_status", "qa_reasons", "manual_review"}} copied
+    verbatim from the master rows built by build_final_question. Optional --
+    when omitted the split rows keep their previous schema (no qa_status).
+    """
     output_root = Path(output_root)
     chapter_dir = output_root / "split" / subject / chapter_id
     chapter_dir.mkdir(parents=True, exist_ok=True)
+    row_status = row_status or {}
 
     # Copy qn_source_pages into each record so the row builders can read it
     # without a separate lookup. This is a per-record decoration done here
@@ -1233,18 +1269,20 @@ def write_split_outputs(*, chapter_id: str, subject: str, chapter_no: int,
     question_rows = [
         _build_question_row(qn, chapter_records[qn], chapter_id, subject,
                             chapter_no, image_files_by_q.get(qn, {}),
-                            ownership_pages=ownership_pages)
+                            ownership_pages=ownership_pages,
+                            status=row_status.get(qn))
         for qn in qns
     ]
     answer_rows = [
         _build_answer_row(qn, chapter_records[qn], chapter_id, subject,
-                          chapter_no)
+                          chapter_no, status=row_status.get(qn))
         for qn in qns
     ]
     solution_rows = [
         _build_solution_row(qn, chapter_records[qn], chapter_id, subject,
                             chapter_no, image_files_by_q.get(qn, {}),
-                            ownership_pages=ownership_pages)
+                            ownership_pages=ownership_pages,
+                            status=row_status.get(qn))
         for qn in qns
     ]
 
@@ -1327,6 +1365,16 @@ def write_split_outputs(*, chapter_id: str, subject: str, chapter_no: int,
     grade_counts = {g: 0 for g in ALLOWED_Q_ID_GRADES}
     seen_qids = set()
     extraction_counts = {"COMPLETE": 0, "INCOMPLETE": 0}
+    # RUN-29: qa_status is a PER-QUESTION verdict (READY / REVIEW_NEEDED /
+    # INCOMPLETE) copied verbatim from the master rows, so it is counted once
+    # per q_id off questions.jsonl -- not once per file, which would
+    # triple-count it the way extraction_status legitimately does.
+    qa_counts: dict = {}
+    for r in question_rows:
+        st = r.get("qa_status")
+        if st is None:
+            continue          # caller passed no row_status (standalone split)
+        qa_counts[st] = qa_counts.get(st, 0) + 1
     pass_summary: dict = {}
     seen_prov_pairs: set = set()
     for r in question_rows + answer_rows + solution_rows:
@@ -1383,6 +1431,9 @@ def write_split_outputs(*, chapter_id: str, subject: str, chapter_no: int,
 
         "q_id_grade_counts": grade_counts,
         "extraction_status_counts": extraction_counts,
+        # RUN-29: omitted entirely when the caller supplied no row_status, so
+        # the standalone-split path keeps the previous schema.
+        "qa_status_counts": qa_counts or None,
         "pass_provenance_summary": pass_summary,
 
         # Phase-2 plan completed: the two non-printed anchors from

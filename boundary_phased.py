@@ -77,6 +77,34 @@ import crop_parse
 
 MAX_FIX_ATTEMPTS = 3
 PAGE_CHUNK = 7            # boundary detect only; Q/S extract uses crops
+# RUN-38: how many crop images go into ONE Gemini call.
+#
+# This was 4, and that contradicted the prompt sent alongside the images:
+# "One image per printed item ... Transcribe ONLY that interval. Do not invent
+# from chapter context." Handing the model four adjacent blocks and asking it
+# to ignore three of them is how q4 came back with q3's explanation prepended
+# -- the neighbouring crop was sitting right there in context.
+#
+# 1 costs more calls (OPH-001: ~12 -> ~46 per chapter) and buys the only thing
+# that actually matters here: an item cannot be contaminated by a neighbour it
+# was never shown. Raise it only if quota forces the trade, and expect
+# cross-item bleed to come back with it.
+#
+# RUN-41: full-book quota math made the trade mandatory. At CROP_BATCH_SIZE=1
+# a 600+ page question bank (23 questions/chapter) spends ~2 Gemini calls per
+# question (Q+S) -> ~1500+ calls/book vs the 480/day free-tier budget: a whole
+# book cannot finish in a day. _crop_is_batchable() only batches the SAFE
+# class -- text-only, single-page QUESTION crops (solutions and anything with
+# figures stay 1-per-call), and _gemini_crop_batch anchors every item to its
+# own interval q_no with an explicit "Expected q_nos" list, so a batched item
+# still cannot absorb a neighbour: wrong-q_no items are rejected at intake and
+# the verify loop re-checks each item against its own page. Default 3 cuts the
+# Q-phase call count ~3x while keeping every solution crop isolated.
+CROP_BATCH_SIZE = int(os.environ.get("QBANK_CROP_BATCH", "3"))
+# Set to a directory to write every crop image Gemini is sent, named
+# <chapter>_<Q|S><q_no>_part<i>.png. The only way to tell a wrong block
+# boundary from a model that added text -- you have to look at the crop.
+CROP_DUMP_DIR = os.environ.get("QBANK_CROP_DUMP", "").strip()
 KEY_TABLE_DPI = 300       # answer-key table crop only (dense grid)
 
 # Tests flip this off; production paces every Gemini request through
@@ -481,6 +509,13 @@ CRITICAL rule (bleed prevention):
 Solution format aksar: text → image → text. Second text-chunk ko AGLE question 
 ke saath mat jodo, chahe visually next question ke paas dikhe.
 
+CRITICAL rule (PEECHHE ka bleed — OPH-001 q4 live):
+Tumhe ek ISOLATED crop mila hai: "Solution to Question N:" header se shuru,
+agle header tak. Agar crop me us header se PEHLE bhi koi text dikhe, to wo
+PICHHLE question ka solution hai — usse bilkul include mat karo. Sirf "Solution
+to Question N:" ke BAAD ka text lo. Yaad se ya context se pichhla solution
+mat likho — jo crop me nahi dikha raha wo exist nahi karta.
+
 Anchor rule: Naya solution TABHI shuru hota hai jab explicit next question-
 number marker dikhe (jaise "Ans. 12" ya "12."). Jab tak agla number-marker 
 na dikhe, saara text (image ke pehle aur baad dono) USI current question 
@@ -743,6 +778,37 @@ def _inclusive_pages(pages, ch_last):
     return list(range(lo, hi + 1))
 
 
+def _zone_pages_from_headers(pages, ch_last):
+    """Contiguous page span for a zone, ignoring headers past the chapter end.
+
+    RUN-31 (OPH-001 live). detect_boundaries scans ch_first..ch_last+2 ON
+    PURPOSE, so a block that continues past the chapter's last page is still
+    seen and cropped. But those extra pages belong to the NEXT chapter, and
+    spanning min..max over the whole set let them stretch the zone:
+
+        visual Question headers  {4,5,6,7,8,9,10,11, 24}
+        _inclusive_pages(..., ch_last=22)  ->  4..22      <-- WRONG
+
+    One next-chapter header on p24 turned a correct Q 4-11 into Q 4-22,
+    swallowing the answer-key page and overlapping the whole solution zone
+    (the run logged Q 4-22 and S 12-22 at once). This was not Gemini
+    hallucinating -- the boundary JSON was right (Q 4-11 | A 12 | S 12-22);
+    the min..max span discarded it.
+
+    Dropping pages beyond ch_last before spanning fixes it without breaking
+    legitimate internal gaps (a question spanning pages 6-8 still leaves no
+    header on 7). Crop intervals keep using file_end=_scan_last, so
+    continuation content past ch_last is still extracted -- only the ZONE
+    stays inside the chapter.
+
+    Returns [] when every header is past ch_last; the caller then keeps the
+    model-derived zone rather than getting an empty one."""
+    inside = [p for p in (pages or []) if p is not None and int(p) <= int(ch_last)]
+    if not inside:
+        return []
+    return _inclusive_pages(inside, ch_last)
+
+
 class ChapterRunner:
     """One chapter through Steps 0-8, then a real commit into the pipeline's
     normal output (Step 8 is WRITE-THROUGH, not a dry run).
@@ -845,6 +911,19 @@ class ChapterRunner:
                  f"invent from chapter context."]
         for iv in ivals:
             b = _stitch_interval_png(self.pdf, iv, dpi=dpi)
+            if b and CROP_DUMP_DIR:
+                # RUN-38: the only way to separate "the block boundary was
+                # wrong" from "the model added text" is to look at the crop
+                # the model was actually sent. q4 shipped with q3's
+                # explanation prepended and nothing on disk could say which
+                # of the two had happened.
+                try:
+                    d = Path(CROP_DUMP_DIR)
+                    d.mkdir(parents=True, exist_ok=True)
+                    (d / f"{self.chapter_id}_q{iv.get('n')}"
+                         f"_p{iv.get('start_page')}.png").write_bytes(b)
+                except OSError as de:
+                    print(f"[BPH] {self.chapter_id}: crop dump failed ({de})")
             if not b:
                 for st in iv.get("strips") or []:
                     b = _crop_strip_png(self.pdf, st["page"], st["y_hi"],
@@ -953,29 +1032,81 @@ class ChapterRunner:
         return res
 
     # -- Phase extraction helper ---------------------------------------------
+    _HEALTH_RANK = {"CLEAN": 3, "DEGRADED": 2, "GARBLED": 1, "EMPTY": 0}
+
     def _geom_item_from_interval(self, iv, label):
-        """CLEAN text-layer parse of one header interval. None if not usable."""
-        blobs = []
-        for st in iv.get("strips") or []:
+        """Deterministic parse of one crop from the PDF TEXT LAYER only.
+        Returns the parsed item or None, and tallies the outcome on
+        self._geom_stats so the phase log says why a crop went to Gemini.
+
+        RUN-34: an OCR fallback was added here in run-32 and is now REMOVED.
+        On OPH-001 it took geom_ok from 0 to 22/23 and cut Gemini calls from
+        46 to ~2 -- and the recovered text was unusable. Tesseract read the
+        page furniture as body copy:
+
+            q1 solution  "...leading to\\n12 Sold by @itachibot\\n\\nhypermetropia."
+            q3 solution  ". X"                    (whole explanation lost)
+            q6 solution  "...neural crest.\\nCmlistklianm Fm Pir tr rebkiana WM"
+            q2 stem      "oe SS «\\ni i ity?\\nAt what age would a child attain full a «"
+
+        Every one shipped as qa_status=READY, because _crop_item_shippable
+        checks structure (stem present + 4 options), not legibility. Gemini
+        reads the crop IMAGE and does not make these mistakes. Cheap-and-wrong
+        is the wrong trade for a book extracted 18,000 questions at a time
+        with nobody reviewing the output, so a crop whose text layer is not
+        CLEAN now falls through to Gemini exactly as it did before run-32."""
+        stats = getattr(self, "_geom_stats", None)
+        if stats is None:
+            stats = self._geom_stats = {}
+
+        def _tally(key):
+            stats[key] = stats.get(key, 0) + 1
+
+        strips = iv.get("strips") or []
+        if not strips:
+            _tally("no_strips")
+            return None
+
+        # Worst health across the strips decides usability -- one garbled page
+        # in a multi-page block makes the joined blob unusable anyway.
+        worst, blobs = "CLEAN", []
+        for st in strips:
             try:
                 txt = qp.pdftotext_page(self.pdf, st["page"]) or ""
             except Exception:
                 txt = ""
             h = header_index.text_layer_health(txt)
-            if h in ("EMPTY", "GARBLED"):
-                return None
+            if self._HEALTH_RANK.get(h, 0) < self._HEALTH_RANK.get(worst, 3):
+                worst = h
             blobs.append(txt)
-        blob = "\n".join(blobs)
-        if header_index.text_layer_health(blob) != "CLEAN":
+
+        if worst != "CLEAN":
+            # Unreadable text layer -> hand the crop to Gemini, which reads
+            # the rendered image. Tally the health so a book that always
+            # lands here is visible in the log instead of silently spending
+            # a Gemini call per crop.
+            _tally(f"text_{worst.lower()}_to_gemini")
             return None
+
         if label == "Question":
-            return crop_parse.parse_question_text(blob, iv["n"])
-        if label == "Solution":
-            return crop_parse.parse_solution_text(blob, iv["n"])
+            it = crop_parse.parse_question_text("\n".join(blobs), iv["n"])
+        elif label == "Solution":
+            it = crop_parse.parse_solution_text("\n".join(blobs), iv["n"])
+        else:
+            return None
+        if it and self._crop_item_shippable(it, label):
+            _tally("text")
+            return it
+        # Readable text but no complete item: a crop_parse coverage gap.
+        # Gemini gets the crop.
+        _tally("text_clean_parse_missed")
         return None
 
     def _extract_from_crops(self, ivals, prompt_tmpl, label, pass_name, dpi=130):
         """Geometric CLEAN parse first; Gemini only leftover crops (max 4)."""
+        # RUN-32: the tally is per-phase, so reset it before this phase's
+        # crops are read and report it with the split.
+        self._geom_stats = {}
         out = []
         leftover = []
         for iv in ivals:
@@ -989,17 +1120,57 @@ class ChapterRunner:
                 out.append(it)
             else:
                 leftover.append(iv)
-        if leftover:
-            print(f"[BPH] {self.chapter_id}: {pass_name} geom ok={len(out)} "
-                  f"gemini_crops={len(leftover)}")
+        # Always report the split (run-30): it used to print only when
+        # something needed Gemini, so a fully geometric phase -- the best
+        # possible outcome, zero tokens -- looked identical to a phase that
+        # never ran the crop path at all. RUN-32 adds the WHY: geom_ok=0 told
+        # us nothing was being parsed deterministically but not whether the
+        # text layer was missing, unreadable, or merely unparseable.
+        _why = " ".join(f"{k}={v}" for k, v in
+                        sorted((self._geom_stats or {}).items())) or "-"
+        print(f"[BPH] {self.chapter_id}: {pass_name} crops={len(ivals)} "
+              f"geom_ok={len(out)} (0 Gemini calls) "
+              f"gemini_crops={len(leftover)} | why: {_why}")
         batchable, singles = [], []
         for iv in leftover:
             if self._crop_is_batchable(iv, label, leftover):
                 batchable.append(iv)
             else:
                 singles.append(iv)
-        work = list(_chunk_pages(batchable, 4)) + [[iv] for iv in singles]
+        work = (list(_chunk_pages(batchable, CROP_BATCH_SIZE))
+                + [[iv] for iv in singles])
+        if CROP_BATCH_SIZE == 1:
+            # Every item gets its own call, so say so in the log -- the call
+            # count is the visible cost of the isolation.
+            print(f"[BPH] {self.chapter_id}: {pass_name} sending "
+                  f"{len(work)} isolated crop(s), one Gemini call each "
+                  f"(CROP_BATCH_SIZE=1: no neighbour in context)")
+        else:
+            # RUN-41: batched mode keeps the call-count visible too. Only the
+            # safe class (text-only single-page Question crops) is batched;
+            # solutions and figure/multi-page/edge crops stay isolated.
+            print(f"[BPH] {self.chapter_id}: {pass_name} sending {len(work)} "
+                  f"Gemini call(s) (batch={CROP_BATCH_SIZE}: "
+                  f"{len(batchable)} batchable -> "
+                  f"{(len(batchable) + CROP_BATCH_SIZE - 1) // CROP_BATCH_SIZE} "
+                  f"batch(es), {len(singles)} isolated; figures and solution "
+                  f"crops never batched)")
         retry_singles = []
+        def _keep_shippable(kept, tag):
+            """RUN-31: one place that decides what may ship, so the batch
+            path, the single-crop path and the post-retry path cannot drift.
+            Anything structurally incomplete is DROPPED here -- it is then
+            missing (named by q_no in the export gate) instead of shipping as
+            a plausible hallucination that every downstream check accepts."""
+            good = [it for it in kept if self._crop_item_shippable(it, label)]
+            bad = len(kept) - len(good)
+            if bad:
+                msg = (f"{pass_name}: {tag} DISCARDED {bad} unusable item(s) "
+                       f"-- left missing rather than shipped as a guess")
+                self.notes.append(msg)
+                print(f"[BPH] {self.chapter_id}: {msg}")
+            return good
+
         for batch in work:
             kept = self._gemini_crop_batch(batch, prompt_tmpl, label,
                                            pass_name, dpi)
@@ -1012,13 +1183,16 @@ class ChapterRunner:
                     else:
                         out.append(it)
             else:
-                out.extend(kept)
+                # Was `out.extend(kept)`: a single crop was appended with no
+                # check at all, so the unbatched path -- the majority on a
+                # book whose text layer is not CLEAN -- could ship anything.
+                out.extend(_keep_shippable(kept, f"q{batch[0]['n']}"))
         for iv in retry_singles:
             self.notes.append(
                 f"{pass_name}: batch miss/low-conf q{iv['n']} -> single crop")
             kept = self._gemini_crop_batch([iv], prompt_tmpl, label,
                                            pass_name, dpi)
-            out.extend(kept)
+            out.extend(_keep_shippable(kept, f"q{iv['n']} after retry"))
         return self._merge_phase_items(out)
 
     @staticmethod
@@ -1041,6 +1215,30 @@ class ChapterRunner:
         if str(it.get("text_confidence") or "").lower() == "low":
             return False
         if it.get("has_figure"):
+            return False
+        if label == "Question":
+            opts, _ = _norm_options(it.get("options"))
+            return bool(str(it.get("stem") or "").strip()) and len(opts) >= 4
+        if label == "Solution":
+            return bool(str(it.get("solution_text") or "").strip())
+        return True
+
+    @staticmethod
+    def _crop_item_shippable(it, label):
+        """RUN-31: may this item SHIP? Not the same question as
+        _crop_item_ok, which asks "should we retry this crop?".
+
+        The difference is has_figure: _crop_item_ok rejects a figured item
+        because a figure can hide text, so it is worth another read. But a
+        figure is NOT a text defect -- the image pass attaches it separately.
+        Using _crop_item_ok as the ship test would throw away every question
+        with a diagram, which on this book is most of them.
+
+        For an 18k-question book with no human review capacity the rule is:
+        ship only content that is structurally complete, otherwise leave the
+        item missing. A missing item is reported by q_no in the export gate;
+        a plausible hallucination looks clean to every downstream check."""
+        if not isinstance(it, dict):
             return False
         if label == "Question":
             opts, _ = _norm_options(it.get("options"))
@@ -1109,6 +1307,10 @@ class ChapterRunner:
         if ivals and label in ("Question", "Solution"):
             # Final rule: stem/options/solution from THAT crop only.
             # No 7-page fallback — empty crop stays empty + flagged.
+            print(f"[BPH] {self.chapter_id}: {pass_name} -> CROP path "
+                  f"({len(ivals)} {label} crop(s) cut from the visual header "
+                  f"index; pages {min(i['start_page'] for i in ivals)}-"
+                  f"{max(i['end_page'] for i in ivals)})")
             cropped = self._extract_from_crops(
                 ivals, prompt_tmpl, label, pass_name, dpi=max(dpi, 130))
             if label == "Solution":
@@ -1117,6 +1319,28 @@ class ChapterRunner:
                 self.notes.append(
                     f"{pass_name}: crop extract empty (no 7-page fallback)")
             return cropped or []
+        # WHY the page path ran must be visible (run-30). Crops are the
+        # designed path for Question/Solution; reaching here means either the
+        # phase is the Answer-key table (whole pages are correct there) or the
+        # visual header scan found no headers of this type, so there was
+        # nothing to cut a crop from. The old code fell through silently, so a
+        # whole book could extract by page images with nothing in the log to
+        # say the crop path never engaged.
+        if label in ("Question", "Solution"):
+            _hdr_n = len(self._visual_headers or [])
+            print(f"[BPH] {self.chapter_id}: {pass_name} -> PAGE path "
+                  f"(FALLBACK: the visual header index produced 0 {label} "
+                  f"crops -- {_hdr_n} header(s) scanned total). Fix the header "
+                  f"scan to get crops back; page images are the degraded "
+                  f"path.")
+            self.notes.append(
+                f"{pass_name}: no {label} crops from the visual header index "
+                f"({_hdr_n} headers scanned) -- degraded to whole-page "
+                f"extraction")
+        else:
+            print(f"[BPH] {self.chapter_id}: {pass_name} -> PAGE path "
+                  f"(answer key is a page-spanning table; crops are cut for "
+                  f"Question/Solution blocks only)")
         out = []
         for chunk in _phase_chunks(pages):
             p = prompt_tmpl.format(chapter_name=self.chapter_id,
@@ -1135,8 +1359,20 @@ class ChapterRunner:
                     # not the content. OCR the same pages (deterministic) and
                     # structure the text with the same phase rules. Items are
                     # marked _ocr -> REVIEW_NEEDED rows, never trusted silent.
-                    ocr_kept = self._ocr_fallback(chunk, prompt_tmpl, label,
-                                                  pass_name)
+                    # RUN-42: guarded. The fallback is a best-effort recovery
+                    # and must never take the chapter run down with it -- a
+                    # missing pdftoppm/tesseract, or a second model block
+                    # inside the fallback, used to propagate out of run()
+                    # entirely. Degrading to an unresolved phase (blocker row,
+                    # chapter left undone, retried next run) is the contract.
+                    try:
+                        ocr_kept = self._ocr_fallback(chunk, prompt_tmpl,
+                                                      label, pass_name)
+                    except Exception as ocr_e:
+                        ocr_kept = None
+                        self.notes.append(
+                            f"{pass_name} phase unresolved: OCR fallback "
+                            f"failed ({type(ocr_e).__name__}: {ocr_e})")
                     if ocr_kept:
                         out.extend(ocr_kept)
                         items = ocr_kept
@@ -1517,19 +1753,95 @@ class ChapterRunner:
         return out
 
     # -- Verify helper (Steps 2/4/6 share this) --------------------------------
+    def _recheck_unverified(self, phase_name, items, verdict):
+        """RUN-35: re-test a verify verdict AFTER the re-ask has run.
+
+        _verify_phase runs BEFORE _printed_header_reask, so its verdict goes
+        stale. OPH-001 live:
+
+            verify -> q3 'Solution text is completely empty.'  (genuine)
+            re-ask -> filled q3
+            commit -> missing solution: 0, 0 INCOMPLETE      (data was fine)
+            gate   -> phase_unresolved ... NOT a clean export (stale verdict)
+
+        The chapter was blocked on a problem the pipeline had already fixed,
+        and because the note is chapter-scoped (q_no=None) it could not even
+        be traced to a row. Re-test every flagged q_no against the items we
+        are actually about to ship: whatever is now complete comes off the
+        list, and if nothing is left the phase counts as resolved. A verdict
+        in any other shape is returned untouched -- this never invents a pass.
+        """
+        if verdict is True:
+            return True
+        if not isinstance(verdict, tuple) or len(verdict) != 2:
+            return verdict
+        reason, payload = verdict
+        if not isinstance(payload, dict) or not isinstance(
+                payload.get("mismatches"), list):
+            return verdict
+
+        content_key = {"Solution": "solution_text",
+                       "Question": "stem"}.get(phase_name)
+        by_qn = {}
+        for it in items or []:
+            qn = _norm_q_no(it.get("_qn") if it.get("_qn") is not None
+                            else it.get("q_no"))
+            if qn is not None:
+                by_qn[qn] = it
+
+        def _now_complete(qn):
+            it = by_qn.get(qn)
+            if it is None or content_key is None:
+                return False
+            val = str(it.get(content_key) or "").strip()
+            if content_key == "solution_text":
+                val, _ = qp.sanitize_solution_text(val, own_qn=qn)
+                val = val.strip()
+            return bool(val)
+
+        still = []
+        recovered = []
+        for m in payload.get("mismatches") or []:
+            qn = _norm_q_no((m or {}).get("q_no"))
+            if qn is not None and _now_complete(qn):
+                recovered.append(qn)
+            else:
+                still.append(m)
+        if recovered:
+            print(f"[BPH] {self.chapter_id}: {phase_name} verify verdict was "
+                  f"stale -- q{sorted(recovered)} recovered by the re-ask, "
+                  f"cleared from the phase verdict")
+        if not still:
+            return True
+        if len(still) == len(payload.get("mismatches") or []):
+            return verdict
+        updated = dict(payload)
+        updated["mismatches"] = still
+        return (reason, updated)
+
     def _verify_phase(self, phase_name, items, pages, dpi=110):
         if not pages:
             return items, True
         bleed_line = BLEED_LINE if phase_name == "Solution" else ""
         prompt = VERIFY_PROMPT.format(phase_name=phase_name, bleed_line=bleed_line)
         # BUG 6: verify the SAME text we will ship (normalized options /
-        # sanitized solutions), never a pre-sanitize draft.
+        # sanitized solutions), never a pre-sanitize draft. RUN-41: page
+        # furniture is stripped here too -- a footer page-number residue
+        # ("18") in a solution was flagged by verify as a mismatch, then
+        # dropped as severity=minor and SHIPPED READY (OPH-001 q15). If the
+        # payload is already clean, verify sees no residue to argue about.
         payload_items = []
         for it in items:
             it2 = dict(it)
             if phase_name == "Question":
                 opts, _ = _norm_options(it.get("options"))
-                it2["options"] = opts
+                opts_clean = {}
+                for _l, _t in (opts or {}).items():
+                    _t2, _ = qp.strip_page_furniture(str(_t or ""))
+                    opts_clean[_l] = _t2
+                stem2, _ = qp.strip_page_furniture(str(it.get("stem") or ""))
+                it2["stem"] = stem2
+                it2["options"] = opts_clean
             elif phase_name == "Solution":
                 st, _ = qp.sanitize_solution_text(
                     it.get("solution_text"), own_qn=it.get("_qn"))
@@ -2050,20 +2362,61 @@ class ChapterRunner:
 
         have = {i.get("_qn") for i in items if _content_ok(i)}
         missing_pages = {}
-        for p in zone_pages:
+        # RUN-32: scan the pages the CROPS actually covered, not just the
+        # clamped zone. _resolve_zones clamps every zone at ch_last, but
+        # detect_boundaries scans ch_last+2 and header_index.intervals closes
+        # the last block at file_end -- so a block whose header sits just past
+        # the chapter's last page IS cropped and sent to Gemini, yet the old
+        # `for p in zone_pages` loop never saw that page and never re-asked.
+        # OPH-001 q23: a header-only solution ("Solution to Question 23:")
+        # sanitized to empty and shipped as missing_solution with no retry.
+        scan_pages = list(zone_pages or [])
+        for iv in (self._visual_intervals(phase_name) or []):
+            for st in (iv.get("strips") or []):
+                pg = st.get("page")
+                if pg is not None and pg not in scan_pages:
+                    scan_pages.append(pg)
+        for p in scan_pages:
             for qn in (hdrs.get(p) or set()):
                 if qn not in have:
                     missing_pages.setdefault(qn, p)
         # Boilerplate (Sol 8/9) is NOT a mislabel. Do not re-ask on
         # similarity. Page-interval mismatch is flagged at commit.
+        # LABEL-MISASSIGNMENT (ANAT-001 live): the model can write one
+        # question's solution INTO another with NO embedded marker, so C1
+        # cannot split and both verify and cross-check pass silently. The
+        # dup detector (80-char floor skips short shared boilerplate) forces
+        # a boundary-proof re-ask of BOTH q_nos; if it persists, the commit
+        # gate flags duplicate_solution (BLOCKER) and the zip stays shut.
         dup_force = set()
+        if phase_name == "Solution":
+            for a, b, sim in self._solution_dup_pairs(items):
+                self.notes.append(
+                    f"Solution: q{a} and q{b} solution texts are near-"
+                    f"duplicates ({int(sim * 100)}%) -- forced re-ask "
+                    f"(label misassignment suspect)")
+                for qn in (a, b):
+                    dup_force.add(qn)
+                    if qn not in have:
+                        continue
+                    pg = next((p for p, s in hdrs.items() if qn in s), None)
+                    if pg is None:
+                        it = next((i for i in items
+                                   if i.get("_qn") == qn), None)
+                        spr = (it or {}).get("source_page_range") or []
+                        pg = _safe_int(spr[0]) if spr else None
+                    missing_pages.setdefault(qn, pg)
         if not missing_pages:
             return items
         qns = sorted(missing_pages)
+        # RUN-32: clamp at the last page the CROPS covered, not max(zone_pages)
+        # -- otherwise a re-ask for a block past the chapter end had its page
+        # window clamped back inside the zone and re-read the wrong page.
+        _hi = max(scan_pages) if scan_pages else max(zone_pages)
         pages = sorted({p for qn in qns
                         for p in range(missing_pages[qn],
                                        min(missing_pages[qn] + 1,
-                                           max(zone_pages)) + 1)})
+                                           _hi) + 1)})
         self.notes.append(f"{phase_name}: printed headers prove missing/"
                           f"empty block(s) q{qns} -- targeted re-ask on "
                           f"{pages}")
@@ -2201,10 +2554,16 @@ class ChapterRunner:
             # Inclusive [min, max] of printed Question headers only.
             # OBG-001 live: max Q header is p12 (Q25-26 + key start);
             # the old `max+1` then another `+1` pulled p13 (solutions) into Q.
-            q_pages = _inclusive_pages(printed["q"], ch_last)
+            # RUN-31: headers past ch_last belong to the NEXT chapter and must
+            # not stretch this one (OPH-001: a p24 header made Q 4-11 -> 4-22).
+            spanned = _zone_pages_from_headers(printed["q"], ch_last)
+            if spanned:
+                q_pages = spanned
         s_pages = m_s
         if printed["s"]:
-            s_pages = _inclusive_pages(printed["s"], ch_last)
+            spanned = _zone_pages_from_headers(printed["s"], ch_last)
+            if spanned:
+                s_pages = spanned
         a_pages = m_a
         if printed["keys"]:
             a_pages = sorted(set(printed["keys"]))
@@ -2464,8 +2823,28 @@ class ChapterRunner:
             v.get("method") in ("key_table_ocr", "key_dual_gemini")
             for v in ev.values())
         if ev:
-            print(f"[BPH] {self.chapter_id}: key evidence for "
-                  f"{len(ev)} row(s) ({','.join(sorted({v['method'] for v in ev.values()}))})")
+            # RUN-47: report the per-method breakdown, not just a total.
+            # OPH-018 logged "key evidence for 5 row(s) (key_table_ocr)" for a
+            # 14-question chapter and nothing said whether the dual Gemini
+            # read had run at all, or run and returned nothing, or disagreed.
+            # OPH-001 got agree=23/23 on the same code, so the difference is
+            # per-chapter and this line is what separates the causes.
+            by_method = {}
+            for v in ev.values():
+                m = v.get("method") or "?"
+                by_method[m] = by_method.get(m, 0) + 1
+            breakdown = " ".join(f"{m}={c}"
+                                 for m, c in sorted(by_method.items()))
+            conflicts = sorted(n for n, v in ev.items()
+                               if v.get("method") == "key_conflict")
+            print(f"[BPH] {self.chapter_id}: key evidence for {len(ev)} "
+                  f"row(s): {breakdown} | key pages {sorted(a_pages or [])}"
+                  + (f" | CONFLICT rows {conflicts}" if conflicts else ""))
+            if "key_dual_gemini" not in by_method:
+                print(f"[BPH] {self.chapter_id}: WARNING -- the dual Gemini "
+                      f"key read contributed NOTHING; every answer came from "
+                      f"{breakdown}. Check the key-table crop and the table's "
+                      f"printed position on pages {sorted(a_pages or [])}.")
         return ev
 
     def _write_audit_artifacts(self, ch_first, ch_last, q_items, a_items, s_items):
@@ -2530,6 +2909,14 @@ class ChapterRunner:
             return False, "no answer-key rows"
         if not s:
             return False, "no solutions"
+        # RUN-42: a phase that never resolved must not lock, even when the
+        # identity sets happen to line up. The set check below only proves the
+        # same q_nos came back from every phase -- it says nothing about
+        # whether a phase actually finished. Losing this guard let a chapter
+        # with an unresolved phase report lock=True.
+        unresolved = [n for n in (self.notes or []) if "unresolved" in n]
+        if unresolved:
+            return False, f"phase unresolved: {unresolved[0][:160]}"
         return True, "sets equal"
 
         # -- Record assembly ------------------------------------------------------
@@ -2607,15 +2994,49 @@ class ChapterRunner:
                 # shape/letter drift must NEVER crash the chapter and must
                 # NEVER pass silently: flag the row for human review.
                 reasons.append("options shape flagged: " + opt_issue)
+            # RUN-34: strip page furniture HERE, not later, so the master row
+            # and the split row both get the cleaned text. OPH-001 shipped
+            # "5 Sold by @itachibot" inside q7's stem and "12 Sold by
+            # @itachibot" between two clauses of q1's solution.
+            stem_txt, n_f = qp.strip_page_furniture(
+                str(q.get("stem") or "").strip())
+            sol_txt, n_fs = qp.strip_page_furniture(
+                str(srow.get("solution_text") or "").strip())
+            opt_txt = {}
+            for _k, _v in (opts or {}).items():
+                _cv, _n = qp.strip_page_furniture(str(_v or ""))
+                opt_txt[_k] = _cv
+                n_f += _n
+            if n_f or n_fs:
+                # RUN-44: logged, NOT a review reason. Removing a reseller
+                # stamp or a page number is routine normalisation -- the
+                # content was never ambiguous, we just dropped print furniture
+                # that does not belong in the data. Treating it as review
+                # evidence flagged q14/q18/q19 on OPH-001 for nothing: 3 of
+                # that chapter's 5 REVIEW_NEEDED rows. What DOES belong in
+                # qa_reasons is the neighbouring case -- content that was
+                # removed and might have been real (a previous question's
+                # explanation, a duplicated dump, OCR damage).
+                print(f"  [FURNITURE] {self.subject}-{self.chapter_no:03d}-"
+                      f"{qn:03d}: stripped {n_f + n_fs} page-furniture "
+                      f"line(s) (reseller stamp / publisher mark / page "
+                      f"number)")
             records[qn] = {
                 "q_no": qn,
-                "question_text": str(q.get("stem") or "").strip(),
-                "options": opts,
+                "question_text": stem_txt,
+                "options": opt_txt,
                 "correct_option": amap.get(qn),
-                "solution_text": str(srow.get("solution_text") or "").strip(),
+                "solution_text": sol_txt,
                 "tables": qp._dedupe_tables(srow.get("tables") or []),
                 "has_figure_in_question": bool(q.get("has_figure")),
                 "has_figure_in_solution": bool(srow.get("has_figure")),
+                # RUN-33: where the TEXT came from. crop_parse tags its own
+                # output "_method": "geometric_text"; a model read leaves it
+                # absent. Downstream checks that only make sense for
+                # model-written text (the [IMG] placeholder count) need to
+                # tell the two apart.
+                "_q_text_method": str(q.get("_method") or ""),
+                "_s_text_method": str(srow.get("_method") or ""),
                 "_review_reasons": reasons,
                 "q_no_anchors": {"field_provenance": {
                     "question_text": "BOUNDARY_PHASED", "options": "BOUNDARY_PHASED",
@@ -2646,6 +3067,107 @@ class ChapterRunner:
         return records, qn_source_pages
 
     # -- Images: deterministic ownership only ---------------------------------
+    def _all_intervals(self):
+        """[(kind, q_no, interval)] for both sides, built once per chapter."""
+        cached = getattr(self, "_interval_cache", None)
+        if cached is not None:
+            return cached
+        out = []
+        for label, kind in (("Question", "question"), ("Solution", "solution")):
+            try:
+                ivals = self._visual_intervals(label) or []
+            except Exception:
+                ivals = []
+            for iv in ivals:
+                try:
+                    out.append((kind, int(iv.get("n")), iv))
+                except (TypeError, ValueError):
+                    continue
+        self._interval_cache = out
+        return out
+
+    def _claim_images_by_interval(self, page, imgs, chapter_records,
+                                 image_files_by_q):
+        """RUN-39: PRIMARY image ownership -- the crop interval a figure sits
+        inside.
+
+        Text and figures used to be attributed by two different header
+        systems. Crops come from header_index.intervals (this header -> next
+        furniture header, spanning pages as strips); images came from
+        qp.union_block_headers_on_page, page by page, with a cross-page
+        "carry" to bridge the gap between them. The carry only exists because
+        the image pass never saw the intervals.
+
+        A figure whose (page, y) lies inside a block's strip is inside that
+        block by construction -- the same geometric fact the crop itself rests
+        on, and the same one a reader uses. Claiming it here means:
+          * a figure printed ABOVE its question's stem, with the "Question N:"
+            header at the bottom of the previous page, belongs to that
+            question with no carry involved (OPH-001 q12);
+          * one header system instead of two, so text and figures cannot
+            disagree about where a block starts.
+
+        Conservative by construction: a figure inside TWO intervals (overlap)
+        or inside NONE is left alone for the existing per-page passes, which
+        stay as the safety net rather than the primary path.
+
+        Returns the images still unclaimed."""
+        intervals = self._all_intervals()
+        if not intervals or not imgs:
+            return list(imgs)
+        try:
+            pos = qp.image_positions_on_page(self.pdf, page)
+        except Exception:
+            return list(imgs)
+        if not pos:
+            return list(imgs)
+        leftover = []
+        for rel in imgs:
+            try:
+                oid = int(Path(rel).stem.rsplit("-", 1)[-1])
+            except (ValueError, IndexError):
+                leftover.append(rel)
+                continue
+            info = pos.get(oid)
+            if info is None:
+                leftover.append(rel)
+                continue
+            y_img = info[0]
+            h = info[4] if len(info) > 4 else 0
+            if h and y_img + h < y_img:
+                y_img = y_img + h        # bottom edge, flip-normalised
+            hits = sorted({(kind, qn) for kind, qn, iv in intervals
+                           if header_index.interval_contains_point(iv, page,
+                                                                   y_img)})
+            if len(hits) != 1:
+                # 0 -> outside every block (page furniture, a full-page
+                # plate). 2+ -> the intervals overlap here, so the geometry
+                # does not decide. Both go to the fallback passes.
+                leftover.append(rel)
+                continue
+            kind, qn = hits[0]
+            if qn not in chapter_records:
+                leftover.append(rel)
+                continue
+            new_rel = qp._rename_for_slot(
+                rel, qn, kind, self.subject, self.chapter_no,
+                image_files_by_q, claim_source=qp.INTERVAL_CLAIM_SOURCE,
+                confidence="high",
+                evidence=f"figure at y={y_img:.1f} on page {page} lies inside "
+                         f"{kind} q{qn}'s crop interval")
+            if not new_rel:
+                leftover.append(rel)
+                continue
+            entry = image_files_by_q.setdefault(
+                qn, {"question": [], "solution": []})
+            entry.setdefault("option", {})
+            if new_rel not in entry[kind]:
+                entry[kind].append(new_rel)
+            qid = f"{self.subject}-{self.chapter_no:03d}-{qn:03d}"
+            print(f"  [IMG] page {page}: crop interval -> {rel} -> {qid} "
+                  f"({kind})")
+        return leftover
+
     def _image_pass(self, ch_first, ch_last, page_section, chapter_records,
                     image_files_by_q):
         """Walk the chapter's pages once, in order. L1 geometry claim -> L2
@@ -2705,8 +3227,12 @@ class ChapterRunner:
             if imgs:
                 pos = qp.image_positions_on_page(self.pdf, page)
                 ordered = qp._order_imgs_by_position(imgs, pos)
+                # RUN-39: the crop interval decides first. Whatever it cannot
+                # prove falls through to the per-page passes below, unchanged.
+                leftover = self._claim_images_by_interval(
+                    page, ordered, chapter_records, image_files_by_q)
                 leftover = qp.claim_page_images(
-                    ordered, self.pdf, page, self.subject, self.chapter_no,
+                    leftover, self.pdf, page, self.subject, self.chapter_no,
                     chapter_records, image_files_by_q,
                     active_block=active_block, section=page_section.get(page))
                 leftover = qp.claim_block_images_ocr(
@@ -2784,6 +3310,70 @@ class ChapterRunner:
             print(f"  [BPH] {self.chapter_id}: closed {closed} flag(s) from "
                   f"the previous extraction of this chapter")
 
+    def _corroborated_carry_files(self):
+        """RUN-37: carry-owned figures that are geometrically INSIDE their
+        owner's own block extent.
+
+        A carry claim means "no heading was found above this figure on its own
+        page, so it went to the block still open from the previous page". On
+        OPH-001 that is simply how the book is laid out -- the figure sits
+        above its question's stem and the "Question N:" header is at the
+        bottom of the previous page:
+
+            ## Question 12:            <- bottom of page 7
+            ---                        <- page break
+            [figure]                   <- top of page 8
+            A child was brought with complaints of decreased vision. Fundus
+            examination shows a developmental anomaly as shown below.
+
+        The attribution was right, and flagging it produced 6 of 23
+        REVIEW_NEEDED rows for correct data. The answer is not to stop
+        flagging carries -- it is to add the evidence that was missing.
+        header_index.intervals already knows every block's page extent, so if
+        the owner's interval covers the figure's page then the figure lies
+        INSIDE that block, which is the same geometric fact a block-position
+        claim rests on. Only those carries are cleared; a carry whose owner's
+        interval does not reach the figure's page still flags.
+
+        Returns a set of final file paths."""
+        spanned = {}
+        for label, kind in (("Question", "question"), ("Solution", "solution")):
+            try:
+                ivals = self._visual_intervals(label) or []
+            except Exception:
+                ivals = []
+            for iv in ivals:
+                try:
+                    qn = int(iv.get("n"))
+                except (TypeError, ValueError):
+                    continue
+                pages = {int(st["page"]) for st in (iv.get("strips") or [])
+                         if st.get("page") is not None}
+                if pages:
+                    spanned[(qn, kind)] = pages
+        if not spanned:
+            return set()
+        corroborated = set()
+        for row in qp.carry_claims(self.chapter_id):
+            owner = str(row.get("owner") or "")
+            slot = row.get("slot")
+            page = row.get("page")
+            if not owner or slot not in ("question", "solution") or page is None:
+                continue
+            try:
+                qn = int(owner.rsplit("-", 1)[-1])
+            except (TypeError, ValueError):
+                continue
+            if int(page) in spanned.get((qn, slot), ()):
+                f = row.get("final_file") or row.get("file")
+                if f:
+                    corroborated.add(f)
+        if corroborated:
+            print(f"[IMG] {self.chapter_id}: {len(corroborated)} carry claim(s) "
+                  f"corroborated -- the figure lies inside its owner's own "
+                  f"block interval, so the owner is proven geometrically")
+        return corroborated
+
     # -- WRITE-THROUGH (Step 8) -----------------------------------------------
     def _commit(self, ch_first, ch_last, page_section, q_items, a_items,
                 s_items, locked, pre_rows):
@@ -2834,6 +3424,16 @@ class ChapterRunner:
         # mislabelling), the chapter must NOT look clean -- BLOCKER + zip
         # shut until a human decides. Never silent.
         # Shared didactic boilerplate (Sol 8/9) is NOT a blocker.
+        # RUN-42: this call site had been deleted while the detector and this
+        # comment both survived, so the ANAT-001 class shipped clean and
+        # silent. Restored.
+        for q_a, q_b, sim in self._solution_dup_pairs(s_items):
+            violations.append((
+                "duplicate_solution", q_a,
+                f"q{q_a} and q{q_b} ship near-identical solution text "
+                f"(similarity {sim:.2f} >= 0.85) -- label misassignment "
+                f"suspect; both verify and the set cross-check pass this "
+                f"silently, so it is blocked here"))
         if not locked:
             reasons = "; ".join(self.notes[-6:]) or "cross-check refused LOCK"
             violations.append(("chapter_not_locked", None,
@@ -2863,6 +3463,69 @@ class ChapterRunner:
                   f"(stems/options/answers/solutions/images/assets all "
                   f"accounted)")
 
+        # Master rows FIRST (run-29). The split layer used to be written
+        # before chapter_rows existed, so it could only see the raw
+        # chapter_records and had to invent its own structural
+        # extraction_status -- leaving qa_status (READY / REVIEW_NEEDED /
+        # INCOMPLETE) stranded in data/questions.jsonl, which final_export.zip
+        # does not ship. Building the rows here lets the SAME verdict be
+        # copied verbatim onto the split rows instead of being re-derived.
+        # Nothing the split layer reads depends on the master file being
+        # written after it, so the swap is safe; the master write still
+        # precedes _close_previous_flags, which needs rows on disk.
+        gate_by_qn = {}
+        for kind, qn_v, detail in violations:
+            # NOTE: chapter/page-scope violations carry qn=None or even the
+            # pages LIST (unresolved_page_* rows) -- only a true int is a
+            # question number that row-level gate notices can attach to.
+            if isinstance(qn_v, int):
+                gate_by_qn.setdefault(qn_v, []).append((kind, detail))
+        chapter_rows = []
+        # Per-question verdict map handed to the split layer (run-29): the
+        # split rows copy these three fields verbatim, so final_export.zip is
+        # distinguishable row-by-row instead of shipping REVIEW_NEEDED rows
+        # that look identical to READY ones. Keyed here, where qn is known --
+        # the built master row carries only "id", no q_no.
+        row_status = {}
+        corroborated = self._corroborated_carry_files()
+        for qn, rec in sorted(chapter_records.items(), key=lambda x: x[0]):
+            _row = qp.build_final_question(
+                self.subject, self.chapter_id, self.chapter_no, qn, rec,
+                image_files_by_q.get(qn, {"question": [], "solution": []}),
+                source_pages=qn_source_pages.get(qn),
+                ownership_pages=ownership_pages,
+                gate_notices=gate_by_qn.get(qn, []),
+                carry_corroborated=corroborated)
+            chapter_rows.append(_row)
+            row_status[int(qn)] = {
+                "qa_status": _row.get("qa_status"),
+                "qa_reasons": _row.get("qa_reasons") or [],
+                "manual_review": bool(_row.get("manual_review")),
+            }
+        questions_path = qp.DATA_DIR / "questions.jsonl"
+        qp.rewrite_questions_file(questions_path, self.chapter_id, chapter_rows)
+        qp.write_chapter_file(self.subject, self.chapter_id, chapter_rows)
+
+        # Attribution mix for this chapter (run-29). Recomputed from the
+        # append-only ledgers, so the carry rate is a reported number instead
+        # of something counted out of "[IMG] ... active-block carry" log
+        # lines. Nothing here blocks the export -- it is the metric that says
+        # whether figure attribution is actually improving.
+        try:
+            _attrib = qp.image_attribution_summary(self.chapter_id)
+            _share = _attrib["carry_share"]
+            print(f"  [IMG] {self.chapter_id}: attribution "
+                  f"{_attrib['interval']} crop-interval / "
+                  f"{_attrib['positional']} block-position / "
+                  f"{_attrib['carry']} carry / {_attrib['model']} model / "
+                  f"{_attrib['unclaimed']} unclaimed"
+                  + (f" | carry share {_share:.0%} of "
+                     f"{_attrib['claimed_total']} claimed"
+                     if _share is not None else " | no claimed figures"))
+        except Exception as _ae:
+            print(f"  [IMG] {self.chapter_id}: attribution summary failed "
+                  f"({_ae}) -- non-fatal, counts unavailable")
+
         # Split layer (sidecar). A failure here must never hurt the master
         # rows -- same contract the pipeline always kept.
         try:
@@ -2880,7 +3543,8 @@ class ChapterRunner:
                 pdf_path=self.pdf, page_files=page_files,
                 reconciled=reconciled,
                 output_root=qp.OUTPUT_ROOT,
-                ownership_pages=ownership_pages)
+                ownership_pages=ownership_pages,
+                row_status=row_status)
             print(f"  [SPLIT] {self.chapter_id}: "
                   f"{split_completeness.get('question_records')} questions / "
                   f"{split_completeness.get('answer_records')} answers / "
@@ -2888,25 +3552,6 @@ class ChapterRunner:
         except Exception as e:
             print(f"  [SPLIT] {self.chapter_id}: split-layer error ({e}) -- "
                   f"master output unaffected, split files NOT written")
-
-        gate_by_qn = {}
-        for kind, qn_v, detail in violations:
-            # NOTE: chapter/page-scope violations carry qn=None or even the
-            # pages LIST (unresolved_page_* rows) -- only a true int is a
-            # question number that row-level gate notices can attach to.
-            if isinstance(qn_v, int):
-                gate_by_qn.setdefault(qn_v, []).append((kind, detail))
-        chapter_rows = []
-        for qn, rec in sorted(chapter_records.items(), key=lambda x: x[0]):
-            chapter_rows.append(qp.build_final_question(
-                self.subject, self.chapter_id, self.chapter_no, qn, rec,
-                image_files_by_q.get(qn, {"question": [], "solution": []}),
-                source_pages=qn_source_pages.get(qn),
-                ownership_pages=ownership_pages,
-                gate_notices=gate_by_qn.get(qn, [])))
-        questions_path = qp.DATA_DIR / "questions.jsonl"
-        qp.rewrite_questions_file(questions_path, self.chapter_id, chapter_rows)
-        qp.write_chapter_file(self.subject, self.chapter_id, chapter_rows)
 
         # rows are on disk NOW -> previous extraction's open flags for this
         # chapter are superseded (append-only decision trail, re-openable).
@@ -2926,6 +3571,21 @@ class ChapterRunner:
               f"{len(chapter_rows)} questions | qa_status: {qa_ready} READY, "
               f"{qa_rev} REVIEW_NEEDED, {qa_inc} INCOMPLETE "
               f"| lock={'yes' if locked else 'NO (flagged for review)'}")
+        # RUN-43: name every non-READY row and say WHY, in the run log.
+        # Until now the log reported only the count, so "6 REVIEW_NEEDED"
+        # meant opening data/questions.jsonl and reading qa_reasons by hand --
+        # and the split rows do not even carry that field. A count with no
+        # reasons is not actionable: the owner cannot tell a real defect from
+        # a false positive in a check without digging through files.
+        for r in chapter_rows:
+            if r.get("qa_status") == "READY":
+                continue
+            _why = r.get("qa_reasons") or []
+            print(f"  [QA] {r.get('id')} {r.get('qa_status')}"
+                  + ("" if _why else "  (no reason recorded -- bug: a row was "
+                                     "flagged with nothing to say why)"))
+            for _w in _why:
+                print(f"       - {_w}")
         qp.clear_render_cache()
         gc.collect()
         return chapter_rows, locked
@@ -2956,6 +3616,7 @@ class ChapterRunner:
         q_items, q_ok = self._verify_phase("Question", q_items, q_pages)
         q_items = self._printed_header_reask("Question", q_items, q_pages,
                                              "_printed_q_hdrs", QUESTION_PROMPT)
+        q_ok = self._recheck_unverified("Question", q_items, q_ok)
         if q_ok is not True:
             self.notes.append(f"question phase unresolved: {q_ok}")
         qp.save_state(self.state)
@@ -2998,6 +3659,9 @@ class ChapterRunner:
                                              "_printed_s_hdrs", SOLUTION_PROMPT)
         s_items = self._c1_split_solutions(s_items)
         s_items = self._flag_solution_interval_mismatch(s_items)
+        # After the re-ask AND the C1 split, so the re-check sees exactly the
+        # items that will be committed.
+        s_ok = self._recheck_unverified("Solution", s_items, s_ok)
         if s_ok is not True:
             self.notes.append(f"solutions phase unresolved: {s_ok}")
         qp.save_state(self.state)

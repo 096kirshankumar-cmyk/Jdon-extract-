@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""RUN-32 regressions: the geometric crop parse must survive a bad text
+layer, and a printed block past the chapter end must still be re-asked.
+
+OPH-001 live (Railway 2026-08-24 08:07):
+
+    Q crops=23 geom_ok=0 (0 Gemini calls) gemini_crops=23
+    S crops=23 geom_ok=0 (0 Gemini calls) gemini_crops=23
+    [GATE] OPH-001: 1 export-gate violation(s) -- NOT a clean export
+      - missing_solution 23: no solution_text (header-only ...)
+
+Two independent defects:
+
+  1. _geom_item_from_interval bailed unless the PDF text layer read CLEAN, so
+     on this book every one of the 46 crops fell through to Gemini. The same
+     rendered pixels already OCR well enough for header anchors, so the body
+     text was available and simply never requested.
+
+  2. _printed_header_reask iterated the CLAMPED zone pages (12-22) while the
+     crops are cut to file_end=ch_last+2. q23's solution header sits past
+     page 22, so its crop was extracted, came back header-only, and the
+     re-ask that exists precisely for that case never fired.
+
+Run:  python3 test_geom_ocr_and_reask_regressions.py
+"""
+import io
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO))
+
+_TMP = Path(tempfile.mkdtemp(prefix="run32_env_"))
+os.environ["OUTPUT_DIR"] = str(_TMP / "out")
+
+from PIL import Image                # noqa: E402
+
+import boundary_phased as bph        # noqa: E402
+import qbank_pipeline as qp          # noqa: E402
+
+# text_layer_health needs a real page's worth of letters: a short fixture
+# scores letters/n < 0.50 and reads DEGRADED, which is not what these tests
+# are exercising. Verified against header_index.text_layer_health directly.
+Q_TEXT = (
+    "7. A 45-year-old woman presents with painless progressive loss of "
+    "vision in the right eye for three months. On examination the best "
+    "corrected visual acuity is 6/24 and the anterior segment is normal. "
+    "Which of the following is the most likely diagnosis?\n"
+    "(A) Primary open angle glaucoma\n"
+    "(B) Senile cortical cataract\n"
+    "(C) Central retinal vein occlusion\n"
+    "(D) Diabetic macular edema")
+S_TEXT = (
+    "Solution to Question 7: The answer is B because senile cortical "
+    "cataract causes painless progressive loss of vision with a normal "
+    "anterior segment and no relative afferent pupillary defect on "
+    "examination of the patient.")
+
+
+class GeomCase(unittest.TestCase):
+    """Drives the real _geom_item_from_interval with the page readers stubbed."""
+
+    IV = {"n": 7, "start_page": 14, "end_page": 14,
+          "strips": [{"page": 14, "y_hi": 700.0, "y_lo": 400.0}]}
+
+    def setUp(self):
+        self.runner = bph.ChapterRunner.__new__(bph.ChapterRunner)
+        self.runner.chapter_id = "OPH-001"
+        self.runner.pdf = "unused.pdf"
+        self.runner._geom_stats = {}
+        self._saved = {
+            "pdftotext_page": qp.pdftotext_page,
+            "ocr_crop_text": getattr(qp, "ocr_crop_text", None),
+            "crop_strip_png": bph._crop_strip_png,
+        }
+        # A REAL png: the production code does Image.open() on these bytes,
+        # so a fake header raises and the OCR path is silently skipped.
+        buf = io.BytesIO()
+        Image.new("RGB", (8, 8), (255, 255, 255)).save(buf, format="PNG")
+        png = buf.getvalue()
+        bph._crop_strip_png = lambda *a, **k: png
+
+    def tearDown(self):
+        qp.pdftotext_page = self._saved["pdftotext_page"]
+        bph._crop_strip_png = self._saved["crop_strip_png"]
+        # qp.ocr_crop_text no longer exists in production; a test that set it
+        # must delete it or it leaks into later tests and hasattr() lies.
+        if getattr(qp, "ocr_crop_text", None) is not None:
+            del qp.ocr_crop_text
+
+    def _text(self, blob):
+        qp.pdftotext_page = lambda pdf, page: blob
+
+    def _ocr(self, blob):
+        qp.ocr_crop_text = lambda img: blob
+
+    def _run(self, label="Question"):
+        return self.runner._geom_item_from_interval(self.IV, label)
+
+
+class TestTextLayerStillWins(GeomCase):
+    def test_clean_complete_text_is_parsed_with_no_ocr(self):
+        self._text(Q_TEXT)
+        self._ocr("MUST NOT BE USED")
+        it = self._run("Question")
+        self.assertIsNotNone(it)
+        self.assertEqual(self.runner._geom_stats.get("text"), 1)
+        self.assertNotIn("ocr", self.runner._geom_stats)
+
+    def test_clean_but_incomplete_still_goes_to_gemini(self):
+        """Readable text that crop_parse cannot parse is a coverage gap, not a
+        missing-text problem -- the crop must reach Gemini."""
+        self._text(Q_TEXT.split("\n")[0])   # stem only, no options
+        self.assertIsNone(self._run("Question"))
+        self.assertEqual(self.runner._geom_stats.get("text_clean_parse_missed"), 1)
+
+
+class TestUnreadableTextGoesToGemini(GeomCase):
+    """RUN-34: the OCR fallback is gone. A crop whose text layer is not CLEAN
+    now falls through to Gemini, which reads the rendered image and does not
+    produce the furniture-laden text tesseract produced on OPH-001."""
+
+    def test_garbled_text_layer_bails_to_gemini(self):
+        self._text("7. \u25a0\u25a0\u25a0\u25a0 \ufffd\ufffd\ufffd\ufffd\ufffd\ufffd")
+        self.assertIsNone(self._run("Question"))
+        self.assertEqual(self.runner._geom_stats.get("text_garbled_to_gemini"), 1)
+        self.assertNotIn("ocr", self.runner._geom_stats,
+                         "OCR must not run any more")
+
+    def test_empty_text_layer_bails_to_gemini(self):
+        self._text("")
+        self.assertIsNone(self._run("Solution"))
+        self.assertEqual(self.runner._geom_stats.get("text_empty_to_gemini"), 1)
+
+    def test_degraded_text_layer_bails_to_gemini(self):
+        """DEGRADED is not CLEAN -- it must not be parsed deterministically.
+        Verified against header_index.text_layer_health: letters/n = 0.43,
+        which is above the GARBLED floor (0.35) and below the CLEAN bar."""
+        self._text("7. The canal of Schlemm appears by the 4th month after "
+                   "conception. 12345 67890 11111 22222 33333 44444 --- === "
+                   "*** +++")
+        self.assertEqual(
+            __import__("header_index").text_layer_health(
+                "7. The canal of Schlemm appears by the 4th month after "
+                "conception. 12345 67890 11111 22222 33333 44444 --- === "
+                "*** +++"),
+            "DEGRADED")
+        self.assertIsNone(self._run("Question"))
+        self.assertEqual(self.runner._geom_stats.get("text_degraded_to_gemini"), 1)
+
+    def test_no_ocr_helper_is_imported_any_more(self):
+        """The helper was removed with the fallback; leaving it would be dead
+        code that implies a path that no longer exists."""
+        self.assertFalse(hasattr(qp, "ocr_crop_text"))
+
+    def test_interval_with_no_strips_is_tallied(self):
+        self.runner._geom_item_from_interval({"n": 7, "strips": []}, "Question")
+        self.assertEqual(self.runner._geom_stats.get("no_strips"), 1)
+
+
+class ReaskCase(unittest.TestCase):
+    """Real _printed_header_reask with the PDF and Gemini leaves stubbed."""
+
+    def _runner(self, zone_pages, hdrs, intervals):
+        r = bph.ChapterRunner.__new__(bph.ChapterRunner)
+        r.chapter_id = "OPH-001"
+        r.notes = []
+        r.ledger_rows = []
+        r._printed_s_hdrs = hdrs
+        r._ivs = intervals
+        r.asked_pages = []
+        r._visual_intervals = lambda label: r._ivs
+        r._call_pages = lambda pages, prompt, dpi=110: (
+            r.asked_pages.append(list(pages)) or "[]")
+        r._ledger = lambda *a, **k: None
+        r._printed_boundary_note = lambda *a, **k: ""
+        return r
+
+    IVALS = [{"n": 23, "start_page": 23, "end_page": 24,
+              "strips": [{"page": 23, "y_hi": 9.0, "y_lo": 0.0},
+                         {"page": 24, "y_hi": 9.0, "y_lo": 0.0}]}]
+
+    def test_header_past_chapter_end_is_still_reasked(self):
+        """q23's solution header is on p23; the zone stops at 22."""
+        r = self._runner(zone_pages=list(range(12, 23)),
+                         hdrs={23: {23}}, intervals=self.IVALS)
+        items = [{"_qn": 23, "solution_text": "Solution to Question 23:"}]
+        bph.ChapterRunner._printed_header_reask(
+            r, "Solution", items, list(range(12, 23)), "_printed_s_hdrs",
+            "{chapter_name}{start}{end}")
+        self.assertTrue(r.asked_pages,
+                        "a printed header with empty content must be re-asked")
+        self.assertIn(23, r.asked_pages[0],
+                      "the re-ask must read the page the header is on")
+
+    def test_page_window_is_not_clamped_back_inside_the_zone(self):
+        """The re-ask window is [header_page, header_page+1]. Clamped at
+        max(zone_pages)=22 that range is empty, so the old code produced no
+        pages at all and never called the model -- the fix must yield the
+        real window, which runs to the crop's last page."""
+        r = self._runner(zone_pages=list(range(12, 23)),
+                         hdrs={23: {23}}, intervals=self.IVALS)
+        items = [{"_qn": 23, "solution_text": ""}]
+        bph.ChapterRunner._printed_header_reask(
+            r, "Solution", items, list(range(12, 23)), "_printed_s_hdrs",
+            "{chapter_name}{start}{end}")
+        self.assertEqual(r.asked_pages, [[23, 24]])
+
+    def test_nothing_missing_means_no_reask(self):
+        r = self._runner(zone_pages=list(range(12, 23)),
+                         hdrs={23: {23}}, intervals=self.IVALS)
+        items = [{"_qn": 23, "solution_text": "A real solution."}]
+        bph.ChapterRunner._printed_header_reask(
+            r, "Solution", items, list(range(12, 23)), "_printed_s_hdrs",
+            "{chapter_name}{start}{end}")
+        self.assertEqual(r.asked_pages, [])
+
+    def test_zone_only_case_is_unchanged(self):
+        """Regression guard: the original in-zone behaviour still works."""
+        r = self._runner(zone_pages=list(range(12, 23)),
+                         hdrs={15: {15}}, intervals=[])
+        items = [{"_qn": 15, "solution_text": ""}]
+        bph.ChapterRunner._printed_header_reask(
+            r, "Solution", items, list(range(12, 23)), "_printed_s_hdrs",
+            "{chapter_name}{start}{end}")
+        self.assertTrue(r.asked_pages)
+        self.assertIn(15, r.asked_pages[0])
+
+
+class TestPlaceholderCheckSkipsDeterministicText(unittest.TestCase):
+    """RUN-33: OPH-001 after the OCR fallback started working --
+
+        Q crops=23 geom_ok=22 ... | why: ocr=22 text_garbled_ocr_parse_missed=1
+        S crops=23 geom_ok=23 ... | why: ocr=23
+
+    -- then logged 17 img_placeholder_count_mismatch rows across 13 of 23
+    questions and the chapter went to 15 REVIEW_NEEDED. crop_parse is a text
+    parser; it never emits [IMG], so "0 tokens vs N owned files" fired on
+    every figured item."""
+
+    def _rec(self, text, method, qn=5):
+        return {qn: {"question_text": text, "solution_text": "",
+                     "_q_text_method": method, "_s_text_method": ""}}
+
+    def test_deterministic_text_with_figures_is_not_flagged(self):
+        recs = self._rec("Stem with a diagram but no placeholder.",
+                         "geometric_text")
+        qp.apply_img_placeholder_reconcile(
+            recs, {5: {"question": ["OPH/OPH-001-005_Q_01.webp"],
+                       "solution": []}})
+        self.assertEqual(recs[5]["_review_reasons"], [],
+                         "a geometric parse has no [IMG] discipline to check")
+
+    def test_model_that_dropped_some_markers_is_still_flagged(self):
+        """The check still does its real job. RUN-45 made "no token at all"
+        advisory (the converter attaches from images[] directly), so the case
+        that must still flag is a model that emitted SOME markers but not
+        enough -- the converter would then position images ambiguously."""
+        recs = self._rec("Stem with [IMG] one diagram but two are owned.", "")
+        qp.apply_img_placeholder_reconcile(
+            recs, {5: {"question": ["OPH/OPH-001-005_Q_01.webp",
+                                    "OPH/OPH-001-005_Q_02.webp"],
+                       "solution": []}})
+        self.assertTrue(any("img_placeholder_count_mismatch" in r
+                            for r in recs[5]["_review_reasons"]),
+                        recs[5]["_review_reasons"])
+
+    def test_attached_figure_with_no_token_is_advisory(self):
+        """RUN-45 (OPH-001 q11 live, owner's decision): text with no [IMG]
+        token but files attached is advisory only -- the converter reads
+        images[] and attaches directly, the token is just inline positioning."""
+        recs = self._rec("Stem with a diagram but no placeholder.", "")
+        qp.apply_img_placeholder_reconcile(
+            recs, {5: {"question": ["OPH/OPH-001-005_Q_01.webp"],
+                       "solution": []}})
+        self.assertEqual(recs[5]["_review_reasons"], [],
+                         recs[5]["_review_reasons"])
+
+    def test_model_text_with_matching_count_is_clean(self):
+        recs = self._rec("Stem [IMG] with a diagram.", "")
+        qp.apply_img_placeholder_reconcile(
+            recs, {5: {"question": ["OPH/OPH-001-005_Q_01.webp"],
+                       "solution": []}})
+        self.assertEqual(recs[5]["_review_reasons"], [])
+
+    def test_sides_are_judged_independently(self):
+        """Deterministic question + model-written solution: only the solution
+        side is checked. The solution side carries a real mismatch (two
+        markers, one owned file) so it must flag, while the deterministic
+        question side is skipped entirely."""
+        # 3 markers against 1 owned file, and the question owns only 1, so
+        # the RUN-44 cross-reference allowance (n_tok <= n_own + n_q) cannot
+        # explain it -- 3 > 1 + 1. It must still flag.
+        recs = {5: {"question_text": "Stem [IMG] with one marker.",
+                    "solution_text": "Solution [IMG] [IMG] [IMG] three.",
+                    "_q_text_method": "geometric_text",
+                    "_s_text_method": ""}}
+        qp.apply_img_placeholder_reconcile(
+            recs, {5: {"question": ["a.webp"], "solution": ["b.webp"]}})
+        notes = recs[5]["_review_reasons"]
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn("solution", notes[0])
+
+
+class TestStaleVerifyVerdictIsRechecked(unittest.TestCase):
+    """RUN-35. OPH-001 live:
+
+        verify -> q3 'Solution text is completely empty.'   (genuine)
+        re-ask -> filled q3
+        commit -> missing solution: 0, 0 INCOMPLETE         (data was fine)
+        gate   -> phase_unresolved ... NOT a clean export   (stale verdict)
+
+    The chapter was blocked on a problem the pipeline had already fixed."""
+
+    VERDICT = ("exceeded attempts",
+               {"phase": "Solution", "total_entries_checked": 23,
+                "all_verified": False,
+                "mismatches": [
+                    {"q_no": "3", "issue": "Solution text is completely empty.",
+                     "severity": "genuine"}]})
+
+    def _runner(self):
+        r = bph.ChapterRunner.__new__(bph.ChapterRunner)
+        r.chapter_id = "OPH-001"
+        return r
+
+    def test_recovered_item_clears_the_verdict(self):
+        items = [{"_qn": 3,
+                  "solution_text": "Uveal melanomas arise from uveal "
+                                   "melanocytes, which are derived from the "
+                                   "neural crest cells."}]
+        self.assertIs(
+            bph.ChapterRunner._recheck_unverified(
+                self._runner(), "Solution", items, self.VERDICT),
+            True)
+
+    def test_still_empty_item_keeps_the_verdict(self):
+        items = [{"_qn": 3, "solution_text": ""}]
+        out = bph.ChapterRunner._recheck_unverified(
+            self._runner(), "Solution", items, self.VERDICT)
+        self.assertIsNot(out, True)
+        self.assertEqual(out, self.VERDICT)
+
+    def test_header_only_text_counts_as_still_empty(self):
+        """sanitize strips 'Solution to Question 3:' to nothing -- that is
+        exactly the OBG-010-021 shape and must not clear the verdict."""
+        items = [{"_qn": 3, "solution_text": "Solution to Question 3:"}]
+        out = bph.ChapterRunner._recheck_unverified(
+            self._runner(), "Solution", items, self.VERDICT)
+        self.assertIsNot(out, True)
+
+    def test_partial_recovery_keeps_only_what_is_still_broken(self):
+        verdict = ("exceeded attempts",
+                   {"phase": "Solution", "all_verified": False,
+                    "mismatches": [
+                        {"q_no": "3", "issue": "empty", "severity": "genuine"},
+                        {"q_no": "23", "issue": "ends abruptly",
+                         "severity": "genuine"}]})
+        items = [{"_qn": 3, "solution_text": "A complete explanation here."},
+                 {"_qn": 23, "solution_text": ""}]
+        out = bph.ChapterRunner._recheck_unverified(
+            self._runner(), "Solution", items, verdict)
+        self.assertIsNot(out, True)
+        remaining = out[1]["mismatches"]
+        self.assertEqual([m["q_no"] for m in remaining], ["23"])
+
+    def test_a_verdict_in_another_shape_is_returned_untouched(self):
+        """Never invent a pass. ('verify-error', str) has no mismatches to
+        re-test, so it must come back exactly as it went in."""
+        for verdict in (("verify-error", "boom"), None, "weird",
+                        ("exceeded attempts", "not a dict")):
+            self.assertEqual(
+                bph.ChapterRunner._recheck_unverified(
+                    self._runner(), "Solution", [], verdict),
+                verdict)
+
+    def test_a_true_verdict_stays_true(self):
+        self.assertIs(
+            bph.ChapterRunner._recheck_unverified(
+                self._runner(), "Solution", [], True),
+            True)
+
+    def test_question_phase_checks_the_stem(self):
+        verdict = ("exceeded attempts",
+                   {"phase": "Question", "all_verified": False,
+                    "mismatches": [{"q_no": "5", "issue": "stem missing",
+                                    "severity": "genuine"}]})
+        items = [{"_qn": 5, "stem": "By how many weeks does the optic groove "
+                                   "appear?"}]
+        self.assertIs(
+            bph.ChapterRunner._recheck_unverified(
+                self._runner(), "Question", items, verdict),
+            True)
+
+    def test_q_no_as_string_or_int_both_match(self):
+        """The model returns q_no as a string; items key it as an int."""
+        items = [{"q_no": 3,
+                  "solution_text": "A complete explanation of the answer."}]
+        self.assertIs(
+            bph.ChapterRunner._recheck_unverified(
+                self._runner(), "Solution", items, self.VERDICT),
+            True)
+
+
+if __name__ == "__main__":
+    import shutil
+    try:
+        unittest.main(verbosity=2)
+    finally:
+        shutil.rmtree(_TMP, ignore_errors=True)

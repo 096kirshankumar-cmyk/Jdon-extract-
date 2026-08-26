@@ -181,9 +181,11 @@ class SolutionFigureMappingTests(unittest.TestCase):
         self.assertEqual(owned[2]["solution"], ["PSY/PSY-001-002_SOL_01.webp"])
 
     def test_under_detected_headers_no_longer_swallow_the_page(self):
-        # ONE decoded header but FIVE figures below it (the old code dumped
-        # all five onto that one solution) -> cap at MAX_SOLUTION_IMAGES,
-        # the rest stay unclaimed for the model/manual pass.
+        # ONE decoded header but FIVE figures below it. Since 2026-08-24 the
+        # design is "geometry owns the file": every figure under the proven
+        # block is claimed (NO hard count cap -- refusing the 3rd+ was data
+        # loss for real multi-figure solutions); high piles get the soft
+        # review_suggested: high_image_count flag instead of being dropped.
         pdf = self.tmp / "one_block.pdf"
         _write_test_pdf(pdf, [
             ("Solution to Question 3:", 72, 700, 12),
@@ -191,8 +193,8 @@ class SolutionFigureMappingTests(unittest.TestCase):
         ], [(6, "Im6", 300, 640), (7, "Im7", 300, 600), (8, "Im8", 300, 560),
             (9, "Im9", 300, 520), (10, "Im10", 300, 480)])
         leftover, owned = self._claim(pdf, [6, 7, 8, 9, 10], {3: {"has_figure_in_solution": True}})
-        self.assertGreaterEqual(len(owned[3]["solution"]), qp.MAX_SOLUTION_IMAGES)
-        self.assertEqual(len(leftover), 3)
+        self.assertEqual(len(owned[3]["solution"]), 5)   # all 5 claimed
+        self.assertEqual(leftover, [])                   # nothing left unclaimed
 
     def test_figure_above_all_headers_is_not_guessed(self):
         # figure drawn ABOVE the only header -> no deterministic owner
@@ -621,7 +623,7 @@ class Run11ForensicHardeningTests(unittest.TestCase):
     def test_export_gate_catches_missing_stems_and_answers(self):
         recs = {1: {"q_no": 1, "question_text": "stem",
                     "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                    "correct_option": None, "solution_text": "sol"},
+                    "correct_option": None, "solution_text": "The answer is B because the structure develops by the fourth month."},
                 2: {"q_no": 2, "question_text": None,
                     "options": {}, "correct_option": None,
                     "solution_text": None}}
@@ -639,7 +641,7 @@ class Run11ForensicHardeningTests(unittest.TestCase):
     def test_export_gate_clean_when_everything_accounted(self):
         recs = {1: {"q_no": 1, "question_text": "stem",
                     "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                    "correct_option": "B", "solution_text": "sol"}}
+                    "correct_option": "B", "solution_text": "The answer is B because the structure develops by the fourth month."}}
         vio = qp._export_gate_violations(recs, {}, [], "PSY-001")
         self.assertEqual(vio, [])
 
@@ -1024,7 +1026,7 @@ class UnifiedImageOwnershipTests(unittest.TestCase):
     def test_unresolved_image_blocks_clean_gate(self):
         recs = {1: {"q_no": 1, "question_text": "stem",
                     "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                    "correct_option": "B", "solution_text": "sol"}}
+                    "correct_option": "B", "solution_text": "The answer is B because the structure develops by the fourth month."}}
         unresolved = [{"page": 4, "file": "PSY/PSY-p4-7.webp",
                        "method": "all_levels_failed", "confidence": None,
                        "deterministic_junk": False}]
@@ -1035,7 +1037,7 @@ class UnifiedImageOwnershipTests(unittest.TestCase):
     def test_broken_crop_not_gate_violation(self):
         recs = {1: {"q_no": 1, "question_text": "stem",
                     "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                    "correct_option": "B", "solution_text": "sol"}}
+                    "correct_option": "B", "solution_text": "The answer is B because the structure develops by the fourth month."}}
         unresolved = [{"page": 4, "file": "PSY/PSY-p4-414B.webp",
                        "method": "all_levels_failed", "confidence": None,
                        "deterministic_junk": True}]
@@ -1116,7 +1118,7 @@ class Run13FinalAuditFixesTests(unittest.TestCase):
     def test_export_gate_flags_meaningful_unresolved_orphan(self):
         recs = {1: {"q_no": 1, "question_text": "stem",
                     "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                    "correct_option": "B", "solution_text": "sol"}}
+                    "correct_option": "B", "solution_text": "The answer is B because the structure develops by the fourth month."}}
         orphan = {"chapter_id": "PAY-007", "pdf_pages": [105],
                   "item": {"q_no": None, "question_text": None,
                            "options": {"A": "Cannabis-induced psychosis",
@@ -1132,7 +1134,7 @@ class Run13FinalAuditFixesTests(unittest.TestCase):
     def test_export_gate_ignores_empty_orphan_fragment(self):
         recs = {1: {"q_no": 1, "question_text": "stem",
                     "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                    "correct_option": "B", "solution_text": "sol"}}
+                    "correct_option": "B", "solution_text": "The answer is B because the structure develops by the fourth month."}}
         orphan = {"chapter_id": "PAY-017", "pdf_pages": [218],
                   "item": {"q_no": None, "question_text": None, "options": None,
                            "correct_option": None, "solution_text": None,
@@ -1567,20 +1569,43 @@ class Run21bCarrySeedAndCarryCapTests(unittest.TestCase):
             "positional stacking")
 
     def test_carry_source_reaches_rename_guard(self):
+        """RUN-29 update. This used to assert that _rename_for_slot held two
+        `claim_source in MODEL_CLAIM_SOURCES` cap-lift guards. The no-cap
+        change (2026-08-24) deleted those guards on purpose -- geometry owns
+        the file, and an outlier is FLAGGED (flag_high_image_counts ->
+        review_suggested: high_image_count) instead of refused. Asserting the
+        removed branches exist kept this test red and described a contract
+        that no longer holds. These assertions are the current one."""
         src = Path(qp.__file__).read_text()
         i = src.index("def _rename_for_slot")
         body = src[i:i + 9000]
-        # AUDIT-FIX: the run-21 carry-cap LIFT let a stale carry stack a
-        # whole page of wrong-owner figures past the flat cap (the ch. 28
-        # failure class). New contract: carries obey the flat caps; only
-        # model-declared claims may lift.
+        # Carries never lifted the cap, and still must not: a carry is the
+        # weakest deterministic claim (ch. 28 failure class).
         self.assertEqual(
             body.count("claim_source == CARRY_CLAIM_SOURCE"), 0,
             "carry claims must NOT lift the cap any more (audit fix)")
+        # No count-based refusal survives in the choke point.
         self.assertEqual(
-            body.count("claim_source in MODEL_CLAIM_SOURCES"), 2,
-            "both the question-side and solution-side guards must still "
-            "honour model-declared claims")
+            body.count("claim_source in MODEL_CLAIM_SOURCES"), 0,
+            "the cap-lift guards are gone with the cap; nothing may still "
+            "branch on MODEL_CLAIM_SOURCES here")
+        self.assertNotIn(
+            'outcome="refused_cap"', body,
+            "no image may be refused for count any more -- outliers are "
+            "flagged, never dropped")
+
+    def test_high_image_count_is_flagged_not_dropped(self):
+        """Behavioural half of the no-cap contract."""
+        recs = {1: {"question_text": "q"}, 2: {"question_text": "q"}}
+        by_q = {1: {"question": [], "solution": [f"s{i}.webp" for i in range(7)]},
+                2: {"question": [], "solution": ["a.webp"]}}
+        qp.flag_high_image_counts(recs, by_q)
+        self.assertEqual(recs[1].get("_review_suggested"), "high_image_count")
+        self.assertTrue(any("high_image_count" in r
+                            for r in recs[1].get("_review_reasons", [])))
+        # the data itself is untouched -- this is a flag, not a filter
+        self.assertEqual(len(by_q[1]["solution"]), 7)
+        self.assertNotIn("_review_suggested", recs[2])
 
 
 class Run22GarbledHeaderAndOrphanInferenceTests(unittest.TestCase):
