@@ -179,6 +179,57 @@ class TestCropBlockEscapesViaOcr(unittest.TestCase):
         self.assertEqual([it["_qn"] for it in out], [18])
 
 
+class TestRealOcrFallbackChain(unittest.TestCase):
+    """The tests above stub _ocr_fallback; this one runs the REAL method so
+    the wiring itself is proven: crop block -> its strip pages -> tesseract
+    text -> text-only Gemini call -> JSON -> normalized _ocr item. Only the
+    two external programs are replaced (pdftoppm/tesseract are absent in this
+    sandbox; the Railway image installs both)."""
+
+    def test_blocked_crop_flows_through_the_real_ocr_fallback(self):
+        r = _runner()
+        r._call_crops = _raise_blocked
+        saved_page_ocr = bph._ocr_page_text
+        bph._ocr_page_text = lambda pdf, page, dpi=300: {
+            306: "18. Which of the following is a drainage device used in "
+                 "glaucoma surgery? (A) Ahmed valve (B) Scleral buckle "
+                 "(C) Intraocular lens (D) Band keratoplasty",
+            307: "19. Next question on the same page."}[page]
+        calls = []
+
+        def fake_gen(files):
+            calls.append(files)
+            return json.dumps([
+                {"q_no": 18,
+                 "stem": "Which of the following is a drainage device used in "
+                         "glaucoma surgery?",
+                 "options": {"A": "Ahmed valve", "B": "Scleral buckle",
+                             "C": "Intraocular lens",
+                             "D": "Band keratoplasty"}},
+                {"q_no": 19, "stem": "Next question on the same page.",
+                 "options": {"A": "a", "B": "b", "C": "c", "D": "d"}}])
+        r._gen = fake_gen
+        try:
+            out = r._gemini_crop_batch([Q18_IV], bph.QUESTION_PROMPT,
+                                       "Question", "Q", 130)
+        finally:
+            bph._ocr_page_text = saved_page_ocr
+
+        self.assertEqual([it["_qn"] for it in out], [18])
+        self.assertTrue(out[0].get("_ocr"))
+        # the fallback call is TEXT ONLY -- no image part, which is the whole
+        # point: the filter that refused the crop cannot refuse plain text
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(all(isinstance(f, str) for f in calls[0]),
+                        f"expected a text-only call, got {calls[0]!r:.200}")
+        self.assertIn("OCR TEXT (pages 306-307)", calls[0][0])
+        # the neighbour the page OCR also read stays out of the row
+        self.assertEqual([it["_qn"] for it in out], [18])
+        self.assertEqual([o["item"]["_qn"] for o in r.orphan_items], [19])
+        self.assertTrue(any(row["pass"] == "OCR_Q" for row in r.ledger_rows),
+                        f"ledger={[x['pass'] for x in r.ledger_rows]}")
+
+
 class TestReaskBlockEscapesViaOcr(unittest.TestCase):
     """_printed_header_reask: the last resort must have a last resort."""
 
