@@ -496,3 +496,41 @@ class TestBlankStemNotContaminated(unittest.TestCase):
     def test_explanation_opener_still_flagged(self):
         self.assertIsNotNone(qv._stem_contamination_reason(
             "Solution: " + self.SOL, self.SOL))
+
+
+class TestFinalRerunReachesBlockedChapters(unittest.TestCase):
+    """RUN-52: a chapter whose pages the recitation filter blocked must leave
+    chapters_done on the next run, otherwise a single final re-run skips it
+    and the RUN-49 OCR escape never fires (OPH-013 q18 / OPH-028 q7)."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = Path(tempfile.mkdtemp(prefix="run52_"))
+        (self.tmp).mkdir(parents=True, exist_ok=True)
+        self._saved = bph.qp.DATA_DIR
+        bph.qp.DATA_DIR = self.tmp
+        gate = self.tmp / "export_gate.jsonl"
+        rows = [
+            {"chapter_id": "OPH-013", "kind": "unresolved_page_Q"},
+            {"chapter_id": "OPH-013", "kind": "unresolved_page_REASK_Q"},
+            {"chapter_id": "OPH-028", "kind": "unresolved_page_REASK_Q"},
+            {"chapter_id": "OPH-011", "kind": "bad_options"},
+            # chapter_not_locked alone must NOT unlock (would re-run forever)
+            {"chapter_id": "OPH-007", "kind": "chapter_not_locked"},
+        ]
+        gate.write_text("\n".join(json.dumps(r) for r in rows) + "\n",
+                        encoding="utf-8")
+
+    def tearDown(self):
+        bph.qp.DATA_DIR = self._saved
+
+    def test_blocked_and_bad_chapters_unlocked_pure_lockflag_kept(self):
+        state = {"pdf_progress": {"OPH": {"chapters_done": [
+            "OPH-013", "OPH-028", "OPH-011", "OPH-007", "OPH-001"]}}}
+        bph.unlock_gated_chapters(state)
+        done = state["pdf_progress"]["OPH"]["chapters_done"]
+        self.assertNotIn("OPH-013", done)
+        self.assertNotIn("OPH-028", done)
+        self.assertNotIn("OPH-011", done)
+        self.assertIn("OPH-007", done)   # not a recoverable kind -> not re-run
+        self.assertIn("OPH-001", done)   # clean -> untouched

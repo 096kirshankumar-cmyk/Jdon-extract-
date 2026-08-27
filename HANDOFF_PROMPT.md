@@ -401,3 +401,16 @@ Fix: added `_{3,}` (a run of underscores = a blank) to `_QUESTION_SHAPED_RE`.
 This is NOT weakening: real contamination (stem that IS the solution, or opens
 with explanation language) has no trailing blank and still trips the reverse-
 containance / explanation-opener branches (both regression-tested).
+
+---
+
+# RUN-52 (2026-08-27) — make ONE final re-run actually reach the blocked chapters
+
+`unlock_gated_chapters` unlocked only missing_*/bad_options/duplicate_solution,
+so OPH-013 (q18) and OPH-028 (q7) -- whose gate kinds are `unresolved_page_Q` /
+`unresolved_page_REASK_Q` (the recitation-blocked pages) -- stayed in
+chapters_done and a resume SKIPPED them, meaning the RUN-49 OCR escape would
+never have run. Added those two kinds to the unlock set so a single final
+re-run re-extracts them. `chapter_not_locked` is deliberately NOT added (it
+would re-run every chapter forever). Test:
+TestFinalRerunReachesBlockedChapters.

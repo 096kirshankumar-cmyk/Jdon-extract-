@@ -3993,7 +3993,13 @@ def unlock_gated_chapters(state):
             kind = row.get("kind") or ""
             if cid and kind in (
                     "missing_solution", "missing_answer", "missing_stem",
-                    "bad_options", "duplicate_solution"):
+                    "bad_options", "duplicate_solution",
+                    # RUN-52: a chapter whose question pages the recitation
+                    # filter blocked (OPH-013 q18, OPH-028 q7) shipped a silent
+                    # hole and was left in chapters_done, so a resume SKIPPED
+                    # it and the RUN-49 OCR escape never ran. Unlocking these
+                    # is what lets ONE final re-run recover them.
+                    "unresolved_page_Q", "unresolved_page_REASK_Q"):
                 dirty.add(cid)
     except Exception:
         return
