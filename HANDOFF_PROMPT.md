@@ -359,3 +359,31 @@ sandbox has no `tesseract`/`pdftoppm`. The Railway image installs both
 - The 2026-08-26 run stopped at chapter 28 ("paused at daily limit"): 25
   chapter files, `🧪 Validation: 214 flags`, digest 13 blocker / 125 review /
   228 noise. Those numbers predate this fix; the gap flags were not firing.
+
+---
+
+# RUN-50 (2026-08-27) — phantom questions: the answer key is the census
+
+User verified from the PDF (screenshot, book p267): OPH-011's block ends at
+**Question 23**, then the printed Answer Key. The run log agrees:
+`ledger lock refused: extracted Q [1..25, 30, 33, 34, 134] != key rows [1..23]`.
+But the pipeline still SHIPPED rows 24,25,30,33,34,134 (deployed review screen
+showed `OPH-011-024` stem + four EMPTY options and `OPH-011-134` = the same
+stem with the real options -- one printed question split across two rows).
+
+Root cause: the VISUAL header index invented `Question N` bands on p262-267
+(reading the key table / page numbers as headers) and `_printed_header_reask`
+imported them. The old phantom guard only ran when `_printed_q_max` was proven
+and never at commit.
+
+Fix (all PDF-grounded, no guessing):
+1. `_q_number_ceiling()`: when the answer key is a contiguous 1..N series it is
+   the chapter census -> N is the ceiling. (Non-contiguous/absent key falls
+   back to weaker maxima; nothing proven -> None -> never deletes.)
+2. `_quarantine_phantom_questions(...)`: at commit, any Q/A/S item with q_no >
+   ceiling goes to orphans.jsonl, never becomes a row.
+3. `_question_shape_ok` + `_crop_item_shippable`/`_crop_item_ok`: four option
+   LETTERS is not completeness -- every option must carry text (OPH-011-024).
+
+Tests: `TestKeyCensusQuarantinesPhantoms`, `TestEmptyOptionsDoNotShip` in
+test_missing_question_recovery_regressions.py (now 25 tests).

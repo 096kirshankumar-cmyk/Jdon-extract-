@@ -1242,6 +1242,15 @@ class ChapterRunner:
         return True
 
     @staticmethod
+    def _question_shape_ok(it, opts):
+        """RUN-50: stem non-empty AND >=4 options AND every option carries
+        text. OPH-011-024 shipped with A/B/C/D all blank because the old test
+        counted letters, not text."""
+        return (bool(str(it.get("stem") or "").strip())
+                and len(opts) >= 4
+                and all((v or "").strip() for v in opts.values()))
+
+    @staticmethod
     def _crop_item_ok(it, label):
         if not isinstance(it, dict):
             return False
@@ -1251,7 +1260,7 @@ class ChapterRunner:
             return False
         if label == "Question":
             opts, _ = _norm_options(it.get("options"))
-            return bool(str(it.get("stem") or "").strip()) and len(opts) >= 4
+            return ChapterRunner._question_shape_ok(it, opts)
         if label == "Solution":
             return bool(str(it.get("solution_text") or "").strip())
         return True
@@ -1270,12 +1279,18 @@ class ChapterRunner:
         For an 18k-question book with no human review capacity the rule is:
         ship only content that is structurally complete, otherwise leave the
         item missing. A missing item is reported by q_no in the export gate;
-        a plausible hallucination looks clean to every downstream check."""
+        a plausible hallucination looks clean to every downstream check.
+
+        RUN-50 (OPH-011-024 live: options A/B/C/D all blank shipped as a real
+        row): counting option LETTERS is not completeness -- four empty
+        strings are not four options. Every option must carry text."""
         if not isinstance(it, dict):
             return False
         if label == "Question":
             opts, _ = _norm_options(it.get("options"))
-            return bool(str(it.get("stem") or "").strip()) and len(opts) >= 4
+            return (bool(str(it.get("stem") or "").strip())
+                    and len(opts) >= 4
+                    and all((v or "").strip() for v in opts.values()))
         if label == "Solution":
             return bool(str(it.get("solution_text") or "").strip())
         return True
@@ -3051,6 +3066,79 @@ class ChapterRunner:
         except Exception as e:
             self.notes.append(f"audit artifacts write failed: {e}")
 
+    def _q_number_ceiling(self):
+        """RUN-50: the highest question number this chapter can have, from the
+        PDF's own census.
+
+        OPH-011 live (read off the deployed review screen + the run log + the
+        user's screenshot of book p267): the printed Answer Key lists rows
+        1..23, yet the pipeline shipped extra rows 24, 25, 30, 33, 34 and a
+        phantom 134, because the VISUAL header index invented 'Question N'
+        bands on p262-267 (it was reading the key table / page numbers as
+        headers) and the re-ask imported them. The screenshot shows p267 holds
+        'Question 23' then the Answer Key -- 23 is the last real question.
+
+        The answer key, when it is a contiguous 1..N series, is that census;
+        use N as the ceiling. When the key is absent or non-contiguous this
+        returns the max of the weaker sources (printed ceiling, key max,
+        visual max) -- and None when nothing is proven, because an unprovable
+        check must never delete a real question.
+        """
+        key_ns = sorted(n for n, v in (self._key_evidence or {}).items()
+                        if v.get("letter") and v.get("method") != "key_conflict")
+        if key_ns and key_ns[0] == 1 \
+                and key_ns == list(range(1, len(key_ns) + 1)):
+            return key_ns[-1]
+        cands = []
+        pqm = getattr(self, "_printed_q_max", None)
+        if isinstance(pqm, int) and pqm > 0:
+            cands.append(pqm)
+        if key_ns:
+            cands.append(int(max(key_ns)))
+        try:
+            vis = header_index.index_sets(self._visual_headers or [])
+            if vis.get("q_ns"):
+                cands.append(max(vis["q_ns"]))
+        except Exception:
+            pass
+        return max(cands) if cands else None
+
+    def _drop_phantom_qno(self, qn, item):
+        """Quarantine a q_no above the chapter's proven ceiling. Never a
+        silent delete: the item's content goes to orphans.jsonl so a human can
+        still recover it from the review screen."""
+        self.orphan_items.append({
+            "chapter_id": self.chapter_id,
+            "batch_start": (item or {}).get("source_page"),
+            "pdf_pages": list((item or {}).get("source_page_range") or []),
+            "reason": f"phantom_q_no {qn} above this chapter's proven "
+                      f"question ceiling {self._q_number_ceiling()} "
+                      f"(answer-key census)",
+            "pass": "Q_PHANTOM_CEILING", "item": item})
+        self.notes.append(f"Q: quarantined phantom q_no {qn} (chapter census "
+                          f"ceiling {self._q_number_ceiling()}) -- kept in "
+                          f"orphans, not shipped as a question")
+
+    def _quarantine_phantom_questions(self, *lists):
+        """RUN-50 last door: drop any phase item whose q_no exceeds the
+        chapter's proven census, into orphans. Applied to Q, A and S lists at
+        commit so a number invented by ANY route (crop, page, re-ask, OCR
+        fallback) can never become a row."""
+        ceiling = self._q_number_ceiling()
+        if ceiling is None:
+            return lists[0] if len(lists) == 1 else lists
+        out = []
+        for items in lists:
+            kept = []
+            for it in (items or []):
+                qn = it.get("_qn") if isinstance(it, dict) else None
+                if qn is not None and qn > ceiling:
+                    self._drop_phantom_qno(qn, it)
+                else:
+                    kept.append(it)
+            out.append(kept)
+        return out[0] if len(lists) == 1 else tuple(out)
+
     def _ledger_lock(self, q_items, a_items, s_items):
         """Chapter LOCK from identity sets — never from Gemini 'LOCKED'."""
         q = {i.get("_qn") for i in q_items if i.get("_qn") is not None}
@@ -3838,6 +3926,13 @@ class ChapterRunner:
         if s_ok is not True:
             self.notes.append(f"solutions phase unresolved: {s_ok}")
         qp.save_state(self.state)
+
+        # RUN-50: the answer key is the chapter's census. Any q_no it cannot
+        # account for (OPH-011: 24,25,30,33,34,134 vs key rows 1..23) is a
+        # phantom from a polluted header read -- quarantine it from every
+        # phase list BEFORE the lock/commit so it can never become a row.
+        q_items, a_items, s_items = self._quarantine_phantom_questions(
+            q_items, a_items, s_items)
 
         # BLOCK-FAIL: a zone that EXISTS (per boundary/print) but yielded ZERO
         # items means the phase failed wholesale -- do not write a

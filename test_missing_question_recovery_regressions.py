@@ -397,3 +397,77 @@ def pipeline_output_root():
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestKeyCensusQuarantinesPhantoms(unittest.TestCase):
+    """RUN-50 (OPH-011 live): the answer key is the chapter census. key rows
+    1..23 + polluted visual index inventing 24..134 must collapse to 23 real
+    questions, with the phantoms quarantined, not shipped."""
+
+    def _runner(self):
+        r = bph.ChapterRunner.__new__(bph.ChapterRunner)
+        r.chapter_id = "OPH-011"; r.subject = "OPH"; r.chapter_no = 11
+        r.pdf = "unused.pdf"; r.notes = []; r.ledger_rows = []
+        r.orphan_items = []; r._missing_qnos = []
+        r._printed_q_max = None
+        r._visual_headers = []          # pretend the visual index is clean-empty
+        r._key_evidence = {n: {"letter": "A", "method": "key_dual_gemini"}
+                           for n in range(1, 24)}   # contiguous 1..23
+        return r
+
+    def test_ceiling_is_the_key_census_not_the_polluted_visual_max(self):
+        r = self._runner()
+        self.assertEqual(r._q_number_ceiling(), 23)
+
+    def test_phantom_rows_are_quarantined_from_every_phase(self):
+        r = self._runner()
+        q = [{"_qn": n} for n in (1, 23, 24, 30, 33, 34, 134)]
+        a = [{"_qn": n} for n in (1, 24, 134)]
+        s = [{"_qn": n} for n in (1, 23, 134)]
+        q2, a2, s2 = r._quarantine_phantom_questions(q, a, s)
+        self.assertEqual([i["_qn"] for i in q2], [1, 23])
+        self.assertEqual([i["_qn"] for i in a2], [1])
+        self.assertEqual([i["_qn"] for i in s2], [1, 23])
+        # every dropped phantom is preserved for human recovery, not deleted
+        self.assertEqual(sorted(o["item"]["_qn"] for o in r.orphan_items),
+                         [24, 24, 30, 33, 34, 134, 134, 134])
+
+    def test_no_key_and_no_evidence_never_deletes(self):
+        r = self._runner()
+        r._key_evidence = {}
+        r._visual_headers = []
+        self.assertIsNone(r._q_number_ceiling())
+        q = [{"_qn": n} for n in (1, 2, 134)]
+        self.assertEqual([i["_qn"] for i in r._quarantine_phantom_questions(q)],
+                         [1, 2, 134])   # unprovable -> nothing dropped
+
+    def test_non_contiguous_key_falls_back_not_trusted_as_census(self):
+        r = self._runner()
+        r._key_evidence = {n: {"letter": "A", "method": "key_dual_gemini"}
+                           for n in (1, 2, 5)}      # gap -> not a census
+        r._printed_q_max = 5
+        self.assertEqual(r._q_number_ceiling(), 5)   # max of key+printed, not visual
+
+
+class TestEmptyOptionsDoNotShip(unittest.TestCase):
+    """RUN-50 (OPH-011-024 live): A/B/C/D all blank is not a shippable row."""
+
+    def _item(self, opt_text):
+        return {"stem": "Which of the following diseases does not show a "
+                        "specific pattern of cataract?",
+                "options": {"A": opt_text, "B": opt_text,
+                            "C": opt_text, "D": opt_text}}
+
+    def test_blank_option_text_is_rejected(self):
+        self.assertFalse(bph.ChapterRunner._crop_item_shippable(
+            self._item(""), "Question"))
+
+    def test_real_option_text_is_accepted(self):
+        self.assertTrue(bph.ChapterRunner._crop_item_shippable(
+            self._item("Juvenile diabetes"), "Question"))
+
+    def test_crop_item_ok_agrees(self):
+        self.assertFalse(bph.ChapterRunner._crop_item_ok(
+            self._item(""), "Question"))
+        self.assertTrue(bph.ChapterRunner._crop_item_ok(
+            self._item("Leprosy"), "Question"))
