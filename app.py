@@ -2190,7 +2190,24 @@ def review_lookup():
     if term and not cards:
         ch_m = _re.match(r"^([A-Za-z]+)-(\d{3})", term)
         ch = ch_m.group(0) if ch_m else (chapter or None)
-        all_rows = review_queue.lookup_questions(out, "", None)
+        if not ch:
+            # RUN-49 (OPH-013-018 live): '013-018' carries the chapter number
+            # too, but the regex above demands a letter prefix, so the hint
+            # fell back to whole-book numbers and told the user nothing.
+            # Resolve '013-018' -> the one chapter id ending in '-013' so the
+            # hint can say exactly which series the number is missing from.
+            m3 = _re.match(r"^(\d{3})-\d{1,3}$", term)
+            split_dir = Path(pipeline.OUTPUT_ROOT) / "split"
+            if m3 and split_dir.exists():
+                cands = sorted({cd.name for sub in split_dir.iterdir()
+                                if sub.is_dir()
+                                for cd in sub.iterdir()
+                                if cd.is_dir()
+                                and cd.name.endswith("-" + m3.group(1))})
+                if len(cands) == 1:
+                    ch = cands[0]
+        all_rows = review_queue._read_jsonl(
+            Path(pipeline.OUTPUT_ROOT) / "data" / "questions.jsonl")
         pool = [r for r in all_rows if r.get("chapter_id") == ch] if ch else all_rows
         if pool:
             qnos = sorted(int(r["id"].rsplit("-", 1)[1]) for r in pool
@@ -2198,7 +2215,9 @@ def review_lookup():
             if qnos:
                 miss_hint = (f"{ch or 'is book'} me total {len(qnos)} questions hain "
                              f"(available: q{qnos[0]}..q{qnos[-1]}). "
-                             f"'{term}' isme NAHI hai — number check karo.")
+                             f"'{term}' isme NAHI hai -- ya toh number galat hai, "
+                             f"ya ye question extract hi nahi hua (review queue "
+                             f"me is chapter ka numbering_gap flag dekho).")
         elif not ch:
             miss_hint = f"'{term}' kisi bhi chapter me nahi mila."
     return render_template_string("""

@@ -282,3 +282,80 @@ prompt rule; it reduces the bleed but does not eliminate it.
 An earlier revision said OPH-001 was correct. Only q1-q6 were compared against
 the source PDF, and those are correct. OPH-001-007 and OPH-001-017 both carry
 `contaminated_question`, so OPH-001 is not clean.
+
+---
+
+# RUN-49 (2026-08-27) — the disappearing question: root cause found and fixed
+
+## The user's first report, and what the run log actually says
+
+"OPH-013-018 was skipped entirely." Verified from the 2026-08-26 full-book run
+log (41 chunks), chapter OPH-013:
+
+```
+[GATE] OPH-013: 7 export-gate violation(s) -- NOT a clean export
+- unresolved_page_Q [306]: UNRESOLVED
+- unresolved_page_REASK_Q [306, 307]: UNRESOLVED
+- unresolved_image 307: OPH/OPH-p307-2037.webp (method=none confidence=?)
+- chapter_not_locked: ... Question: printed headers prove missing/empty
+  block(s) q[18] -- targeted re-ask on [306, 307]; Question re-ask unresolved:
+  model blocked pages 306-307; ledger lock refused: extracted Q
+  [1..17, 19..35] != key rows [1..35]
+[SPLIT] OPH-013: 34 questions / 34 answers / 34 solutions
+```
+
+Not a header-detection failure and not a tall-crop timeout. Gemini's
+**recitation filter refused the page IMAGE** (finish_reason 4 → `ModelBlocked`)
+for p306–307, and:
+
+1. `_gemini_crop_batch` (the path every Question/Solution takes on this book)
+   had **no escape** — one ledger row, `break`, question gone. The page path
+   has had an OCR escape since RUN-42; the crop path never called it.
+2. `_printed_header_reask` — the last resort, which fires *precisely* because
+   the printed header proves q18 exists — re-sent the **same pages as images**
+   to the **same filter**, got the **same refusal**, and `continue`d.
+3. `qbank_validator.check_chapter` computes `qns`/`s` at chapter scope, but the
+   `numbering_gap` / `numbering_start` appends were **indented inside the
+   `suspect_truncated_table` loop**, so they only ran for a chapter with ≥2
+   solutions sharing a table header. OPH-013 has none → the 1..17,19..35 hole
+   was never flagged anywhere. The user found it by eye.
+4. `/review/lookup` answered `koi row nahi mili: 013-018` with no hint: the
+   hint's row pool came from `lookup_questions(out, "", None)`, and an empty
+   term returns `[]` by contract — the pool was always empty. `013-018` also
+   failed the letter-prefixed chapter regex, so the chapter never resolved.
+
+**This is not unique to q18.** The same log shows OPH-028 with
+`model blocked pages 610-611; ledger lock refused: extracted Q [1..6, 8..23]
+!= key rows [1..23]` → **OPH-028-007 is missing the same way**. Expect more;
+after this fix the validator names every one of them by q_no.
+
+## What changed (all four defects)
+
+| # | file | change |
+|---|------|--------|
+| 1 | `boundary_phased.py` | new `_crop_ocr_recovery`: a blocked crop OCRs its own strip pages and keeps **only that crop's q_nos**; anything else on the page goes to `orphan_items`, never into the row |
+| 2 | `boundary_phased.py` | `_printed_header_reask` gets the same OCR escape on `ModelBlocked` |
+| 3 | `qbank_validator.py` | `numbering_gap` / `numbering_start` moved out of the table loop — unconditional |
+| 4 | `boundary_phased.py` | `_ledger_lock` now says `MISSING q[18]` / `EXTRA q[99]` instead of only dumping both sets |
+| 5 | `app.py` | lookup hint reads the real `questions.jsonl` and resolves `013-018` → `OPH-013` |
+
+Recovered text stays `_ocr` → the row is **REVIEW_NEEDED**, never silently
+trusted. If OCR is unavailable or the text is refused too, the item is left
+**missing and named by q_no** — the honest outcome is preserved, it just stops
+being invisible.
+
+Tests: `test_missing_question_recovery_regressions.py` (17 tests). Suite:
+**533 passed, 1 failed, 17 skipped** — the failure is
+`test_ocr_geometry_claims_when_text_layer_garbled`, which also fails on the
+pristine `3689388` checkout (verified with the changes stashed) because this
+sandbox has no `tesseract`/`pdftoppm`. The Railway image installs both
+(`Dockerfile`: `poppler-utils tesseract-ocr`), so the OCR escape is live there.
+
+## Still open (unchanged by RUN-49)
+
+- Solution bleed (model recitation) — `sanitize_solution_text` catches it.
+- `contaminated_question` on OPH-001-007/-017, OPH-002-029.
+- 3 unresolved printed figures: OPH-002 p23, OPH-005 p101, OPH-006 p117.
+- The 2026-08-26 run stopped at chapter 28 ("paused at daily limit"): 25
+  chapter files, `🧪 Validation: 214 flags`, digest 13 blocker / 125 review /
+  228 noise. Those numbers predate this fix; the gap flags were not firing.

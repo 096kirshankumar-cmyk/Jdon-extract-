@@ -541,6 +541,16 @@ def check_chapter(chapter_id, rows):
                                   f"{biggest} with the same header AND the solution ends on a "
                                   f"header lead-in -- table likely cut",
                                   _as_int(rid.rsplit("-", 1)[-1])))
+
+    # RUN-49 (OPH-013 q18 live): these two checks were INDENTED INSIDE the
+    # table-header loop above, so they only ran for a chapter that happened
+    # to have >=2 solutions sharing a table header. A chapter with no such
+    # table group never reported a hole at all -- OPH-013 shipped 34 rows
+    # numbered 1..17,19..35 and NOTHING flagged the missing 18; the user
+    # found it by eye in the review lookup ("koi row nahi mili: 013-018").
+    # A missing question number is the single most important defect in an
+    # 18k-question bank with no review capacity, so it must be unconditional.
+    if qns:
         for missing in [n for n in range(min(qns), max(qns) + 1) if n not in s]:
             flags.append(flag(chapter_id, "numbering_gap",
                               f"question {missing} absent (series runs {min(qns)}..{max(qns)})", missing))

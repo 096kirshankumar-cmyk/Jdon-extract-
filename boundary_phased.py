@@ -843,6 +843,7 @@ class ChapterRunner:
         self._visual_headers = []      # pixel/OCR header index (not pdftotext)
         self._key_evidence = {}        # qn -> {letter, method, pages}
         self._key_evidence_required = False
+        self._missing_qnos = []        # q_nos the key proves but no content for
 
     # ------------------------------------------------------------------
     # THE model-call choke point
@@ -1279,6 +1280,69 @@ class ChapterRunner:
             return bool(str(it.get("solution_text") or "").strip())
         return True
 
+    def _crop_ocr_recovery(self, batch, crop_prompt, label, pass_name):
+        """RUN-49: the crop path had NO escape hatch from a model block.
+
+        OPH-013 q18 (live): Gemini's recitation filter refused the crop image
+        (finish_reason 4), the ledger said 'model blocked on crop', the
+        targeted re-ask hit the SAME filter on the same pages, and the
+        question simply never existed in the output -- the review screen
+        answered 'koi row nahi mili: 013-018'. The printed header index and
+        the answer key both prove q18 is real, so dropping it silently was
+        the worst possible outcome.
+
+        The page path already escapes this way (RUN-42): OCR the page with
+        tesseract and structure the TEXT with the same rules, because the
+        filter is on the page IMAGE, not on the printed text. This runs the
+        same escape for crops, then keeps ONLY the batch's own q_nos -- a
+        whole-page OCR sees neighbouring questions too, and importing those
+        here would bypass the crop isolation the whole crop path exists for.
+        Every recovered item stays `_ocr` -> REVIEW_NEEDED, never silently
+        trusted. Returns [] when OCR/tesseract is unavailable or the text is
+        also refused: the item is then reported missing by q_no, as before.
+        """
+        pages = sorted({st["page"] for iv in batch
+                        for st in (iv.get("strips") or [])
+                        if st.get("page") is not None}) \
+            or sorted({iv.get("start_page") for iv in batch
+                       if iv.get("start_page") is not None})
+        if not pages:
+            return []
+        expect = {iv["n"] for iv in batch if iv.get("n") is not None}
+        try:
+            got = self._ocr_fallback(pages, crop_prompt, label, pass_name)
+        except Exception as ocr_e:
+            self.notes.append(f"{pass_name}: crop OCR recovery failed "
+                              f"({type(ocr_e).__name__}: {ocr_e}) -- left "
+                              f"missing rather than shipped as a guess")
+            return []
+        if not got:
+            return []
+        kept = [it for it in got if it.get("_qn") in expect]
+        off = [it.get("_qn") for it in got if it.get("_qn") not in expect]
+        for it in got:
+            if it.get("_qn") in expect:
+                continue
+            self.orphan_items.append({
+                "chapter_id": self.chapter_id,
+                "batch_start": pages[0],
+                "pdf_pages": list(pages),
+                "reason": f"crop_ocr_recovery returned q_no {it.get('_qn')} "
+                          f"outside this crop's expected {sorted(expect)}",
+                "pass": f"OCR_{pass_name}", "item": it})
+        if off:
+            self.notes.append(f"{pass_name}: crop OCR recovery ignored q_no(s) "
+                              f"{sorted(x for x in off if x is not None)} "
+                              f"(not this crop's item) -> orphans")
+        if kept:
+            self.notes.append(f"{pass_name}: model blocked the crop IMAGE -> "
+                              f"recovered q{sorted(it.get('_qn') for it in kept)} "
+                              f"from OCR text ({len(kept)} item(s)); rows stay "
+                              f"REVIEW_NEEDED, verify text manually")
+            print(f"[BPH] {self.chapter_id}: {pass_name} crop blocked -> OCR "
+                  f"recovery {sorted(it.get('_qn') for it in kept)}")
+        return kept
+
     def _gemini_crop_batch(self, batch, prompt_tmpl, label, pass_name, dpi):
         if not batch:
             return []
@@ -1299,6 +1363,7 @@ class ChapterRunner:
                              qp.PASS_STATUS_UNRESOLVED, 0,
                              "model blocked on crop")
                 self.notes.append(f"{pass_name} crop unresolved (blocked)")
+                items = self._crop_ocr_recovery(batch, p, label, pass_name)
                 break
             items = _unwrap_items(_parse_json(raw))
             if isinstance(items, list):
@@ -2487,6 +2552,47 @@ class ChapterRunner:
                              "model blocked (recitation/safety), retried once")
                 self.notes.append(f"{phase_name} re-ask unresolved: model "
                                   f"blocked pages {chunk[0]}-{chunk[-1]}")
+                # RUN-49: the re-ask used to be the LAST resort, so a page the
+                # recitation filter refuses twice was simply never extracted
+                # (OPH-013 q18 -> 'koi row nahi mili'). Give the re-ask the
+                # same OCR escape the page path has: the filter is on the page
+                # IMAGE, the printed text is still readable.
+                try:
+                    ocr_fixed = self._ocr_fallback(chunk, re_prompt,
+                                                   phase_name,
+                                                   f"REASK_{phase_name[0]}")
+                except Exception as ocr_e:
+                    ocr_fixed = None
+                    self.notes.append(
+                        f"{phase_name} re-ask OCR recovery failed "
+                        f"({type(ocr_e).__name__}: {ocr_e}) -- left missing "
+                        f"rather than shipped as a guess")
+                if not ocr_fixed:
+                    continue
+                self.notes.append(
+                    f"{phase_name} re-ask: model blocked the page IMAGE -> "
+                    f"recovered from OCR text ({len(ocr_fixed)} item(s)); "
+                    f"rows stay REVIEW_NEEDED")
+                for it in ocr_fixed:
+                    it["_reasked"] = True
+                fixed = ocr_fixed
+                for it in fixed:
+                    qn0 = _item_qn(it)
+                    if qn0 is None:
+                        continue
+                    _normalize_phase_item(phase_name, it)
+                    it["_qn"] = qn0
+                    existing = next((i for i in items if i.get("_qn") == qn0),
+                                    None)
+                    if existing is not None and _content_ok(existing) \
+                            and qn0 not in dup_force:
+                        continue
+                    if existing is None:
+                        items = list(items) + [it]
+                    else:
+                        items = [it if i.get("_qn") == qn0 else i
+                                 for i in items]
+                    have.add(qn0)
                 continue
             fixed = _unwrap_items(_parse_json(raw))
             if not isinstance(fixed, list):
@@ -2956,7 +3062,18 @@ class ChapterRunner:
         key_ns = {n for n, v in (self._key_evidence or {}).items()
                   if v.get("letter") and v.get("method") != "key_conflict"}
         if key_ns and q != key_ns:
-            return False, f"extracted Q {sorted(q)} != key rows {sorted(key_ns)}"
+            missing = sorted(key_ns - q)
+            extra = sorted(q - key_ns)
+            self._missing_qnos = missing
+            detail = ""
+            if missing:
+                detail += (f"; MISSING q{missing} -- the printed answer key "
+                           f"proves these questions exist but NO content was "
+                           f"extracted for them (a hole in the output)")
+            if extra:
+                detail += f"; EXTRA q{extra} (no answer-key row)"
+            return False, (f"extracted Q {sorted(q)} != key rows "
+                           f"{sorted(key_ns)}" + detail)
         if a and q != a:
             return False, f"Q {sorted(q)} != A {sorted(a)}"
         if s and q != s:
