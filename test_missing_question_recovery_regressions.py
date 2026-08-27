@@ -471,3 +471,28 @@ class TestEmptyOptionsDoNotShip(unittest.TestCase):
             self._item(""), "Question"))
         self.assertTrue(bph.ChapterRunner._crop_item_ok(
             self._item("Leprosy"), "Question"))
+
+
+class TestBlankStemNotContaminated(unittest.TestCase):
+    """RUN-51 (OPH-001-007 live, verified on the deployed lookup): the row is
+    READY and CORRECT -- stem 'After conception, the canal of Schlemm appears
+    by ____.' with solution restating it. The detector flagged it only because
+    a fill-in-the-blank stem has no '?' and no question word, so
+    _QUESTION_SHAPED_RE missed it. A trailing blank IS a question marker."""
+
+    STEM = ("After conception, the canal of Schlemm appears by "
+            "___________________ .")
+    SOL = "The canal of Schlemm appears by the 4th month after conception."
+
+    def test_fill_in_blank_stem_is_not_contamination(self):
+        self.assertIsNone(qv._stem_contamination_reason(self.STEM, self.SOL))
+
+    def test_stem_that_is_the_solution_still_flagged(self):
+        # reverse containment: the whole solution sits inside the stem ->
+        # same text in both fields -> contamination, with or without a blank
+        bad = self.SOL + " (4th month)."
+        self.assertIsNotNone(qv._stem_contamination_reason(bad, self.SOL))
+
+    def test_explanation_opener_still_flagged(self):
+        self.assertIsNotNone(qv._stem_contamination_reason(
+            "Solution: " + self.SOL, self.SOL))

@@ -100,7 +100,7 @@ EXPLANATION_START_RE = re.compile(
 # called ___") as contaminated_question -> false positives on every re-run.
 _MAX_REAL_STEM_LEN = 250
 _QUESTION_SHAPED_RE = re.compile(
-    r"\?\s*$|which\b|what\b|who\b|whom\b|how\b|why\b|identify\b|choose\b|"
+    r"\?\s*$|_{3,}|which\b|what\b|who\b|whom\b|how\b|why\b|identify\b|choose\b|"
     r"select\b|best\b|most likely\b|correct\b|diagnos|drug\b|treatment\b|"
     r"following\b|regarding\b|according\b|is the\b|are the\b|of the\b",
     re.IGNORECASE)

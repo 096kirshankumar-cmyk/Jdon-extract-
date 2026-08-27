@@ -387,3 +387,17 @@ Fix (all PDF-grounded, no guessing):
 
 Tests: `TestKeyCensusQuarantinesPhantoms`, `TestEmptyOptionsDoNotShip` in
 test_missing_question_recovery_regressions.py (now 25 tests).
+
+# RUN-51 (2026-08-27) — contaminated_question false positive on fill-in-the-blank stems
+
+Live `OPH-001-007` (verified on deployed lookup, qa=READY, CORRECT):
+stem "After conception, the canal of Schlemm appears by ____." solution
+restates it. Flagged contaminated_question (89% of stem tokens in its own
+solution) ONLY because `_QUESTION_SHAPED_RE` had no branch for a trailing
+blank -- a fill-in stem has no "?" and no question word, so the shape test
+failed and the token-overlap rule fired.
+
+Fix: added `_{3,}` (a run of underscores = a blank) to `_QUESTION_SHAPED_RE`.
+This is NOT weakening: real contamination (stem that IS the solution, or opens
+with explanation language) has no trailing blank and still trips the reverse-
+containance / explanation-opener branches (both regression-tested).
