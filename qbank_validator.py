@@ -320,7 +320,9 @@ def check_row(row, assets_questions):
         # way with the figure sitting right there in solution.images, which
         # makes a clean chapter look broken and trains reviewers to ignore the
         # flag. One rule, both places: ':' + (table OR image) = a lead-in.
-        _leadin_explained = s.endswith(":") and (sol.get("tables") or sol.get("images"))
+        _q_imgs = (row.get("question") or {}).get("images") or []
+        _leadin_explained = s.endswith(":") and (
+            sol.get("tables") or sol.get("images") or _q_imgs)
         if DANGLING_END_RE.search(s) and not _leadin_explained:
             flags.append(flag(cid, "truncated_solution",
                               f"{row.get('id')}: solution ends on a dangling connector (...{s[-50:]!r})", qn))
@@ -601,11 +603,20 @@ def numeric_drift_flag(row, page_text_getter):
     pages = [p for p in (row.get("source_pages") or []) if isinstance(p, int)]
     if not pages:
         return None
+    # Garbled source -> pdftotext proof impossible -> skip (no false drift)
+    try:
+        import header_index as _hi
+
+        _texts = {p: (page_text_getter(p) or "") for p in pages}
+        if any(_hi.text_layer_health(t) == "GARBLED" for t in _texts.values()):
+            return None
+    except Exception:
+        _texts = {p: (page_text_getter(p) or "") for p in pages}
     printed = set()
     for p in pages:
-        printed |= _printed_numbers(page_text_getter(p) or "")
+        printed |= _printed_numbers(_texts.get(p) or "")
     if not printed:
-        return None     # no text layer on these pages -> nothing provable
+        return None
     hits = []
     for m in _num_unit_re().finditer(sol):
         tok = m.group(0).replace(" ", "").replace(",", "")
