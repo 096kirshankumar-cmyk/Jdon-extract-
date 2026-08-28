@@ -571,3 +571,31 @@ class TestRecoveredCropDoesNotBlockLock(unittest.TestCase):
         self.assertEqual(out, [])
         self.assertTrue(any("unresolved" in n for n in r.notes),
                         f"no blocking note on failed recovery: {r.notes}")
+
+
+class TestBlankOptionsDoNotCrashChapter(unittest.TestCase):
+    """RUN-54 (OPH-020 live CRASH): a row with all-blank options left opt_toks
+    empty and _overlap_letter did max() over an empty dict -> ValueError out of
+    build_final_question -> the whole chapter was dropped by the crash handler.
+    The detector must return None (nothing to compare), never raise."""
+
+    def test_blank_options_return_none_not_raise(self):
+        import qbank_pipeline as qp
+        rec = {"solution_text": "The most common cause is neuroblastoma which "
+                                "presents with bilateral proptosis in children."}
+        option_rows = [{"id": L, "text": ""} for L in "ABCD"]
+        # would raise ValueError before the guard
+        self.assertIsNone(
+            qp._answer_option_mismatch(rec, "C", option_rows))
+
+    def test_real_mismatch_still_detected(self):
+        import qbank_pipeline as qp
+        rec = {"solution_text": "Option A craniofacial dysostosis is the "
+                                "correct answer for bilateral proptosis."}
+        option_rows = [{"id": "A", "text": "Craniofacial dysostosis"},
+                       {"id": "B", "text": "Thyroid ophthalmopathy"},
+                       {"id": "C", "text": "Neuroblastoma"},
+                       {"id": "D", "text": "Orbital cellulitis"}]
+        # extracted C but solution verbatim-names option A -> flip flagged
+        self.assertIsNotNone(
+            qp._answer_option_mismatch(rec, "C", option_rows))

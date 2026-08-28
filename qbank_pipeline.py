@@ -3187,6 +3187,14 @@ def _answer_option_mismatch(rec, correct_id, option_rows):
         f = {w for w in re.findall(WORD, frag.lower()) if len(w) > 3}
         if len(f) < 3:
             return None
+        # RUN-54 (OPH-020 live CRASH): a row whose options are all blank
+        # (bad_options) leaves opt_toks empty, and max() over an empty dict
+        # raised ValueError out of build_final_question -> the WHOLE chapter
+        # was lost to the per-chapter crash handler. A detector must never
+        # take a chapter down; with no option text there is nothing to
+        # compare, so there is no mismatch to report.
+        if not opt_toks:
+            return None
         scores = {k: len(f & s) for k, s in opt_toks.items()}
         best = max(scores, key=scores.get)
         if scores[best] >= max(3, scores.get(correct_id, 0) + 2):

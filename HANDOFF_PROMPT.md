@@ -430,3 +430,18 @@ first; append the blocking "unresolved" note ONLY when recovery yields nothing.
 A successful recovery leaves a non-blocking note; the recovered rows stay
 `_ocr` -> REVIEW_NEEDED (honest), but the chapter is no longer hard-blocked.
 Test: TestRecoveredCropDoesNotBlockLock.
+
+---
+
+# RUN-54 (2026-08-28) — blank options crashed the WHOLE chapter (OPH-020 lost)
+
+Live log traceback: build_final_question -> _answer_option_mismatch ->
+_overlap_letter -> `max(scores)` with scores built from `opt_toks`, which is
+EMPTY when every option text is blank (the OPH-020-007 bad_options row).
+ValueError propagated to run_all's per-chapter crash handler, so the entire
+chapter was dropped instead of being flagged.
+
+Fix: `if not opt_toks: return None` in _overlap_letter -- with no option text
+there is nothing to compare, so no mismatch; the row keeps its bad_options
+REVIEW flag instead of taking the chapter down.
+Test: TestBlankOptionsDoNotCrashChapter.
