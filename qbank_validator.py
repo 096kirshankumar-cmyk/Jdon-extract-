@@ -100,7 +100,7 @@ EXPLANATION_START_RE = re.compile(
 # called ___") as contaminated_question -> false positives on every re-run.
 _MAX_REAL_STEM_LEN = 250
 _QUESTION_SHAPED_RE = re.compile(
-    r"\?\s*$|which\b|what\b|who\b|whom\b|how\b|why\b|identify\b|choose\b|"
+    r"\?\s*$|_{3,}|which\b|what\b|who\b|whom\b|how\b|why\b|identify\b|choose\b|"
     r"select\b|best\b|most likely\b|correct\b|diagnos|drug\b|treatment\b|"
     r"following\b|regarding\b|according\b|is the\b|are the\b|of the\b",
     re.IGNORECASE)
@@ -541,6 +541,16 @@ def check_chapter(chapter_id, rows):
                                   f"{biggest} with the same header AND the solution ends on a "
                                   f"header lead-in -- table likely cut",
                                   _as_int(rid.rsplit("-", 1)[-1])))
+
+    # RUN-49 (OPH-013 q18 live): these two checks were INDENTED INSIDE the
+    # table-header loop above, so they only ran for a chapter that happened
+    # to have >=2 solutions sharing a table header. A chapter with no such
+    # table group never reported a hole at all -- OPH-013 shipped 34 rows
+    # numbered 1..17,19..35 and NOTHING flagged the missing 18; the user
+    # found it by eye in the review lookup ("koi row nahi mili: 013-018").
+    # A missing question number is the single most important defect in an
+    # 18k-question bank with no review capacity, so it must be unconditional.
+    if qns:
         for missing in [n for n in range(min(qns), max(qns) + 1) if n not in s]:
             flags.append(flag(chapter_id, "numbering_gap",
                               f"question {missing} absent (series runs {min(qns)}..{max(qns)})", missing))
@@ -946,116 +956,10 @@ def adjudicate(candidate, page_text_lookup):
     return "reject", score
 
 
-def candidate_to_merge_item(candidate):
-    """Approved candidate -> Gemini-item-shaped dict for fill_only merge."""
-    kind, d = candidate["flag"]["kind"], candidate["data"]
-    qn = _as_int(d.get("q_no")) or _as_int(d.get("owner_q_no")) or candidate["flag"].get("q_no")
-    if qn is None:
-        return None
-    # "truncated_solution" is deliberately absent: it is human-queue-only
-    # (append/replace semantics), never an auto merge item.
-    if kind in ("missing_solution", "audit_component_missing") and d.get("solution_text"):
-        return {"q_no": qn, "solution_text": d["solution_text"]}
-    if kind in ("missing_answer", "answer_mismatch") and d.get("correct_option"):
-        return {"q_no": qn, "correct_option": d["correct_option"]}
-    if kind == "bad_options" and d.get("options"):
-        return {"q_no": qn, "options": d["options"]}
-    if kind in ("numbering_gap", "audit_missing_question") and d.get("question_text"):
-        return {"q_no": qn, "question_text": d["question_text"], "options": d.get("options"),
-                "correct_option": d.get("correct_option"), "solution_text": d.get("solution_text")}
-    if kind == "orphan_unresolved" and d.get("owner_q_no"):
-        key = {"solution": "solution_text", "question": "question_text"}.get(d.get("role"))
-        if key:
-            frag = candidate["flag"]["detail"][:2000]
-            return {"q_no": qn, key: frag}
-    return None
 
 
-def check_preconditions(rows, items, deletes, inserts):
-    """All-or-nothing per chapter: if ANY patch violates its precondition,
-    nothing is written. Fills must target empty fields; inserts must be
-    new q_nos; deletes must name an existing id."""
-    by_qn = {q_no_of(r): r for r in rows}
-    ids = [r.get("id") for r in rows]
-    for qn in inserts:
-        if qn in by_qn:
-            return f"insert q{qn}: q_no already present"
-    for d in deletes:
-        if d not in ids:
-            return f"delete {d}: id not present in chapter"
-    for it in items:
-        qn = _as_int(it.get("q_no"))
-        row = by_qn.get(qn)
-        if row is None:
-            continue  # insert-shaped item handled above
-        if it.get("solution_text") and ((row.get("solution") or {}).get("text") or "").strip():
-            return f"q{qn}: solution already filled (fill-only violation)"
-        if it.get("correct_option") and (row.get("correct_options") or []):
-            return f"q{qn}: answer already present (fill-only violation)"
-    return None
 
 
-def apply_chapter_patches(chapter_id, rows, approved, qp, dry_run=True):
-    """approved: [(candidate, score)].
-    Returns (result_dict, new_rows | None) -- None means preconditions
-    failed and the chapter was left UNTOUCHED (transactional).
-    Production machinery is injected as qp (= qbank_pipeline module)."""
-    items, deletes, inserts, applied = [], [], [], []
-    existing_qns = {q_no_of(r) for r in rows}
-
-    for cand, score in approved:
-        kind = cand["flag"]["kind"]
-        if kind == "duplicate_text":
-            parts = cand["flag"]["detail"].split(" ~ ")
-            later_id = parts[1].split(" ")[0].strip() if len(parts) > 1 else None
-            if not later_id:
-                return {"chapter_id": chapter_id, "applied": [],
-                        "aborted": f"duplicate_text flag unparsable: {cand['flag']['detail']}"}, None
-            deletes.append(later_id)
-            applied.append({"op": "delete", "id": later_id, "score": score})
-            continue
-        item = candidate_to_merge_item(cand)
-        if item is None:
-            continue  # unactionable candidate (should have been queued earlier)
-        if _as_int(item["q_no"]) not in existing_qns:
-            inserts.append(_as_int(item["q_no"]))
-        items.append(item)
-        applied.append({"op": "merge_item", "q_no": item["q_no"],
-                        "fields": sorted(k for k in item if k != "q_no"),
-                        "score": score, "pages": cand.get("pages")})
-
-    abort = check_preconditions(rows, items, deletes, inserts)
-    if abort:
-        return {"chapter_id": chapter_id, "applied": [], "aborted": abort}, None
-
-    records, owned = {}, {}
-    subject = chapter_id.split("-", 1)[0]
-    chapter_no = int(chapter_id.split("-", 1)[1])
-    for r in rows:
-        rec, own = qp.final_q_to_record(r)
-        records[rec["q_no"]], owned[rec["q_no"]] = rec, own
-    stats = {}
-    if items:
-        records, _skipped = qp.merge_question_records(records, items, stats, fill_only=True)
-
-    kept_qns = set()
-    new_rows = []
-    delete_set = set(deletes)
-    deleted_qns = {q_no_of(r) for r in rows if r.get("id") in delete_set}
-    for r in rows:
-        if r.get("id") in delete_set:
-            continue
-        qn = q_no_of(r)
-        kept_qns.add(qn)
-        new_rows.append(qp.build_final_question(subject, chapter_id, chapter_no, qn,
-                                                records[qn], owned.get(qn, {"question": [], "solution": []})))
-    # only true INSERTS are appended as brand-new rows -- never resurrect a
-    # record whose row was just deleted.
-    for qn in sorted(set(inserts) - kept_qns - deleted_qns):
-        new_rows.append(qp.build_final_question(subject, chapter_id, chapter_no, qn,
-                                                records[qn], {"question": [], "solution": []}))
-    return {"chapter_id": chapter_id, "applied": applied, "aborted": None,
-            "dry_run": dry_run, "stats": stats}, new_rows
 
 
 def rewrite_questions(path, all_rows):
@@ -1179,19 +1083,20 @@ def run_hybrid(output_root=OUTPUT_ROOT, audit=False, model=None, image_opener=No
                 queued.append({"flag": cand["flag"], "candidate": cand["data"], "score": score})
             else:
                 rejected_n += 1
-        auto_dups = [({"flag": f, "data": {}, "pages": []}, f.get("similarity", 0.0))
-                     for f in chapter_flags
-                     if f["kind"] == "duplicate_text" and f.get("similarity", 0.0) >= DELETE_AUTO_MIN]
+        # RETIRED (boundary-engine cutover): the audit mode no longer
+        # REWRITES rows. Auto-applying/merging/deleting content was the old
+        # multi-pass engine's job and violates the standing rule -- flag,
+        # don't fix. Every candidate (however confident) now goes to the
+        # human queue and is decided in /review.
+        auto_dups = []
         applied_this = []
-        if approved or auto_dups:
-            import qbank_pipeline as qp  # lazy: report-only mode needs no genai/pypdf
-            result, new_rows = apply_chapter_patches(cid, crows, approved + auto_dups, qp, dry_run=dry_run)
-            if result.get("aborted"):
-                print(f"  [AUDIT] {cid}: patch set aborted ({result['aborted']}) -- chapter left untouched")
-            else:
-                by_chapter[cid] = new_rows
-                applied_this = result["applied"]
-                applied_n += len(applied_this)
+        if approved:
+            for cand, score in approved:
+                queued.append({"flag": cand["flag"], "candidate": cand["data"],
+                               "score": score,
+                               "note": "was auto_apply; routed to human after "
+                                       "engine cutover (flag, don't fix)"})
+            approved = []
         human_n += len(queued)
         if not dry_run:
             for hq in queued:

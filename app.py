@@ -15,11 +15,16 @@ import json as _json
 import os
 import shutil
 import socket
+import sys
 import threading
 import time
 import traceback
 import zipfile
 from pathlib import Path
+
+_REPO_ROOT = str(Path(__file__).resolve().parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import requests
 from flask import Flask, render_template_string, request, redirect, url_for, send_file, jsonify
@@ -583,23 +588,6 @@ PAGE = """
     </form>
   </details>
 
-  <details class="bg-white rounded-lg shadow p-4">
-    <summary class="text-sm font-semibold cursor-pointer">Recovery mode — heal specific pages (missing solutions etc.)</summary>
-    <form action="/recover" method="POST" class="space-y-3 mt-3">
-      <div>
-        <label class="block text-sm font-semibold mb-1">Recovery plan (JSON)</label>
-        <textarea name="plan" rows="6" class="w-full text-xs font-mono border p-2 rounded">{
-  "PSY-016": {"pages": [214, 217], "reason": "recitation batch loss"},
-  "PSY-001": {"pages": [17], "reason": "missing solution for q13"}
-}</textarea>
-        <p class="text-xs text-gray-500">Pages = true PDF file page numbers (see orphans.jsonl / unmatched image filenames). Renders ±1 neighbour page for context. Never overwrites existing text; only fills what is missing.</p>
-      </div>
-      <button class="w-full bg-indigo-600 text-white font-bold py-2 rounded" {% if state.status == 'processing' %}disabled{% endif %}>
-        Run recovery
-      </button>
-    </form>
-  </details>
-
   <div class="bg-black text-green-400 text-xs rounded-lg p-3 h-64 overflow-y-auto font-mono" id="log">
     {% for line in state.log %}{{ line }}<br>{% endfor %}
   </div>
@@ -707,9 +695,8 @@ def run_url():
 
 @app.route("/v2-test", methods=["POST"])
 def v2_test():
-    """Smoke-test the v2 3-pass flow on ONE chapter, output into an isolated
-    <OUTPUT_ROOT>_v2test/ folder -- never touches real data. Phone-friendly
-    equivalent of running test_v2_chapter.py on the server."""
+    """Smoke-test the boundary-phased engine on ONE chapter, output into an
+    isolated <OUTPUT_ROOT>_v2test/ folder -- never touches real data."""
     pdf_url = resolve_download_url(request.form.get("pdf_url", "").strip())
     subject_code = request.form.get("subject_code", "").strip().upper() or "TST"
     try:
@@ -754,20 +741,21 @@ def v2_test():
                 pipeline.STATE_FILE = test_root / "state.json"
                 pipeline.DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-                cfg = {"subject": subject_code, "path": str(pdf_path), "page_offset": page_offset}
                 st = pipeline.load_state()
-                chapters_out = []
-                log(f"🧪 [V2-TEST] {subject_code} chapter {chapter_no} (3-pass chal raha hai)...")
+                log(f"🧪 [V2-TEST] {subject_code} chapter {chapter_no} "
+                    f"(boundary-phased engine chal raha hai)...")
                 import google.generativeai as genai
                 # Multi-key pool: configures the first usable key and lets the
                 # pipeline rotate to the next project as each one is spent.
                 gemini_keys.init(st, pipeline.MAX_CALLS_PER_DAY)
                 model = gemini_keys.track(genai.GenerativeModel(pipeline.GEMINI_MODEL))
+                pipeline.reset_daily_counter_if_needed(st)
                 q_path = pipeline.DATA_DIR / "questions.jsonl"
-                # run-16: per-chapter atomic rewrite inside process_pdf --
-                # pass the PATH, not an append handle (crash-safe resume).
-                pipeline.process_pdf(cfg, st, model, chapters_out, q_path,
-                                     only_chapter_no=chapter_no)
+                import boundary_phased as engine
+                engine.run_chapter(str(pdf_path), subject_code, chapter_no,
+                                   pipeline.OUTPUT_ROOT,
+                                   page_offset=page_offset, model=model,
+                                   state=st)
                 import json as _json
                 rows = [_json.loads(l) for l in q_path.read_text().splitlines() if l.strip()] \
                     if q_path.exists() else []
@@ -776,23 +764,18 @@ def v2_test():
                 ms = sum(1 for r in rows if not (r.get("solution") or {}).get("text"))
                 log(f"📊 [V2-TEST] Result: {n} questions | missing answer: {ma} | "
                     f"missing solution: {ms} (output: _v2test/ folder, asli data safe ✅)")
-                # Non-empty fields do not prove a complete solution. Surface
-                # the retry ledger prominently so a test is never described
-                # as clean while truncated-solution suspects remain.
-                ledger = test_root / "data" / "still_incomplete_after_retry.jsonl"
+                # Non-empty fields do not prove a clean chapter. Surface the
+                # engine's gate rows prominently so a test is never described
+                # as clean while blockers/review flags remain.
+                ledger = test_root / "data" / "export_gate.jsonl"
                 pending = sum(1 for line in ledger.read_text(encoding="utf-8").splitlines()
                               if line.strip()) if ledger.exists() else 0
                 if pending:
-                    log(f"⚠️ [V2-TEST] REVIEW REQUIRED: {pending} item(s) remain in "
-                        "still_incomplete_after_retry.jsonl — do not start full-book run yet.")
+                    log(f"⚠️ [V2-TEST] REVIEW REQUIRED: {pending} export-gate "
+                        "row(s) written -- boundary engine ne kuch cheezein flag "
+                        "ki hain. Pehle inhe dekho, full-book run baad me.")
                 else:
-                    log("✅ [V2-TEST] No retry-ledger gaps remain; run validator before full book.")
-                safety_events = [e for e in st.get("safety_blocked", [])
-                                 if e.get("chapter_id") == f"{subject_code}-{chapter_no:03d}"]
-                if safety_events:
-                    safety_pages = sorted({str(p) for e in safety_events for p in e.get("pages", [])})
-                    log("🚫 [V2-TEST] SAFETY BLOCKED page(s): " + ", ".join(safety_pages) +
-                        " — recovered output may exist, but inspect these pages manually before a full-book run.")
+                    log("✅ [V2-TEST] Export gate clean; run validator before full book.")
                 # Test output lives outside the main output root, so /download
                 # cannot include it; build a dedicated downloadable archive.
                 try:
@@ -864,57 +847,10 @@ def run():
     t.start()
     return redirect(url_for("index"))
 
-RECOVERY_PLAN_PATH = Path("./recovery_plan.json")
-
-@app.route("/recover", methods=["POST"])
-def recover():
-    if VOLUME_WARN:
-        return ("Volume /data pe attach nahi hai -- pehle Railway Settings me Volume lagao "
-                "(Mount Path: /data), warna jo bhi likha jayega wo next redeploy pe udd jayega.", 400)
-    if not try_mark_processing():          # AUDIT-FIX: atomic busy-guard
-        return redirect(url_for("index"))
-    plan_text = request.form.get("plan", "").strip()
-    if not plan_text:
-        with state_lock:
-            state["status"] = "idle"
-        return "No plan provided", 400
-    import json as _json
-    try:
-        plan = _json.loads(plan_text)
-        assert isinstance(plan, dict) and plan, "plan must be a non-empty object"
-        for cid, spec in plan.items():
-            assert isinstance(spec.get("pages"), list) and spec["pages"], \
-                f"{cid}: needs a non-empty 'pages' list"
-    except (ValueError, AssertionError) as e:
-        with state_lock:
-            state["status"] = "idle"
-        return f"Invalid plan JSON: {e}", 400
-    RECOVERY_PLAN_PATH.write_text(plan_text)
-
-    def _do_recover():
-        try:
-            log(f"🩹 Recovery started for: {', '.join(plan)}")
-            pipeline.recover_pages(str(RECOVERY_PLAN_PATH))
-            with state_lock:
-                state["status"] = "completed"
-            log("🩹 Recovery finished. Download zip to inspect healed rows.")
-            make_zip()
-        except SystemExit:
-            with state_lock:
-                state["status"] = "paused"
-            log("⏸ Recovery paused at Gemini daily limit -- run it again tomorrow.")
-            make_zip()
-        except Exception as e:
-            with state_lock:
-                state["status"] = "failed"
-                state["error"] = str(e)
-            log(f"❌ Recovery error: {e}")
-            traceback.print_exc()
-
-    t = threading.Thread(target=_do_recover)
-    t.daemon = True
-    t.start()
-    return redirect(url_for("index"))
+# The old multi-pass engine's /recover mode is RETIRED with the engine
+# cutover. Healing a chapter now = re-run it (a chapter absent from
+# state.json -> chapters_done is retried automatically on Run), and
+# content-level fixes go through the /review queue (flag, don't fix).
 
 @app.route("/fix", methods=["POST"])
 def fix():
@@ -1300,7 +1236,7 @@ def download_master_review():
     # happened (matches the existing 'Download results' UX where
     # /make-zip prints a one-liner).
     try:
-        manifest = json.loads(
+        manifest = _json.loads(
             (out / "MASTER_REVIEW" / "MASTER_REVIEW_MANIFEST.json").read_text(
                 encoding="utf-8"))
         log(f"📒 MASTER_REVIEW: {manifest.get('total_chapters', 0)} chapter(s), "
@@ -2252,10 +2188,26 @@ def review_lookup():
                                           back=back_url)
     miss_hint = None
     if term and not cards:
-        qn_m = re.search(r"(?:^|-)(\d{1,3})$", term)
-        ch_m = re.match(r"^([A-Za-z]+)-(\d{3})", term)
+        ch_m = _re.match(r"^([A-Za-z]+)-(\d{3})", term)
         ch = ch_m.group(0) if ch_m else (chapter or None)
-        all_rows = review_queue.lookup_questions(out, "", None)
+        if not ch:
+            # RUN-49 (OPH-013-018 live): '013-018' carries the chapter number
+            # too, but the regex above demands a letter prefix, so the hint
+            # fell back to whole-book numbers and told the user nothing.
+            # Resolve '013-018' -> the one chapter id ending in '-013' so the
+            # hint can say exactly which series the number is missing from.
+            m3 = _re.match(r"^(\d{3})-\d{1,3}$", term)
+            split_dir = Path(pipeline.OUTPUT_ROOT) / "split"
+            if m3 and split_dir.exists():
+                cands = sorted({cd.name for sub in split_dir.iterdir()
+                                if sub.is_dir()
+                                for cd in sub.iterdir()
+                                if cd.is_dir()
+                                and cd.name.endswith("-" + m3.group(1))})
+                if len(cands) == 1:
+                    ch = cands[0]
+        all_rows = review_queue._read_jsonl(
+            Path(pipeline.OUTPUT_ROOT) / "data" / "questions.jsonl")
         pool = [r for r in all_rows if r.get("chapter_id") == ch] if ch else all_rows
         if pool:
             qnos = sorted(int(r["id"].rsplit("-", 1)[1]) for r in pool
@@ -2263,7 +2215,9 @@ def review_lookup():
             if qnos:
                 miss_hint = (f"{ch or 'is book'} me total {len(qnos)} questions hain "
                              f"(available: q{qnos[0]}..q{qnos[-1]}). "
-                             f"'{term}' isme NAHI hai — number check karo.")
+                             f"'{term}' isme NAHI hai -- ya toh number galat hai, "
+                             f"ya ye question extract hi nahi hua (review queue "
+                             f"me is chapter ka numbering_gap flag dekho).")
         elif not ch:
             miss_hint = f"'{term}' kisi bhi chapter me nahi mila."
     return render_template_string("""
@@ -2349,7 +2303,7 @@ document.querySelectorAll('button[data-imop]').forEach(function(b){
 </script>
 </body></html>
 """, f=f, term=term, chapter=chapter or "", auto_chapter=auto_chapter,
-    fstat=fstat, cards=cards)
+    fstat=fstat, cards=cards, miss_hint=miss_hint)
 
 
 @app.route("/review/upload-image", methods=["POST"])
@@ -2549,13 +2503,28 @@ def download_final():
     if gate["locked"]:
         return (f"🔒 Final zip LOCKED: {gate['why']}. Pehle /review par sab "
                 f"decide karo.", 423)
-    res = review_queue.build_final_zip(out)
+    try:
+        res = review_queue.build_final_zip(out)
+    except FileNotFoundError as e:
+        q = review_queue.collect_review_queue(out)
+        pending = q["counts"]["blocker"] + q["counts"]["review"]
+        return (f"Final zip abhi ready nahi hai "
+                f"({e.filename or e} missing). "
+                f"{pending} issue(s) pending in /review.", 404)
     if not res.get("ok"):
-        return f"final zip build failed: {res}", 500
+        q = review_queue.collect_review_queue(out)
+        pending = q["counts"]["blocker"] + q["counts"]["review"]
+        why = res.get("why") or res
+        return (f"Final zip abhi ready nahi hai: {why}. "
+                f"{pending} issue(s) pending in /review.", 409)
+    zpath = Path(res["path"])
+    if not zpath.exists():
+        return ("Final zip abhi ready nahi hai (build reported ok but "
+                "final_export.zip is missing on disk).", 404)
     log(f"🚀 FINAL zip built: {res['receipt']['chapters']} chapter(s), "
         f"{res['receipt']['images_shipped']} image(s), "
         f"{res['receipt']['human_edits']} human edit(s) -> final_export.zip")
-    return send_file(res["path"], as_attachment=True,
+    return send_file(str(zpath), as_attachment=True,
                      download_name="final_export.zip")
 
 

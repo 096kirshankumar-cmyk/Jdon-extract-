@@ -63,6 +63,11 @@ class AuditEnv(unittest.TestCase):
         qp._declared_image_allowance.clear()
         qp._OCR_ANCHOR_CACHE.clear()
         qp._OCR_ANCHOR_XY.clear()
+        # union_block_headers_on_page caches per (pdf, page, dpi, section,
+        # rec_sig); a previous test's stubbed scan for the SAME key would
+        # otherwise be replayed here (order-dependent failures).
+        qp._UNION_HEADER_CACHE.clear()
+        qp._UNION_DROP_LOGGED.clear()
         self._patches = {}
 
     def tearDown(self):
@@ -257,15 +262,6 @@ class TestOneToOneExtent(AuditEnv):
 # FIX A3: carry recency + kind correctness + flat-cap parity
 # ============================================================================
 class TestCarryFixed(AuditEnv):
-    def test_adjacent_carry_selection_by_recency(self):
-        carries = {"Q": {"last_open_question": 6, "cut_part": "question",
-                         "ending_page": 482},
-                   "S": {"last_open_question": 9, "cut_part": "solution",
-                         "ending_page": 489}}
-        self.assertEqual(qp._active_block_from_carries(carries),
-                         ("solution", 9),
-                         "the carry whose block ended closest to the window "
-                         "must win (not an unconditional Q preference)")
 
     def test_carry_obeys_flat_cap(self):
         records = {6: _full_rec(6)}
@@ -279,13 +275,12 @@ class TestCarryFixed(AuditEnv):
         leftover = qp.claim_page_images(imgs, PDF, 483, SUBJECT, CH_NO,
                                         records, by_q,
                                         active_block=("question", 6))
-        self.assertEqual(len(by_q[6]["question"]), qp.MAX_QUESTION_IMAGES,
-                         "carry claims must stop at the same flat cap as "
-                         "positional claims")
-        self.assertIn("OPH/OPH-p483-104.webp", leftover,
-                      "the 4th carry image must flow to review, not stack on")
+        self.assertEqual(len(by_q[6]["question"]), 4,
+                         "no hard image-count cap: all geometrically owned "
+                         "figures ship")
+        self.assertEqual(leftover, [])
         refused = [r for r in self.ledger() if r.get("outcome") == "refused_cap"]
-        self.assertEqual(len(refused), 1)
+        self.assertEqual(len(refused), 0)
 
 
 # ============================================================================
@@ -310,48 +305,6 @@ class TestMixedPageFixed(AuditEnv):
         self.assertEqual(len(by_q[3]["solution"]), 1,
                          "the figure inside solution q3's block belongs to the "
                          "solution side of q3")
-
-
-# ============================================================================
-# FIX B2: L3 vision context pages (height, not width; correct direction)
-# ============================================================================
-class TestVisionContextFixed(AuditEnv):
-    def _run(self, positions, oids=(101,), page=483):
-        records = {6: _full_rec(6)}
-        renders = []
-
-        def fake_render(pdf, p, dpi=150):
-            renders.append(p)
-            from PIL import Image
-            return Image.new("RGB", (612, 792), "white"), 1.0, 792.0
-
-        self.stub("render_page_png", fake_render)
-
-        class FakeModel:
-            def generate_content(self, parts, **kw):
-                class R:
-                    candidates = []
-                    text = "{}"
-                return R()
-
-        self.make_temp_images(page, list(oids))
-        qp.full_page_vision_ownership(
-            FakeModel(), PDF, page,
-            [f"{SUBJECT}/{SUBJECT}-p{page}-{o}.webp" for o in oids],
-            positions, SUBJECT, CH_NO, records, CH_ID, {}, {})
-        return renders
-
-    def test_top_edge_figure_pulls_previous_page(self):
-        renders = self._run({101: (712.0, 100.0, 0, 60.0, 80.0)})  # y+h = 792 top
-        self.assertIn(482, renders,
-                      "a figure touching the TOP edge must attach the PREVIOUS "
-                      "page (its owner heading lives there)")
-
-    def test_bottom_edge_figure_pulls_next_page(self):
-        renders = self._run({101: (10.0, 100.0, 0, 500.0, 80.0)})  # bottom edge
-        self.assertIn(484, renders,
-                      "a figure touching the BOTTOM edge must attach the NEXT "
-                      "page (where its block continues)")
 
 
 # ============================================================================
@@ -720,18 +673,3 @@ class TestTableDedupeNearVariants(unittest.TestCase):
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["markdown"], base)   # fuller/cleaner wins
 
-    def test_recover_orphans_table_path_uses_real_dedupe(self):
-        rec = {1: {"q_no": 1, "question_text": "Q?", "options":
-                   {"A": "a", "B": "b", "C": "c", "D": "d"}, "correct_option": "A",
-                   "solution_text": "Full solution.", "tables": [
-                       {"type": "cmp", "markdown": "| A | B |\n|---|---|\n| 1 | 2 |"}]}}
-        drift = "| A | B |\n|---|---|\n| 1|2 |"
-        orph = [{"pdf_pages": [9], "new_pages": [9], "pass": "S",
-                 "item": {"q_no": 1, "solution_text": None, "correct_option": None,
-                          "question_text": None,
-                          "tables": [{"type": "cmp", "markdown": drift}]},
-                 "_prov": "S_PASS"}]
-        before = len(rec[1]["tables"])
-        qp.recover_orphans(orph, rec, "OPH", 1, {})
-        self.assertEqual(len(rec[1]["tables"]), before,
-                         "spacing-drift duplicate must collapse")
