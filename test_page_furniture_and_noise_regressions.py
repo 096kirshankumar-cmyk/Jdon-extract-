@@ -70,8 +70,12 @@ class TestStripPageFurniture(unittest.TestCase):
         the line would delete 'Middle cerebral artery', which is the answer."""
         src = "Middle cerebral artery 6 Sold by @itachibot"
         out, n = qp.strip_page_furniture(src)
-        self.assertEqual(n, 0)
-        self.assertEqual(out, src)
+        # RUN-55: the REAL text is never eaten (that was the old guarantee);
+        # now only the inline stamp substring is removed, so the option keeps
+        # its content and loses the watermark.
+        self.assertGreaterEqual(n, 1)
+        self.assertIn("Middle cerebral artery", out)
+        self.assertNotIn("itachibot", out)
 
     def test_bare_number_with_no_stamp_after_it_survives(self):
         """A solution may legitimately contain a lone number."""

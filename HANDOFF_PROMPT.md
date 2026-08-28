@@ -457,3 +457,9 @@ quoted "q9 option D ... Sold by @itachibot ..."), which whole-line rules never
 see, and options went out as-is. Added _INLINE_STAMP_RE (sold-by only -- bone
 "marrow" is content and stays) to strip_page_furniture, and options are now
 cleaned with it in build_final_question. Test: TestInlineWatermarkStripped.
+
+RUN-55 follow-up: the first inline-stamp attempt used a global \s*-based regex
+that spanned newlines and broke the whole-line footer rules (2 regressions).
+Corrected to a PER-LINE inline strip that only fires on a content line AFTER
+the whole-line rules, preserving all existing footer behavior. Updated the
+"never eaten" test to the improved contract (content kept, stamp removed).

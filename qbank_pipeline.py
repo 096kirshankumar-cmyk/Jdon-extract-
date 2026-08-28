@@ -1674,7 +1674,9 @@ _BARE_PAGE_NO_RE = re.compile(r"^\s*\d{1,4}\s*$")
 # PRunebdinn IN"), which the whole-line rules never see. The stamp is never
 # real content, so strip it inline. Bone-"marrow" IS content, so the publisher
 # mark stays whole-line-only.
-_INLINE_STAMP_RE = re.compile(r"(?i)\s*\d{0,4}\s*sold\s+by\s+@\S+")
+# [ \t] (not \s) so it never spans a newline -- a stamp on its OWN line is the
+# whole-line rule's job; this only cleans a stamp welded into a content line.
+_INLINE_STAMP_RE = re.compile(r"(?i)(?:[ \t]\d{1,4})?[ \t]+sold\s+by\s+@\S+")
 
 
 def strip_page_furniture(text):
@@ -1703,13 +1705,9 @@ def strip_page_furniture(text):
         return src, 0
     # RUN-55: strip INLINE reseller stamps first ("... 6 Sold by @itachibot
     # ..."). They sit inside a content line so the whole-line rules never see
-    # them, and the stamp is never real content. Collapses the leftover space.
-    src, n_inline = _INLINE_STAMP_RE.subn(" ", src)
-    if n_inline:
-        src = re.sub(r"[ \t]{2,}", " ", src)
+    # them, and the stamp is never real content.
     lines = src.split("\n")
     keep, dropped = [], 0
-    dropped += n_inline
     # RUN-41: drop LEADING bare page-number line(s) -- crop-top residue from
     # a footer sitting under a bottom-of-page header. Only lines before any
     # real content qualify; a lone digit line anywhere later is ambiguous
@@ -1734,6 +1732,15 @@ def strip_page_furniture(text):
             if any(r.match(nxt) for r in _PAGE_FURNITURE_RES[:2]):
                 dropped += 1
                 continue
+        # RUN-55: an inline reseller stamp welded into a CONTENT line (the
+        # line is not pure furniture, so the whole-line rule kept it). Strip
+        # just the stamp substring; the real text is preserved.
+        if _INLINE_STAMP_RE.search(ln):
+            ln2 = re.sub(r"[ \t]{2,}", " ", _INLINE_STAMP_RE.sub(" ", ln)).strip()
+            dropped += 1
+            if ln2:
+                keep.append(ln2)
+            continue
         keep.append(ln)
     if not dropped:
         return src, 0
