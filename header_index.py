@@ -43,8 +43,12 @@ def _ocr_lines(png, scale):
         return []
     try:
         import pytesseract
+        # RUN-56 (audit F2): the one tesseract call with no timeout; a dense
+        # 300dpi page could hang the worker and lose all remaining chapters.
+        # pytesseract>=0.3.8 raises RuntimeError on expiry -> caught -> [].
         data = pytesseract.image_to_data(
-            png, config="--psm 6", output_type=pytesseract.Output.DICT)
+            png, config="--psm 6", output_type=pytesseract.Output.DICT,
+            timeout=90)
     except Exception:
         return []
     words = []
@@ -131,6 +135,17 @@ def scan_page(pdf_path, page, dpi=150):
     # the exact header).  Add only exact line-level visitor evidence as a
     # deterministic recovery; it does not read body content or infer a
     # boundary.  De-duplicate a header already found by pixel OCR.
+    # RUN-56 (audit F5): on a GARBLED layer the visitor word stream is
+    # typographical substitution, not real header text -- trusting it injects
+    # phantom "Solution to Question N" headers that split real crops. Pixels
+    # stay authoritative; skip deterministic visitor recovery when garbled.
+    try:
+        _health = text_layer_health(qp.pdftotext_page(pdf_path, page) or "")
+    except Exception:
+        _health = "CLEAN"
+    if _health == "GARBLED":
+        recs.sort(key=lambda r: -float(r["y"]))
+        return recs
     try:
         for y, words in qp._page_word_lines(pdf_path, page):
             text = " ".join(t for _x, t in words)
@@ -755,6 +770,17 @@ def merge_dual_key_reads(map_a, map_b, third=None):
             if lt and lt != la:
                 rec["third"] = lt
             out[n] = rec
+        # RUN-56 (audit F1): exactly-ONE Gemini read + the OCR third read
+        # agreeing is two independent modalities concurring -- a deterministic
+        # claim, not a guess. Recovers the ~110 missing_answer rows where read
+        # B missed a table row but read A + OCR agree. Two disagreeing Gemini
+        # reads stay key_conflict (OCR confirms an absent read, never breaks a
+        # tie between two present reads).
+        elif lt and (la or lb) and not (la and lb) and (la or lb) == lt:
+            out[n] = {"letter": la or lb, "method": "key_single_gemini_ocr",
+                      "agree": True,
+                      "reads": [x for x in (la, lb, lt) if x],
+                      "corroborated_by": "ocr_third"}
         else:
             reads = [x for x in (la, lb, lt) if x]
             out[n] = {

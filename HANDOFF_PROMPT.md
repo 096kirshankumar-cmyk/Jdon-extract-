@@ -463,3 +463,21 @@ that spanned newlines and broke the whole-line footer rules (2 regressions).
 Corrected to a PER-LINE inline strip that only fires on a content line AFTER
 the whole-line rules, preserving all existing footer behavior. Updated the
 "never eaten" test to the improved contract (content kept, stamp removed).
+
+---
+
+# RUN-56 (2026-08-28) — external audit (via AI_AUDIT_PROMPT) findings, verified & implemented
+
+Each finding checked against real code first. Implemented (safe, test-backed):
+- F1 merge_dual_key_reads: exactly-ONE Gemini read + OCR third agreeing ->
+  key_single_gemini_ocr (a letter), recovering ~110 missing_answer rows; two
+  disagreeing Gemini reads STAY key_conflict (OCR confirms an absent read,
+  never breaks a tie).
+- F2 _ocr_lines: timeout=90 (the one tesseract call with none; dense page could
+  hang the worker and lose remaining chapters).
+- F3 _export_gate_violations: len(opts)!=4 so 5+ option rows hit bad_options.
+- F4 key_conflict overlay: no longer overwrites a present answer with None.
+- F5 scan_page: skip text-visitor header recovery on GARBLED layer (it injected
+  phantom headers). Pixels stay authoritative.
+NOT implemented: F6 (review-cache perf; minimal version was a no-op) -- deferred.
+Tests: test_run56_audit_regressions.py.

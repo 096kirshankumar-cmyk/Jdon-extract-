@@ -3922,7 +3922,12 @@ class ChapterRunner:
             if ev.get("agree") and ev.get("letter") and ev.get("method") != "key_conflict":
                 it["correct_option"] = ev["letter"]
             elif ev.get("method") == "key_conflict":
-                it["correct_option"] = ev.get("letter")
+                # RUN-56 (audit F4): a conflict with no proven letter must not
+                # erase a Gemini-extracted answer (was overwriting 'B' with
+                # None -> missing_answer). Keep the present answer, flag
+                # low_confidence; the gate still catches a truly empty one.
+                if ev.get("letter"):
+                    it["correct_option"] = ev["letter"]
                 it["low_confidence"] = True
         s_items = self._extract_phase(s_pages, SOLUTION_PROMPT, "Solution", "S")
         s_items = self._c1_split_solutions(s_items)

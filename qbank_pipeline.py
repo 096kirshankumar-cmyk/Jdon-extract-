@@ -4117,7 +4117,10 @@ def _export_gate_violations(chapter_records, image_files_by_q, unresolved_ledger
             violations.append(("missing_stem", qn,
                                "no question_text after batch+retry+rescue"))
         opts = rec.get("options") or {}
-        if len(opts) < 4 or any(not str(v or "").strip() for v in opts.values()):
+        # RUN-56 (audit F3): FORMAT.md says options are always A-D; the old
+        # one-sided check caught <4 but let 5+ option rows (model position-
+        # assigned E,F..) pass the gate and ship. !=4 flags both directions.
+        if len(opts) != 4 or any(not str(v or "").strip() for v in opts.values()):
             violations.append(("bad_options", qn, f"options={sorted(opts)}"))
         if not rec.get("correct_option"):
             violations.append(("missing_answer", qn, "no correct_option"))
