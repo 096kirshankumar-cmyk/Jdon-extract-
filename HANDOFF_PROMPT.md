@@ -414,3 +414,19 @@ never have run. Added those two kinds to the unlock set so a single final
 re-run re-extracts them. `chapter_not_locked` is deliberately NOT added (it
 would re-run every chapter forever). Test:
 TestFinalRerunReachesBlockedChapters.
+
+---
+
+# RUN-53 (2026-08-28) — a successful OCR recovery must not keep the chapter blocked
+
+OPH-013 live (post-RUN-49 run): q18 WAS recovered via the OCR escape, but the
+chapter still showed BLOCKER `phase_unresolved: Q crop unresolved (blocked)`,
+because the blocking "unresolved" note was appended BEFORE/unconditionally of
+the recovery, and `_ledger_lock` refuses on ANY note containing "unresolved".
+So the recovery was invisible to the lock.
+
+Fix: in `_gemini_crop_batch` and `_printed_header_reask`, attempt OCR recovery
+first; append the blocking "unresolved" note ONLY when recovery yields nothing.
+A successful recovery leaves a non-blocking note; the recovered rows stay
+`_ocr` -> REVIEW_NEEDED (honest), but the chapter is no longer hard-blocked.
+Test: TestRecoveredCropDoesNotBlockLock.

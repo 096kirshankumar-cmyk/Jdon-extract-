@@ -534,3 +534,40 @@ class TestFinalRerunReachesBlockedChapters(unittest.TestCase):
         self.assertNotIn("OPH-011", done)
         self.assertIn("OPH-007", done)   # not a recoverable kind -> not re-run
         self.assertIn("OPH-001", done)   # clean -> untouched
+
+
+class TestRecoveredCropDoesNotBlockLock(unittest.TestCase):
+    """RUN-53 (OPH-013 live): OCR recovery succeeded but the chapter stayed
+    BLOCKER phase_unresolved because a blocking 'unresolved' note was appended
+    even on success, and _ledger_lock refuses on ANY note containing
+    'unresolved'. A successful recovery must leave only a non-blocking note;
+    the recovered rows stay _ocr -> REVIEW_NEEDED."""
+
+    def _runner(self):
+        r = bph.ChapterRunner.__new__(bph.ChapterRunner)
+        r.chapter_id = "OPH-013"; r.subject = "OPH"; r.chapter_no = 13
+        r.pdf = "unused.pdf"; r.notes = []; r.ledger_rows = []
+        r.orphan_items = []; r._missing_qnos = []; r._printed_q_max = None
+        return r
+
+    def test_successful_recovery_leaves_no_blocking_note(self):
+        r = self._runner()
+        r._call_crops = _raise_blocked
+        r._ocr_fallback = lambda *a, **k: [dict(Q18_OCR_ITEM)]
+        iv = {"n": 18, "start_page": 306, "end_page": 307,
+              "strips": [{"page": 306, "y_hi": 700.0, "y_lo": 400.0}]}
+        out = r._gemini_crop_batch([iv], bph.QUESTION_PROMPT, "Question", "Q", 130)
+        self.assertEqual([it["_qn"] for it in out], [18])
+        self.assertFalse(any("unresolved" in n for n in r.notes),
+                         f"blocking note left despite recovery: {r.notes}")
+
+    def test_failed_recovery_still_blocks(self):
+        r = self._runner()
+        r._call_crops = _raise_blocked
+        r._ocr_fallback = lambda *a, **k: []
+        iv = {"n": 18, "start_page": 306, "end_page": 307,
+              "strips": [{"page": 306, "y_hi": 700.0, "y_lo": 400.0}]}
+        out = r._gemini_crop_batch([iv], bph.QUESTION_PROMPT, "Question", "Q", 130)
+        self.assertEqual(out, [])
+        self.assertTrue(any("unresolved" in n for n in r.notes),
+                        f"no blocking note on failed recovery: {r.notes}")

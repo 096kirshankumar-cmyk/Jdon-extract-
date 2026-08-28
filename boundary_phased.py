@@ -1377,8 +1377,17 @@ class ChapterRunner:
                 self._ledger(pass_name, [iv["start_page"] for iv in batch],
                              qp.PASS_STATUS_UNRESOLVED, 0,
                              "model blocked on crop")
-                self.notes.append(f"{pass_name} crop unresolved (blocked)")
-                items = self._crop_ocr_recovery(batch, p, label, pass_name)
+                recovered = self._crop_ocr_recovery(batch, p, label, pass_name)
+                if recovered:
+                    # RUN-53: recovery succeeded -> the items are _ocr
+                    # (REVIEW_NEEDED), NOT a hard block. A blocking
+                    # "unresolved" note here would make _ledger_lock refuse
+                    # the chapter even though q18 was recovered (OPH-013 live:
+                    # 'Q crop unresolved (blocked)' despite OCR recovery).
+                    items = recovered
+                else:
+                    self.notes.append(f"{pass_name} crop unresolved (blocked)")
+                    items = None
                 break
             items = _unwrap_items(_parse_json(raw))
             if isinstance(items, list):
@@ -2565,8 +2574,6 @@ class ChapterRunner:
                 self._ledger(f"REASK_{phase_name[0]}", chunk,
                              qp.PASS_STATUS_UNRESOLVED, 0,
                              "model blocked (recitation/safety), retried once")
-                self.notes.append(f"{phase_name} re-ask unresolved: model "
-                                  f"blocked pages {chunk[0]}-{chunk[-1]}")
                 # RUN-49: the re-ask used to be the LAST resort, so a page the
                 # recitation filter refuses twice was simply never extracted
                 # (OPH-013 q18 -> 'koi row nahi mili'). Give the re-ask the
@@ -2583,6 +2590,11 @@ class ChapterRunner:
                         f"({type(ocr_e).__name__}: {ocr_e}) -- left missing "
                         f"rather than shipped as a guess")
                 if not ocr_fixed:
+                    # RUN-53: only a FAILED recovery is a blocking unresolved
+                    # note; a successful one must not keep the chapter locked
+                    # out (the recovered rows are _ocr -> REVIEW_NEEDED).
+                    self.notes.append(f"{phase_name} re-ask unresolved: model "
+                                      f"blocked pages {chunk[0]}-{chunk[-1]}")
                     continue
                 self.notes.append(
                     f"{phase_name} re-ask: model blocked the page IMAGE -> "
