@@ -1669,6 +1669,12 @@ _PAGE_FURNITURE_RES = (
     re.compile(r"(?i)^\s*(?:\u00a9|\(c\))?\s*marrow\s*$"),
 )
 _BARE_PAGE_NO_RE = re.compile(r"^\s*\d{1,4}\s*$")
+# RUN-55 (external-audit idea, made safe): the reseller stamp also appears
+# INLINE inside a content line ("Middle cerebral artery 6 Sold by @itachibot
+# PRunebdinn IN"), which the whole-line rules never see. The stamp is never
+# real content, so strip it inline. Bone-"marrow" IS content, so the publisher
+# mark stays whole-line-only.
+_INLINE_STAMP_RE = re.compile(r"(?i)\s*\d{0,4}\s*sold\s+by\s+@\S+")
 
 
 def strip_page_furniture(text):
@@ -1695,8 +1701,15 @@ def strip_page_furniture(text):
     src = text or ""
     if not src.strip():
         return src, 0
+    # RUN-55: strip INLINE reseller stamps first ("... 6 Sold by @itachibot
+    # ..."). They sit inside a content line so the whole-line rules never see
+    # them, and the stamp is never real content. Collapses the leftover space.
+    src, n_inline = _INLINE_STAMP_RE.subn(" ", src)
+    if n_inline:
+        src = re.sub(r"[ \t]{2,}", " ", src)
     lines = src.split("\n")
     keep, dropped = [], 0
+    dropped += n_inline
     # RUN-41: drop LEADING bare page-number line(s) -- crop-top residue from
     # a footer sitting under a bottom-of-page header. Only lines before any
     # real content qualify; a lone digit line anywhere later is ambiguous
@@ -1895,7 +1908,11 @@ def build_final_question(subject, chapter_id, chapter_no, q_no, rec, image_files
     # populated by the deterministic option geometry; the per-option "images"
     # array already existed in the schema (hardcoded [] before) -- now filled.
     opt_imgs = image_files.get("option") or {}
-    option_rows = [{"id": str(k).strip().upper(), "text": v,
+    # RUN-55: options previously went out as-is, so an inline reseller stamp
+    # ("... 6 Sold by @itachibot ...") shipped inside option text and read as
+    # garbage / bad_options. Clean each option with the same furniture stripper.
+    option_rows = [{"id": str(k).strip().upper(),
+                    "text": strip_page_furniture(str(v or ""))[0],
                     "images": valid_images(opt_imgs.get(str(k).strip().upper(), []), "option")}
                    for k, v in (rec["options"] or {}).items()]
     # A missing option must remain missing.  The previous release copied the

@@ -445,3 +445,15 @@ Fix: `if not opt_toks: return None` in _overlap_letter -- with no option text
 there is nothing to compare, so no mismatch; the row keeps its bad_options
 REVIEW flag instead of taking the chapter down.
 Test: TestBlankOptionsDoNotCrashChapter.
+
+---
+
+# RUN-55 (2026-08-28) — from the 2nd external audit: strip INLINE reseller stamps
+
+The audit's full rewrite was rejected (toy mocked pipeline, breaks the JSON
+contract, deletes safety layers). ONE safe idea extracted: the "Sold by
+@itachibot" stamp also appears INLINE inside content lines (its docstring even
+quoted "q9 option D ... Sold by @itachibot ..."), which whole-line rules never
+see, and options went out as-is. Added _INLINE_STAMP_RE (sold-by only -- bone
+"marrow" is content and stays) to strip_page_furniture, and options are now
+cleaned with it in build_final_question. Test: TestInlineWatermarkStripped.

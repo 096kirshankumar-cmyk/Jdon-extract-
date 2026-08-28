@@ -599,3 +599,29 @@ class TestBlankOptionsDoNotCrashChapter(unittest.TestCase):
         # extracted C but solution verbatim-names option A -> flip flagged
         self.assertIsNotNone(
             qp._answer_option_mismatch(rec, "C", option_rows))
+
+
+class TestInlineWatermarkStripped(unittest.TestCase):
+    """RUN-55 (external-audit idea, made safe): inline 'Sold by @...' stamps
+    inside a content line are never real content and must be stripped from
+    stem/options/solution; bone-'marrow' (real content) must NOT be touched."""
+
+    def test_inline_stamp_removed_content_kept(self):
+        import qbank_pipeline as qp
+        cleaned, n = qp.strip_page_furniture(
+            "Middle cerebral artery 6 Sold by @itachibot PRunebdinn IN")
+        self.assertNotIn("sold by", cleaned.lower())
+        self.assertIn("Middle cerebral artery", cleaned)
+        self.assertGreaterEqual(n, 1)
+
+    def test_whole_line_stamp_still_removed(self):
+        import qbank_pipeline as qp
+        cleaned, n = qp.strip_page_furniture("some text\n12 Sold by @itachibot")
+        self.assertNotIn("sold by", cleaned.lower())
+        self.assertIn("some text", cleaned)
+
+    def test_bone_marrow_not_removed(self):
+        import qbank_pipeline as qp
+        cleaned, n = qp.strip_page_furniture(
+            "bone marrow transplantation is indicated")
+        self.assertIn("marrow", cleaned.lower())
