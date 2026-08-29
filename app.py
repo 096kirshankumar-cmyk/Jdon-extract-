@@ -4,8 +4,9 @@ PDF Fixer dashboard (Railway).
 
 A tiny Flask app that does exactly one job: clean a garbled medical MCQ PDF
 before any extraction runs.  It uploads a PDF, runs fix_pdf.py in the
-background (watermark removal + forced-OCR text-layer rebuild), streams the
-live log, and serves the final CLEAN PDF plus the watermark-free intermediate.
+background (watermark removal; OCR text-layer rebuild is OPTIONAL and off by
+default), streams the live log, and serves the final CLEAN PDF plus the
+watermark-free intermediate.
 
 There is no JSON/QBank/Gemini/quota/date code here.  All PDF work lives in
 fix_pdf.py, which runs as a subprocess per job so a hung OCR run can be
@@ -122,6 +123,13 @@ def _spawn(job: dict) -> None:
         cmd.append("--clean")
     else:
         cmd.append("--no-clean")
+    # DEFAULT: watermark removal only (--ocr off).  OCR re-renders every page
+    # and usually produces a much larger, less accurate file on low-DPI
+    # uploads, so it must be an explicit user choice.
+    if job["ocr"]:
+        cmd.append("--ocr")
+    else:
+        cmd.append("--skip-ocr")
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -254,7 +262,8 @@ def _job_public(job: dict, with_log: bool = True) -> dict:
         "error": job["error"],
         "size_mb": job["size_mb"],
         "options": {k: job[k] for k in
-                    ("language", "jobs", "output_type", "deskew", "clean")},
+                    ("language", "jobs", "output_type", "deskew", "clean",
+                     "ocr")},
         "has_output": job["output_path"].exists(),
         "has_step1": job["step1_path"].exists(),
     }
@@ -329,8 +338,13 @@ def upload():
         "language": request.form.get("language", "eng+hin"),
         "jobs": max(1, min(16, int(request.form.get("jobs", str(DEFAULT_JOBS)) or DEFAULT_JOBS))),
         "output_type": request.form.get("output_type", OUT_TYPE_DEFAULT),
-        "deskew": request.form.get("deskew", "on") != "off",
-        "clean": request.form.get("clean", "on") != "off",
+        # NOTE: an UNCHECKED checkbox is simply absent from the form data, so
+        # the default for absent fields must be "off" (checked boxes in the
+        # template send "on").  clean/ocr are unchecked by default; deskew is
+        # checked by default and therefore normally present.
+        "deskew": request.form.get("deskew", "off") != "off",
+        "clean": request.form.get("clean", "off") == "on",
+        "ocr": request.form.get("ocr", "off") == "on",
         "samples": request.form.get("samples", "1,50,100,200,300"),
     }
     if options["language"] not in ("eng+hin", "eng"):
@@ -490,8 +504,9 @@ PAGE_TEMPLATE = r"""
 <body>
 <div class="wrap">
   <h1>📄 PDF Fixer</h1>
-  <div class="sub">Watermark removal + forced-OCR text layer rebuild
-    (MARROW-style garbled PDFs) — no JSON/QBank pipeline here.</div>
+  <div class="sub">Watermark removal (page content, images &amp; size stay
+    like the upload). OCR text layer = optional extra — no JSON/QBank pipeline
+    here.</div>
 
   {% if upload_error %}<div class="err">⚠ {{ upload_error }}</div>{% endif %}
 
@@ -499,7 +514,13 @@ PAGE_TEMPLATE = r"""
     <form method="post" action="/upload" enctype="multipart/form-data">
       <label>PDF file (max {{ max_upload_mb }} MB)</label>
       <input type="file" name="pdf" accept="application/pdf,.pdf" required>
-      <div class="row">
+      <div class="checks">
+        <label style="font-weight:600"><input type="checkbox" name="ocr"> Rebuild text layer with OCR
+          <span class="muted">(optional — re-renders pages, so the text layer
+          is replaced and the file gets much bigger; on low-DPI files the
+          words can be wrong. Off by default.)</span></label>
+      </div>
+      <div class="row" id="ocrow">
         <div><label>OCR language</label>
           <select name="language">
             <option value="eng+hin" selected>English + Hindi</option>
@@ -520,8 +541,10 @@ PAGE_TEMPLATE = r"""
         <label><input type="checkbox" name="clean"> Clean scan artifacts
           <span class="muted">(memory-heavy, off by default)</span></label>
       </div>
-      <p class="muted">Tip: on small Railway plans use <b>Jobs = 1</b>,
-        <b>Clean OFF</b> and <b>Output PDF</b> to avoid out-of-memory kills.</p>
+      <p class="muted">Tip: default keeps images, figures and file size like
+        your upload. Only when <b>OCR is ON</b>, on small Railway plans use
+        <b>Jobs = 1</b>, <b>Clean OFF</b> and <b>Output PDF</b> to avoid
+        out-of-memory kills.</p>
       <button class="btn" type="submit">Upload &amp; Fix PDF</button>
     </form>
   </div>
@@ -574,7 +597,8 @@ async function poll() {
     if (!r.ok) return;
     const j = await r.json();
     const st = document.getElementById('jobstatus');
-    const stmap = {queued:'⏳ queued', running:'🔄 fixing (OCR in progress)…',
+    const stmap = {queued:'⏳ queued',
+                   running:'🔄 fixing' + (j.options && j.options.ocr ? ' (OCR ON)…' : ' (watermark removal)…'),
                    done:'✅ done', error:'❌ error', cancelled:'✕ cancelled'};
     st.textContent = (stmap[j.status] || j.status) +
       (j.size_mb ? ` — clean PDF ${j.size_mb} MB` : '');

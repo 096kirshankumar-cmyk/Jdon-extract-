@@ -6,7 +6,7 @@ fix_pdf.py
 Pre-process a garbled medical MCQ PDF (MARROW ED8 series) before the extraction
 pipeline runs.
 
-Two problems are fixed, strictly in this order:
+One problem is fixed by default (OCR is an optional extra):
 
   STEP 1  Remove the full-page "Sold by @itachibot" watermark with PyMuPDF.
           The watermark is a /Image XObject that appears on >=90% of all pages
@@ -17,20 +17,23 @@ Two problems are fixed, strictly in this order:
           "@itachibot") are removed from the content streams.
           Intermediate output: step1_no_watermark.pdf
 
-  STEP 2  Rebuild a clean, searchable text layer with OCRmyPDF using --force-ocr
-          (the broken text layer / ToUnicode CMaps are ignored, the pixels are
-          re-OCRed).  If OCRmyPDF cannot run, fall back to
-          pytesseract + reportlab (rendered page image + invisible text layer).
+  STEP 2  OPTIONAL - rebuild a searchable text layer with OCRmyPDF
+          (--force-ocr).  OFF by default: OCR re-renders every page at high
+          DPI, so the output becomes many times larger than the upload, and
+          on low-DPI scans (e.g. iLovePDF-compressed files at ~55 DPI) the
+          recognized words are often wrong.  If OCR is disabled, the final
+          PDF is exactly the watermark-free original (visuals + size like
+          the upload).  Enable with --ocr (or the dashboard checkbox).
 
-  STEP 3  Verify the output: pdftotext sample pages contain readable text, no
-          watermark strings, and a summary is printed.
+  STEP 3  Verify the output: pdftotext sample pages + watermark strings scan;
+          in OCR mode readability is checked too.  A summary is printed.
 
 Usage
 -----
-    python3 fix_pdf.py /data/input_pdfs/OPH.pdf
-    python3 fix_pdf.py OPH.pdf --language eng          # Hindi pack missing
-    python3 fix_pdf.py OPH.pdf --skip-ocr              # only step 1
-    python3 fix_pdf.py OPH.pdf --jobs 4 --keep-intermediate
+    python3 fix_pdf.py /data/input_pdfs/OPH.pdf          # watermark removal only
+    python3 fix_pdf.py OPH.pdf --ocr                     # add OCR text layer
+    python3 fix_pdf.py OPH.pdf --ocr --language eng      # Hindi pack missing
+    python3 fix_pdf.py OPH.pdf --skip-ocr                # same as default
 
 Output
 ------
@@ -1268,7 +1271,16 @@ def page_quality(text: str) -> tuple[float, float, int]:
     return good / total, garbage / max(1, total), len(words)
 
 
-def verify_output(pdf_path: Path, sample_pages, language: str, tag: str) -> dict:
+def verify_output(pdf_path: Path, sample_pages, language: str, tag: str,
+                  check_quality: bool = True) -> dict:
+    """
+    Verify an output PDF.
+
+    check_quality=True  (OCR mode): sample pages must contain readable text.
+    check_quality=False (no-OCR mode): the ORIGINAL text layer is kept, which
+      may be garbled (broken ToUnicode CMaps) - do NOT judge readability, only
+      confirm the watermark strings are gone.
+    """
     try:
         from pypdf import PdfReader
         total = len(PdfReader(str(pdf_path)).pages)
@@ -1288,12 +1300,17 @@ def verify_output(pdf_path: Path, sample_pages, language: str, tag: str) -> dict
         read, garb, words = page_quality(text)
         wm = len(WATERMARK_TEXT_RE.findall(text))
         watermark_hits += wm
-        bad = garb > 0.05 or read < 0.55 or words < 5
+        bad = (check_quality and (garb > 0.05 or read < 0.55 or words < 5))
         if bad:
             bad_samples += 1
+        tag_flags = []
+        if check_quality and bad:
+            tag_flags.append("BAD")
+        if wm:
+            tag_flags.append("WATERMARK")
         print(f"  page {pno:>4}: readable {read:.0%}, garbage {garb:.2%}, "
               f"words {words}, watermark hits {wm}  "
-              f"[{'BAD' if bad or wm else 'ok'}]")
+              f"[{', '.join(tag_flags) if tag_flags else 'ok'}]")
         samp = Path(tempfile.gettempdir()) / f"fix_pdf_sample_p{pno}.txt"
         samp.write_text(text, encoding="utf-8")
         results.append({"page": pno, "readable": read, "garbage": garb,
@@ -1316,7 +1333,7 @@ def verify_output(pdf_path: Path, sample_pages, language: str, tag: str) -> dict
     full_hits = len(WATERMARK_TEXT_RE.findall(full or ""))
 
     ok = (seen_any and watermark_hits == 0 and full_hits == 0
-          and bad_samples == 0)
+          and (bad_samples == 0 or not check_quality))
     return {"pages": total, "language": language, "ok": ok,
             "sample": results, "full_watermark_hits": full_hits,
             "bad_samples": bad_samples,
@@ -1358,8 +1375,15 @@ def parse_args(argv=None):
     p.add_argument("--no-clean", dest="clean", action="store_false")
     p.add_argument("--fallback-dpi", type=int, default=200,
                    help="render DPI for the pytesseract fallback (default 200)")
+    p.add_argument("--ocr", action="store_true", default=False,
+                   help="rebuild the text layer with OCR (DEFAULT is OFF: "
+                        "watermark removal only, so the output keeps the "
+                        "original page content, looks identical to the upload "
+                        "and stays near the original size.  OCR is only useful "
+                        "for high-resolution scans; on low-DPI files it "
+                        "produces inaccurate text and a much larger file)")
     p.add_argument("--skip-ocr", action="store_true",
-                   help="stop after step 1 (no OCR)")
+                   help="stop after step 1 (same as leaving --ocr off)")
     p.add_argument("--keep-intermediate", action="store_true", default=True,
                    help="keep step1_no_watermark.pdf (default)")
     p.add_argument("--remove-intermediate", dest="keep_intermediate",
@@ -1404,7 +1428,7 @@ def main(argv=None) -> int:
         step1 = inp.parent / "step1_no_watermark.pdf"
 
     print("=" * 78)
-    print("FIX_PDF  -  watermark removal + OCR text layer rebuild")
+    print("FIX_PDF  -  watermark removal (OCR text layer optional, off by default)")
     print(f"input   : {inp}")
     print(f"output  : {out}")
     print("=" * 78)
@@ -1422,17 +1446,46 @@ def main(argv=None) -> int:
     with fitz.open(step1) as chk:
         ok1 = verify_step1(chk, wm_xrefs, "step1")
     if not ok1:
-        print("[warn] step1 verification found residue; continuing with OCR "
-              "(the OCR output is checked again at the end)", file=sys.stderr)
+        print("[warn] step1 verification found residue; see log", file=sys.stderr)
 
-    if args.skip_ocr:
-        size_mid = step1.stat().st_size
+    sample_pages = []
+    for s in args.samples.split(","):
+        s = s.strip()
+        if s.isdigit():
+            sample_pages.append(int(s))
+
+    run_ocr = args.ocr and not args.skip_ocr
+
+    if not run_ocr:
+        # DEFAULT: watermark removal only.  The original pages (images,
+        # figures, layout) are kept exactly as in the upload - no re-render,
+        # no OCR - so the output is visually identical and similar in size.
+        print("[step2] OCR skipped (default). The output keeps the original "
+              "page content; only the watermark was removed.")
+        shutil.copyfile(step1, out)
+        size_after = out.stat().st_size
+        res = verify_output(out, sample_pages, "none (no OCR)", "final",
+                            check_quality=False)
+        elapsed = time.time() - t_start
         print("=" * 78)
-        print(f"SUMMARY (skip-ocr): input {size_before / 1e6:.1f} MB -> "
-              f"step1 {size_mid / 1e6:.1f} MB; OCR skipped")
-        print(f"  intermediate : {step1}")
+        print("SUMMARY")
+        print(f"  total pages             : {res['pages']}")
+        print(f"  OCR                     : skipped (watermark removal only)")
+        print(f"  file size before/after  : {size_before / 1e6:.1f} MB -> "
+              f"{size_after / 1e6:.1f} MB  (upload-like size)")
+        print(f"  watermark strings found : {res['full_watermark_hits']}  "
+              f"(target 0)")
+        print(f"  elapsed                 : {elapsed:.0f}s")
+        print(f"  output                  : {out}")
+        print(f"  intermediate            : {step1}")
+        verdict = "PASS" if res["ok"] and res["full_watermark_hits"] == 0 else "FAIL"
+        print(f"  VERDICT                 : {verdict}")
         print("=" * 78)
-        return 0
+        print("Note: no searchable text layer was added (the original broken "
+              "text layer is untouched - copy/search may still show garbage). "
+              "Use --ocr if you really need OCR text; OCR re-renders pages at "
+              "high DPI (much larger file) and is inaccurate on low-DPI scans.")
+        return 0 if verdict == "PASS" else 1
 
     # --------------------------------------------------------------- step 2
     language = args.language
@@ -1457,12 +1510,8 @@ def main(argv=None) -> int:
 
     # --------------------------------------------------------------- step 3
     size_after = out.stat().st_size
-    sample_pages = []
-    for s in args.samples.split(","):
-        s = s.strip()
-        if s.isdigit():
-            sample_pages.append(int(s))
-    res = verify_output(out, sample_pages, language, "final")
+    res = verify_output(out, sample_pages, language, "final",
+                        check_quality=True)
 
     if not args.keep_intermediate:
         step1.unlink(missing_ok=True)
@@ -1473,7 +1522,7 @@ def main(argv=None) -> int:
     print(f"  total pages             : {res['pages']}")
     print(f"  OCR engine / language   : {ocr_engine} / {res['language']}")
     print(f"  file size before/after  : {size_before / 1e6:.1f} MB -> "
-          f"{size_after / 1e6:.1f} MB")
+          f"{size_after / 1e6:.1f} MB  (OCR re-renders pages, hence larger)")
     print(f"  watermark strings found : {res['full_watermark_hits']}  "
           f"(target 0)")
     print(f"  bad sample pages        : {res['bad_samples']}  (target 0)")
