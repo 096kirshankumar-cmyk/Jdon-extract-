@@ -4,33 +4,26 @@ FROM python:3.11-slim
 # tzdata: today_stamp() stamps the quota day in US/Pacific to match Google's
 # RPD reset. Without the tz database zoneinfo raises and we fall back to a
 # fixed UTC-8 offset (safe, but an hour off during US DST).
-RUN apt-get update && apt-get install -y poppler-utils tesseract-ocr tzdata && rm -rf /var/lib/apt/lists/*
+# tesseract-ocr-hin: Hindi OCR pack for fix_pdf.py (--language eng+hin)
+# ghostscript: PDF/A conversion + ocrmypdf postprocessing
+# unpaper: optional, enables ocrmypdf --clean (scan artifact cleanup)
+RUN apt-get update && apt-get install -y \
+        poppler-utils tesseract-ocr tesseract-ocr-hin ghostscript unpaper tzdata \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Explicit siblings: a missing COPY is a ModuleNotFoundError at runtime
-# (Railway 2026-08-24: header_index / crop_parse were imported but not baked).
-COPY qbank_pipeline.py qbank_validator.py fix_output.py app.py split_outputs.py \
-     master_review_export.py gemini_keys.py review_digest.py review_queue.py \
-     flag_verifier.py boundary_phased.py header_index.py crop_parse.py FORMAT.md ./
-ENV PYTHONPATH=/app
-# PDFs get uploaded via the dashboard now, so no need to bake them into the image.
-# (If you'd rather pre-load them at build time, uncomment the next line and
-#  add a pdfs/ folder next to this Dockerfile.)
-# COPY pdfs/ ./pdfs/
-
-# V2: SEPARATE output root on the Railway Volume -- v1 data (/data/qbank_output)
-# stays untouched while v2 is being proven.
-ENV OUTPUT_DIR=/data/qbank_output_v2
-# Flush every print() immediately, otherwise Docker block-buffers stdout and
-# pipeline progress never shows up in Railway's Deploy Logs in real time.
+# PDF Fixer only -- no QBank/JSON pipeline code.
+COPY app.py fix_pdf.py ./
 ENV PYTHONUNBUFFERED=1
-
-# Container clock stays UTC; the quota day is computed in US/Pacific by
-# today_stamp(). Override only if Google moves the reset boundary.
-ENV QUOTA_RESET_TZ=America/Los_Angeles
+# Job directories (uploaded PDF + clean output) live on the Railway Volume.
+ENV PDF_FIX_JOBS_DIR=/data/pdf_fix_jobs
+# Max OCR processes running at once (each job = one fix_pdf.py subprocess).
+ENV PDF_FIX_MAX_CONCURRENT=2
+# Keep this many finished job folders on disk.
+ENV PDF_FIX_MAX_JOB_KEEP=20
 
 EXPOSE 8080
 # Gunicorn avoids Flask's development-server warning and is safe for Railway.

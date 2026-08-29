@@ -1,8 +1,12 @@
+# PDF Fixer (watermark removal + forced-OCR text layer rebuild).
 # Bounded versions keep Railway builds reproducible while allowing security fixes.
-pypdf>=5.0,<7
-Pillow>=10.0,<12
-google-generativeai>=0.8.5,<0.9
 Flask>=3.0,<4
 gunicorn>=22,<24
-requests>=2.31,<3
+pypdf>=5.0,<7
+Pillow>=10.0,<12
 pytesseract>=0.3,<0.4
+# fix_pdf.py: watermark removal (PyMuPDF) + forced-OCR text layer rebuild (OCRmyPDF)
+PyMuPDF>=1.24,<2
+ocrmypdf>=16,<18
+# reportlab is the pytesseract fallback renderer used by fix_pdf.py
+reportlab>=4.0,<5
