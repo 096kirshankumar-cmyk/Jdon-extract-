@@ -84,7 +84,10 @@ FORM_SUBTYPE = "/Form"
 
 _WS = b" \t\r\n\f\x00"
 _DELIM = b"()<>[]{}/%"
-_HEXVAL = {c: v for v, c in enumerate(b"0123456789abcdefABCDEF")}
+# NOTE: must map each hex char to its TRUE value (A/a -> 10 ... F/f -> 15).
+# A naive enumeration over "0123456789abcdefABCDEF" maps 'A' to 16, which
+# turns <FF> into byte 256 -> "byte must be in range(0, 256)".
+_HEXVAL = {ord(c): int(c, 16) for c in "0123456789abcdefABCDEF"}
 _ESCAPED = {
     ord("n"): b"\n",
     ord("r"): b"\r",
@@ -179,7 +182,7 @@ def _parse_hex_string(data: bytes, i: int) -> tuple[bytes, int]:
 
 _NUM_RE = re.compile(rb"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$")
 _INLINE_EI_RE = re.compile(rb"[ \t\r\n\f]EI[ \t\r\n\f\x00]")
-_INLINE_EI_RE2 = re.compile(rb"(?<![A-Za-z0-9])EI[ \t\r\n\f\x00]")
+_INLINE_EI_RE2 = re.compile(rb"(?<![A-Za-z0-9])EI(?![A-Za-z0-9])")
 
 
 def tokenize(data: bytes) -> list[tuple]:
@@ -547,7 +550,7 @@ def patch_data(
         stats.unparsed_streams += 1
         print(f"  [warn] content stream not parsed ({exc}); left untouched",
               file=sys.stderr)
-        return data
+        return data, False
 
     ops = parse_operators(tokens)
     remove_ops: set[int] = set()
@@ -588,6 +591,7 @@ def patch_data(
                     stats.dropped_text_ops += 1
 
     # patch referenced forms first (they may contain the watermark)
+    forms_ok = True
     for fx in sorted(forms_to_patch):
         if fx in forms_done:
             continue
@@ -596,18 +600,22 @@ def patch_data(
             old = doc.xref_stream(fx)
         except Exception:
             stats.unparsed_streams += 1
+            forms_ok = False
             continue
         fx_map = get_xobject_map(doc, fx)
-        new = patch_data(doc, old, fx_map, watermark_xrefs, stats, forms_done)
+        new, ok = patch_data(doc, old, fx_map, watermark_xrefs, stats,
+                             forms_done)
+        if not ok:
+            forms_ok = False
         if new != old:
             try:
                 doc.update_stream(fx, new)
                 stats.forms_patched += 1
             except Exception:
-                pass
+                forms_ok = False
 
     if not remove_ops:
-        return data
+        return data, forms_ok
 
     lines: list[bytes] = []
     for idx, (operands, op) in enumerate(ops):
@@ -623,22 +631,29 @@ def patch_data(
             pieces.append(serialize_token(op))
         if pieces:
             lines.append(b" ".join(pieces))
-    return b"\n".join(lines) if lines else b""
+    return (b"\n".join(lines) if lines else b""), forms_ok
 
 
 def patch_page(doc, page, watermark_xrefs: set[int], stats: PatchStats,
-               forms_done: set[int]) -> None:
-    """Patch one page's /Contents (and any forms it uses)."""
+               forms_done: set[int]) -> bool:
+    """
+    Patch one page's /Contents (and any forms it uses).
+
+    Returns True when the page was parsed completely (i.e. we KNOW no
+    watermark draw remains), False when a stream could not be parsed and the
+    page may still draw the watermark (caller must then neutralize the object).
+    """
     data = page.read_contents()
     if not data:
-        return
+        return True
     xo_map = get_xobject_map(doc, page.xref)
-    new = patch_data(doc, data, xo_map, watermark_xrefs, stats, forms_done)
+    new, ok = patch_data(doc, data, xo_map, watermark_xrefs, stats, forms_done)
     if new != data:
         xref = doc.get_new_xref()
         doc.update_object(xref, "<< /Length 0 >>")
         doc.update_stream(xref, new)
         doc.xref_set_key(page.xref, "Contents", f"{xref} 0 R")
+    return ok
 
 
 def neutralize_image_object(doc, page, xref: int, stats: PatchStats) -> None:
@@ -660,31 +675,57 @@ def neutralize_image_object(doc, page, xref: int, stats: PatchStats) -> None:
 
 def redact_watermark_text(doc, page, stats: PatchStats) -> int:
     """
-    Fallback for encodings the byte-level scan cannot decode: find text spans
-    in the extracted text layer that contain watermark strings and redact
-    exactly those rectangles (text only - images and line art are preserved).
+    Fallback for encodings the byte-level scan cannot decode (and for streams
+    that MuPDF can still extract text from but rawdict cannot): find the
+    watermark strings with MuPDF's own text search and redact exactly those
+    rectangles (text only - images and line art are preserved).
     """
-    rects = []
+    rects: list[fitz.Rect] = []
+    # 1) rawdict spans (precise per-span rects)
     try:
         raw = page.get_text("rawdict")
+        for block in raw.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    if WATERMARK_TEXT_RE.search(span.get("text", "") or ""):
+                        rects.append(fitz.Rect(span["bbox"]))
     except Exception:
-        return 0
-    for block in raw.get("blocks", []):
-        if block.get("type") != 0:
-            continue
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                if WATERMARK_TEXT_RE.search(span.get("text", "") or ""):
-                    rects.append(fitz.Rect(span["bbox"]))
+        rects = []
+    # 2) MuPDF text search - works even when rawdict spans are empty.
+    # Longest needle first, so "Sold by@itachibot" wins over its substrings
+    # and the "@" between them is covered (no visual leftovers).
+    if not rects:
+        for needle in ("Sold by@itachibot", "itachibot", "Sold by"):
+            try:
+                for r in page.search_for(needle):
+                    if not any(fitz.Rect(r).intersects(x) for x in rects):
+                        rects.append(fitz.Rect(r))
+            except Exception:
+                continue
+    # 3) last resort: word boxes containing the pattern
+    if not rects:
+        try:
+            for w in page.get_text("words"):
+                if WATERMARK_TEXT_RE.search(w[4]):
+                    rects.append(fitz.Rect(w[:4]))
+        except Exception:
+            pass
+
     for r in rects:
         page.add_redact_annot(r)
     if rects:
-        page.apply_redactions(
-            images=fitz.PDF_REDACT_IMAGE_NONE,
-            graphics=fitz.PDF_REDACT_LINE_ART_NONE,
-            text=fitz.PDF_REDACT_TEXT_REMOVE,
-        )
-        stats.redaction_fallbacks += 1
+        try:
+            page.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_NONE,
+                graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                text=fitz.PDF_REDACT_TEXT_REMOVE,
+            )
+            stats.redaction_fallbacks += 1
+        except Exception as exc:
+            print(f"  [warn] redaction failed on a page: {exc}", file=sys.stderr)
+            return 0
     return len(rects)
 
 
@@ -820,26 +861,40 @@ def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStat
     watermark_set = set(an.candidates)
     forms_done: set[int] = set()
     t0 = time.time()
+    # "dirty" = we could not prove the watermark draw is gone (parse failure
+    # on the page or on a Form it uses).  NOTE: we never trust get_image_rects
+    # here - PyMuPDF caches per-page image info, so it keeps answering with
+    # stale rects after an in-place content swap.
+    dirty: list[int] = []
     for pno, page in enumerate(pages):
         try:
-            patch_page(doc, page, watermark_set, stats, forms_done)
+            ok = patch_page(doc, page, watermark_set, stats, forms_done)
+            if not ok:
+                dirty.append(pno + 1)
         except Exception as exc:
+            dirty.append(pno + 1)
             print(f"  [warn] page {pno + 1}: content patch failed: {exc}",
                   file=sys.stderr)
-        # re-load the page so MuPDF's image cache does not hide leftover draws
-        try:
-            doc.reload_page(page)
-        except Exception:
-            pass
-        # safety net: any watermark image still drawn -> neutralize the object
-        for xref in watermark_set:
-            try:
-                if page.get_image_rects(xref):
-                    neutralize_image_object(doc, page, xref, stats)
-            except Exception:
-                pass
         if (pno + 1) % PROGRESS_EVERY == 0:
             print(f"[step1] processed page {pno + 1}/{n}  -  {stats.summary()}")
+
+    # GUARANTEED visual removal: if any page's stream could not be parsed, we
+    # cannot be sure the watermark draw is gone, so replace the watermark
+    # image OBJECT with a fully transparent image.  This is object-level (one
+    # call), so EVERY page referencing it - including unparsed streams -
+    # paints nothing.  Use a freshly loaded page object (never a stale one).
+    if dirty:
+        print(f"[step1] safeguard: replacing watermark image object(s) with "
+              f"transparent (ambiguous page(s): {sorted(set(dirty))})")
+        for xref in watermark_set:
+            try:
+                neutralize_image_object(doc, doc[0], xref, stats)
+            except Exception as exc:
+                print(f"  [warn] could not neutralize image xref {xref}: {exc}",
+                      file=sys.stderr)
+    else:
+        print("[step1] all watermark draws removed surgically; no object "
+              "replacement needed")
 
     # text-layer fallback for exotic font encodings
     print("[step1] checking text layer for residual watermark strings ...")
@@ -956,6 +1011,21 @@ def run_ocrmypdf(in_pdf: Path, out_pdf: Path, args) -> tuple[str, bool]:
     language = "+".join(requested)
     print(f"[step2] OCR language: {language}")
 
+    # --- memory safety ---------------------------------------------------
+    # OCRmyPDF runs `jobs` tesseract processes concurrently; each one renders
+    # a full page at ~300 DPI and Leptonica keeps several pixmap copies, so
+    # 4 jobs easily exceed a 512 MB Railway container -> the kernel OOM-kills
+    # the process (exit code -9).  Clamp to the available CPUs and 1 OpenMP
+    # thread per tesseract process.
+    cpu = max(1, os.cpu_count() or 1)
+    jobs = max(1, min(args.jobs, cpu))
+    if jobs != args.jobs:
+        print(f"[step2] jobs clamped from {args.jobs} to {jobs} "
+              f"(CPU count {cpu}, memory safety)")
+    os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+    if os.environ.get("OMP_THREAD_LIMIT") == "1":
+        print("[step2] OMP_THREAD_LIMIT=1 (one thread per tesseract process)")
+
     gs_ok = shutil.which("gs") is not None
     unpaper_ok = shutil.which("unpaper") is not None
     if args.output_type == "pdfa" and not gs_ok:
@@ -966,7 +1036,7 @@ def run_ocrmypdf(in_pdf: Path, out_pdf: Path, args) -> tuple[str, bool]:
     kwargs = dict(
         language=requested,
         force_ocr=True,
-        jobs=args.jobs,
+        jobs=jobs,
         deskew=args.deskew,
         output_type=output_type,
         progress_bar=True,
@@ -980,7 +1050,7 @@ def run_ocrmypdf(in_pdf: Path, out_pdf: Path, args) -> tuple[str, bool]:
     t0 = time.time()
     try:
         print(f"[step2] ocrmypdf: force-ocr, language={language}, "
-              f"jobs={args.jobs}, deskew={args.deskew}, "
+              f"jobs={jobs}, deskew={args.deskew}, "
               f"clean={kwargs.get('clean', False)}, output-type={output_type}  "
               f"({in_pdf.name} -> {out_pdf.name})")
         rc = ocrmypdf.ocr(str(in_pdf), str(tmp_out),
@@ -1273,19 +1343,21 @@ def parse_args(argv=None):
                         "(default: <input dir>/step1_no_watermark.pdf)")
     p.add_argument("--language", default="eng+hin",
                    help="OCR languages, '+' separated (default eng+hin)")
-    p.add_argument("--jobs", type=int, default=4,
-                   help="parallel OCR jobs (default 4)")
+    p.add_argument("--jobs", type=int, default=1,
+                   help="parallel OCR jobs (default 1 - safest for small "
+                        "Railway containers; higher values need more RAM)")
     p.add_argument("--output-type", default="pdfa",
                    choices=["pdfa", "pdf"],
                    help="ocrmypdf output type (default pdfa; needs ghostscript)")
     p.add_argument("--deskew", action="store_true", default=True,
                    help="deskew pages before OCR (default on)")
     p.add_argument("--no-deskew", dest="deskew", action="store_false")
-    p.add_argument("--clean", action="store_true", default=True,
-                   help="clean scans with unpaper before OCR (default on)")
+    p.add_argument("--clean", action="store_true", default=False,
+                   help="remove scan artifacts with unpaper before OCR "
+                        "(default off - unpaper is memory-heavy)")
     p.add_argument("--no-clean", dest="clean", action="store_false")
-    p.add_argument("--fallback-dpi", type=int, default=300,
-                   help="render DPI for the pytesseract fallback (default 300)")
+    p.add_argument("--fallback-dpi", type=int, default=200,
+                   help="render DPI for the pytesseract fallback (default 200)")
     p.add_argument("--skip-ocr", action="store_true",
                    help="stop after step 1 (no OCR)")
     p.add_argument("--keep-intermediate", action="store_true", default=True,

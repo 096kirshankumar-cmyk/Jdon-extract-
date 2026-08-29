@@ -38,12 +38,19 @@ _REPO_ROOT = Path(__file__).resolve().parent
 FIX_SCRIPT = _REPO_ROOT / "fix_pdf.py"
 
 JOBS_DIR = Path(os.environ.get("PDF_FIX_JOBS_DIR", "./pdf_fix_jobs")).resolve()
-MAX_CONCURRENT = max(1, int(os.environ.get("PDF_FIX_MAX_CONCURRENT", "2")))
+MAX_CONCURRENT = max(1, int(os.environ.get("PDF_FIX_MAX_CONCURRENT", "1")))
 MAX_JOB_KEEP = max(1, int(os.environ.get("PDF_FIX_MAX_JOB_KEEP", "20")))
 MAX_UPLOAD_MB = int(os.environ.get("PDF_FIX_MAX_UPLOAD_MB", "200"))
+DEFAULT_JOBS = max(1, min(8, int(os.environ.get("PDF_FIX_OCR_JOBS", "1"))))
+OUT_TYPE_DEFAULT = os.environ.get("PDF_FIX_OUTPUT_TYPE", "pdfa")
+if OUT_TYPE_DEFAULT not in ("pdfa", "pdf"):
+    OUT_TYPE_DEFAULT = "pdfa"
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+# make DEFAULT_JOBS / OUT_TYPE_DEFAULT available inside the page template
+app.jinja_env.globals["DEFAULT_JOBS"] = DEFAULT_JOBS
+app.jinja_env.globals["OUT_TYPE_DEFAULT"] = OUT_TYPE_DEFAULT
 
 # --------------------------------------------------------------------------
 # Job state (in-memory; single gunicorn worker)
@@ -157,6 +164,17 @@ def _spawn(job: dict) -> None:
                     job["size_mb"] = round(job["output_path"].stat().st_size / 1e6, 2)
                     _append_log(job, f"DONE: {job['output_path']}"
                                      f" ({job['size_mb']} MB)")
+                elif rc < 0:
+                    # negative code = killed by a signal (-9 = SIGKILL, the
+                    # classic out-of-memory killer)
+                    job["status"] = "error"
+                    job["error"] = (
+                        f"fix_pdf.py was killed by signal {-rc} "
+                        f"({'-9' if rc == -9 else ''} - almost always "
+                        f"OUT OF MEMORY on small Railway plans). "
+                        f"Retry with: Jobs = 1, 'Clean' OFF, Output type = PDF."
+                    )
+                    _append_log(job, f"ERROR: {job['error']}")
                 else:
                     job["status"] = "error"
                     job["error"] = (f"fix_pdf.py exited with code {rc}; "
@@ -309,8 +327,8 @@ def upload():
 
     options = {
         "language": request.form.get("language", "eng+hin"),
-        "jobs": max(1, min(16, int(request.form.get("jobs", "4") or 4))),
-        "output_type": request.form.get("output_type", "pdfa"),
+        "jobs": max(1, min(16, int(request.form.get("jobs", str(DEFAULT_JOBS)) or DEFAULT_JOBS))),
+        "output_type": request.form.get("output_type", OUT_TYPE_DEFAULT),
         "deskew": request.form.get("deskew", "on") != "off",
         "clean": request.form.get("clean", "on") != "off",
         "samples": request.form.get("samples", "1,50,100,200,300"),
@@ -487,20 +505,23 @@ PAGE_TEMPLATE = r"""
             <option value="eng+hin" selected>English + Hindi</option>
             <option value="eng">English only</option>
           </select></div>
-        <div><label>Parallel OCR jobs</label>
+        <div><label>Parallel OCR jobs <span class="muted">(1 = safest)</span></label>
           <select name="jobs">
-            {% for n in [1,2,3,4,6,8] %}<option value="{{ n }}" {% if n==4 %}selected{% endif %}>{{ n }}</option>{% endfor %}
+            {% for n in [1,2,3,4,6,8] %}<option value="{{ n }}" {% if n==DEFAULT_JOBS %}selected{% endif %}>{{ n }}</option>{% endfor %}
           </select></div>
         <div><label>Output type</label>
           <select name="output_type">
-            <option value="pdfa" selected>PDF/A (needs ghostscript)</option>
-            <option value="pdf">PDF</option>
+            <option value="pdfa" {% if OUT_TYPE_DEFAULT=='pdfa' %}selected{% endif %}>PDF/A (needs ghostscript)</option>
+            <option value="pdf" {% if OUT_TYPE_DEFAULT=='pdf' %}selected{% endif %}>PDF</option>
           </select></div>
       </div>
       <div class="checks">
         <label><input type="checkbox" name="deskew" checked> Deskew pages</label>
-        <label><input type="checkbox" name="clean" checked> Clean scan artifacts</label>
+        <label><input type="checkbox" name="clean"> Clean scan artifacts
+          <span class="muted">(memory-heavy, off by default)</span></label>
       </div>
+      <p class="muted">Tip: on small Railway plans use <b>Jobs = 1</b>,
+        <b>Clean OFF</b> and <b>Output PDF</b> to avoid out-of-memory kills.</p>
       <button class="btn" type="submit">Upload &amp; Fix PDF</button>
     </form>
   </div>

@@ -42,9 +42,17 @@ take the web worker down. Job output is stored in `PDF_FIX_JOBS_DIR`
 |---|---|---|
 | `PORT` | `8080` | listen port (set by Railway) |
 | `PDF_FIX_JOBS_DIR` | `/data/pdf_fix_jobs` | job workspace root |
-| `PDF_FIX_MAX_CONCURRENT` | `2` | max parallel OCR jobs |
+| `PDF_FIX_MAX_CONCURRENT` | `1` | max parallel OCR jobs (keep 1 on small plans) |
 | `PDF_FIX_MAX_JOB_KEEP` | `20` | job folders kept on disk |
 | `PDF_FIX_MAX_UPLOAD_MB` | `200` | upload size cap |
+| `PDF_FIX_OCR_JOBS` | `1` | default tesseract workers per job (clamped to CPU count) |
+| `PDF_FIX_OUTPUT_TYPE` | `pdfa` | default output type (`pdfa` or `pdf`) |
+
+> **Memory:** OCR is RAM-hungry. On 512 MB Railway plans keep
+> `PDF_FIX_MAX_CONCURRENT=1`, `PDF_FIX_OCR_JOBS=1`, leave "Clean" unchecked
+> and use `PDF_FIX_OUTPUT_TYPE=pdf` if you see `exit code -9` (the kernel's
+> out-of-memory kill). The app also sets `OMP_THREAD_LIMIT=1` so every
+> tesseract process uses one thread.
 
 ## CLI (outside the dashboard)
 

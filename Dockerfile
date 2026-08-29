@@ -21,7 +21,12 @@ ENV PYTHONUNBUFFERED=1
 # Job directories (uploaded PDF + clean output) live on the Railway Volume.
 ENV PDF_FIX_JOBS_DIR=/data/pdf_fix_jobs
 # Max OCR processes running at once (each job = one fix_pdf.py subprocess).
-ENV PDF_FIX_MAX_CONCURRENT=2
+# Keep at 1 on small plans: OCR is RAM-hungry and 2 concurrent runs on a
+# 512 MB container get OOM-killed (SIGKILL / exit code -9).
+ENV PDF_FIX_MAX_CONCURRENT=1
+# OCRmyPDF default jobs (bounded internally by CPU count; 1 is the safe
+# default and can be raised from the dashboard drop-down).
+ENV PDF_FIX_OCR_JOBS=1
 # Keep this many finished job folders on disk.
 ENV PDF_FIX_MAX_JOB_KEEP=20
 
