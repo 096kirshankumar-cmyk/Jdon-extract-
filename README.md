@@ -9,6 +9,11 @@ default, and one thing optionally:
 1. **Removes the full-page "Sold by @itachibot" watermark** (image + text)
    — pages are kept exactly as uploaded (no re-render, no re-encode), so the
    output is visually identical and stays near the original file size.
+   Detection treats **all full-page image variants together**: the same
+   watermark is often stored as several pixel variants (e.g. one variant on
+   82% of pages and another on 18%), so every full-page variant whose page
+   union covers ≥90% of the file is removed as one watermark family, while
+   small figures and one-off full-page images are left untouched.
 2. **OPTIONAL — rebuilds the broken text layer with OCR**
    (`ocrmypdf --force-ocr`, English + Hindi). **Off by default**: OCR
    re-renders every page at high DPI, so the file is typically many times

@@ -8,13 +8,15 @@ pipeline runs.
 
 One problem is fixed by default (OCR is an optional extra):
 
-  STEP 1  Remove the full-page "Sold by @itachibot" watermark with PyMuPDF.
-          The watermark is a /Image XObject that appears on >=90% of all pages
-          and covers >=80% of page width/height.  Every invocation of that
-          XObject is removed from the content streams (through Form XObjects
-          too), any invocation that survives is neutralized as a safety net,
-          and the watermark's text instances ("Sold by", "itachibot",
-          "@itachibot") are removed from the content streams.
+  STEP 1  Remove the full-page watermark image with PyMuPDF.
+          The watermark is one or more /Image XObject variants (same physical
+          watermark rendered with different rotations/pixels across pages).
+          All full-page variants together cover >=90% of all pages at >=80%
+          page width/height.  Every invocation of those XObjects is removed
+          from the content streams (through Form XObjects too), any invocation
+          that survives is neutralized as a safety net, and the watermark's
+          text instances ("Sold by", "itachibot", "@itachibot") are removed
+          from the content streams.
           Intermediate output: step1_no_watermark.pdf
 
   STEP 2  OPTIONAL - rebuild a searchable text layer with OCRmyPDF
@@ -80,6 +82,13 @@ READABLE_RE = re.compile(
 
 IMAGE_SUBTYPE = "/Image"
 FORM_SUBTYPE = "/Form"
+
+# Watermark detection thresholds
+WATERMARK_COVER_MIN = 0.80  # median min(w,h) page coverage of a group
+WATERMARK_FREQ_MIN = 0.90   # union page coverage of the watermark family
+# A full-page-cover image seen on fewer pages than this is a one-off figure,
+# never part of the watermark family (protects legitimate full-page images).
+MIN_FULLPAGE_PAGES = 3
 
 # --------------------------------------------------------------------------
 # PDF content-stream tokenizer (minimal, safe)
@@ -765,9 +774,18 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
 
     Images are grouped by pixel digest (not by xref): some PDF generators use
     one shared XObject, others embed a copy of the image on every page, and a
-    digest group catches both.  A group is a watermark when it is drawn on
-    >=90% of all pages and covers >=80% of page width/height (median of the
-    min(w,h) ratio).  All xrefs in a qualifying group are removed surgically.
+    digest group catches both.
+
+    A WATERMARK FAMILY = all image groups that cover >=80% of page width and
+    height (median of the min(w,h) ratio) and together appear on >=90% of all
+    pages.  One physical watermark is often stored as SEVERAL pixel variants
+    (different rotation, slightly different raster) - e.g. variant A on 82% of
+    pages and variant B on 18% - so neither digest alone reaches >=90%, but
+    the union covers every page.  All variants of the family are removed
+    surgically; the same rule also catches the classic single-variant case.
+
+    Groups that only appear on a couple of pages (MIN_FULLPAGE_PAGES) are
+    treated as one-off full-page figures and never removed.
     """
     an = WatermarkAnalysis()
     an.total_pages = len(pages)
@@ -819,14 +837,39 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
         if (pno + 1) % PROGRESS_EVERY == 0:
             print(f"[step1] analyzed images on page {pno + 1}/{len(pages)}")
 
+    def cover_of(g: WatermarkGroup) -> float:
+        return statistics.median(g.cover) if g.cover else 0.0
+
     an.groups = list(groups_by_digest.values())
     an.groups.sort(key=lambda g: -len(g.pages))
-    for g in an.groups:
-        freq = len(g.pages) / max(1, an.total_pages)
-        med = statistics.median(g.cover) if g.cover else 0.0
-        if freq >= 0.90 and med >= 0.80:
-            an.candidate_groups.append(g)
-            an.candidates.extend(sorted(g.xrefs))
+
+    # full-page-cover groups (a legit figure never covers >=80% of a page
+    # body; the watermark does, in every variant)
+    full_page = [g for g in an.groups
+                 if cover_of(g) >= WATERMARK_COVER_MIN
+                 and len(g.pages) >= MIN_FULLPAGE_PAGES]
+    union_pages: set[int] = set()
+    for g in full_page:
+        union_pages |= g.pages
+    union_freq = len(union_pages) / max(1, an.total_pages)
+
+    if union_freq >= WATERMARK_FREQ_MIN:
+        # GOLDEN RULE: the full-page family covers >=90% of all pages.
+        an.candidate_groups = full_page
+        if len(full_page) > 1:
+            print(f"[step1] watermark FAMILY: {len(full_page)} full-page image "
+                  f"variant(s) together cover {len(union_pages)}/{an.total_pages} "
+                  f"pages ({union_freq:.0%}) - treating all as one watermark")
+    else:
+        # fallback: strict single-group rule (a single variant on >=90% of
+        # pages, even if no other full-page variant exists)
+        an.candidate_groups = [
+            g for g in an.groups
+            if len(g.pages) / max(1, an.total_pages) >= WATERMARK_FREQ_MIN
+            and cover_of(g) >= WATERMARK_COVER_MIN
+        ]
+    for g in an.candidate_groups:
+        an.candidates.extend(sorted(g.xrefs))
     an.candidates = sorted(set(an.candidates))
     return an
 
@@ -854,7 +897,9 @@ def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStat
         doc.close()
         raise RuntimeError(
             "no candidate watermark XObject found "
-            "(need >=90% page frequency and >=80% width/height coverage). "
+            f"(need a full-page image family covering >=90% of all pages at "
+            f">={WATERMARK_COVER_MIN:.0%} page coverage, or a single image on "
+            f">={WATERMARK_FREQ_MIN:.0%} of pages). "
             "Inspect the report above; refusing to proceed so no figure is damaged."
         )
     print(f"[step1] watermark XObject(s) detected: {an.candidates} "
