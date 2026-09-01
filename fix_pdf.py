@@ -27,10 +27,19 @@ One problem is fixed by default (OCR is an optional extra):
               repeated on >=90% of pages that is rotated (diagonal), large or
               known, and same-position text families (wording may differ per
               page) redacted at their exact bbox.
+            * raster-baked watermarks: image-only books (one full-page bitmap
+              per page, no vector content) whose watermark is burned INTO the
+              pixels - a per-pixel consensus mask finds a light-gray overlay
+              at the same normalized position on >=75% of sampled pages; only
+              those pixels (within the band, carved away from solid gray
+              figures/columns and dark content) are filled with the page's
+              paper tone and the image is re-encoded as JPEG.  Pages without
+              a consistent pattern are refused untouched.
           Legitimate content is protected: small corner logos, one-off
           figures, page numbers and header/footer furniture stay untouched,
-          and image-only scanned pages are never touched (refused with a
-          clear message).  Intermediate output: step1_no_watermark.pdf
+          and image-only scanned pages without a provable watermark are
+          refused with a clear message (never damaged).
+          Intermediate output: step1_no_watermark.pdf
 
   STEP 2  OPTIONAL - rebuild a searchable text layer with OCRmyPDF
           (--force-ocr).  OFF by default: OCR re-renders every page at high
@@ -151,8 +160,52 @@ OVERLAY_GRAY_MIN = 0.60     # share of gray-light sampled images
 OVERLAY_GRAY_SAMPLES = 24   # images decoded for the gray-light check
 # (e) text-position family: ANY text span occupying the same (rotated, or
 #     large) region on >=90% of pages is a watermark even when the wording
-#     differs per page (stamps with page numbers etc.)
-TEXT_POS_ROUND = 2          # percent rounding for position grouping
+#     differs per page (stamps with page numbers etc.).  Grouping is by the
+#     span's TOP-LEFT POSITION ONLY (5% cells) - width/height must not be in
+#     the key because the wording length changes the bbox size per page.
+TEXT_POS_ROUND = 20         # position cells per axis (5% buckets)
+# (f) RASTER watermark mode: some books are pure rasters (one full-page image
+#     per page, zero vector content) and the watermark is BAKED into the
+#     bitmap.  We then look for a consistent light-gray overlay across pages
+#     (same normalized pixel is neutral-gray on >=75% of sampled pages) and
+#     erase only those pixels (filled with the page's paper tone) inside the
+#     page images.  Pages are never re-rendered; only watermark pixels change.
+RASTER_UNION_MIN = 0.98      # full-page images must cover >=98% of pages
+RASTER_VISIBLE_MAX = 0.10    # visible vector content must be < 10% of pages
+RASTER_CANVAS = (480, 640)   # normalized canvas (w, h) for the mask
+RASTER_SAMPLE_MAX = 48       # pages sampled for the consistency mask
+RASTER_OBS_MIN = 8           # min pages observing a pixel
+RASTER_FRAC_MIN = 0.75       # pixel must be in the gray band on >=75%
+RASTER_NEUTRAL_MAX = 10.0    # max per-pixel channel spread (near-neutral)
+# ADAPTIVE gray band: a stamp is 20-110 luminance below the page's paper tone
+# (median luminance), clamped to 120-250.  A plain gray paper background
+# (240-252) stays OUT of the band, so scans with grayish paper still work.
+RASTER_BG_GAP_LO = 20.0
+RASTER_BG_GAP_HI = 110.0
+RASTER_LUM_LO, RASTER_LUM_HI = 120.0, 250.0
+# furniture protection: a mask living almost entirely in the top/bottom 10%
+# margin band is a running head / footer, not a watermark
+RASTER_FURN_MARGIN = 0.10
+RASTER_FURN_FRAC = 0.85
+# a small page-number/footer stamp is below the minimum
+RASTER_AREA_MIN, RASTER_AREA_MAX = 0.0015, 0.08  # mask must be small
+RASTER_LINE_FULL = 0.92      # fully-marked rows/cols = frames -> excluded
+# solid-block protection: any mask region whose 13x13 neighbourhood is fully
+# in the mask is a solid object (gray figure, side column) - NEVER erase it.
+RASTER_SOLID_BOX = 6
+RASTER_SOLID_DILATE = 8
+# anti-aliased text edges hug DARK content pixels; a watermark does not.
+# exclusion radius around consensus-dark pixels
+RASTER_DARK_LUM = 120.0
+RASTER_DARK_FRAC_MIN = 0.5
+RASTER_DARK_DILATE = 3
+# at ERASE time the band is widened (halo pixels) and pixels are filled with
+# the page's PAPER TONE (not pure white) so nothing is visible on grayish scans
+RASTER_ERASE_GAP = 4.0      # erase almost up to the paper tone
+RASTER_ERASE_NEUTRAL = 12.0
+RASTER_ERASE_DILATE = 2     # pixel rings added around the consensus mask
+RASTER_ERASE_LUM_LO = 110.0
+RASTER_JPEG_QUALITY = 88     # re-encode quality for erased images
 
 # --------------------------------------------------------------------------
 # PDF content-stream tokenizer (minimal, safe)
@@ -695,6 +748,7 @@ class PatchStats:
         self.neutralized_images = 0
         self.redaction_fallbacks = 0
         self.redacted_spans = 0
+        self.raster_erased = 0          # page images whose pixels were cleaned
         self.unparsed_streams = 0
 
     def summary(self) -> str:
@@ -705,6 +759,7 @@ class PatchStats:
             f"{self.dropped_text_ops} watermark text ops, "
             f"neutralized {self.neutralized_images} image object(s), "
             f"{self.redacted_spans} redacted span(s), "
+            f"raster-cleaned {self.raster_erased} page image(s), "
             f"{self.unparsed_streams} stream(s) skipped"
         )
 
@@ -1028,6 +1083,7 @@ class WatermarkAnalysis:
         # overlay-family diagnostics + per-page redaction boxes
         self.fullpage_draws = 0
         self.fullpage_pages: set[int] = set()
+        self.fullpage_xrefs: dict[int, list[int]] = {}
         self.fullpage_rotated = 0
         self.visible_content_pages: set[int] = set()
         self.gray_sampled = 0
@@ -1173,6 +1229,8 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
             if ratio >= WATERMARK_COVER_MIN:
                 an.fullpage_draws += 1
                 an.fullpage_pages.add(pno)
+                if xref and xref > 0:
+                    an.fullpage_xrefs.setdefault(pno, []).append(xref)
                 if rotated_draw:
                     an.fullpage_rotated += 1
                     g.rotated_draws += 1
@@ -1282,12 +1340,12 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
                         tg.area = max(tg.area, area)
                         tg.rotated = tg.rotated or bool(rotated)
                     # text-POSITION family: same region on many pages even if
-                    # wording differs (stamp with page number, etc.)
+                    # wording differs (stamp with page number, etc.).
+                    # Key = top-left position in 5% cells ONLY (width/height
+                    # change with the wording length and would split pages).
                     pq = (bool(rotated),
-                          round(bbox.x0 / pw * 100 / TEXT_POS_ROUND),
-                          round(bbox.y0 / ph * 100 / TEXT_POS_ROUND),
-                          round(bbox.width / pw * 100 / TEXT_POS_ROUND),
-                          round(bbox.height / ph * 100 / TEXT_POS_ROUND))
+                          int(bbox.x0 / pw * TEXT_POS_ROUND),
+                          int(bbox.y0 / ph * TEXT_POS_ROUND))
                     nrect = (bbox.x0 / pw, bbox.y0 / ph,
                              bbox.width / pw, bbox.height / ph)
                     pk = pos_by_key.get(pq)
@@ -1446,9 +1504,10 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
     # Stamps often vary per page ("... - page 123") so identical-span matching
     # misses them.  ANY span occupying the same rotated (or large) region on
     # >=90% of pages is redacted at its exact bbox on every page.
-    for (rotated, _qx, _qy, _qw, _qh), (pages_d, boxes, sample, area,
-                                        rot_sig, nrect) in pos_by_key.items():
-        frac = len(pages_d) / max(1, an.total_pages)
+    for (rotated, _qx, _qy), (pages_d, boxes, sample, area,
+                              rot_sig, nrect) in pos_by_key.items():
+        # NOTE: pages_d is {"pages": set(...)} - use the SET, not len(dict)
+        frac = len(pages_d["pages"]) / max(1, an.total_pages)
         known_hit = any(n in sample for n in known)
         if frac < TEXT_MIN_PAGES and not known_hit:
             continue
@@ -1499,6 +1558,257 @@ def _parse_bbox(value: str):
     return None
 
 
+# --------------------------------------------------------------------------
+# RASTER watermark mode (watermark baked into per-page bitmaps)
+# --------------------------------------------------------------------------
+
+def _decode_image_rgb(doc, xref: int):
+    """Decode an image XObject to an (H, W, 3) uint8 array (RGB)."""
+    try:
+        import numpy as np
+        pix = None
+        try:
+            pix = fitz.Pixmap(doc, xref)
+            if pix.alpha:
+                pix = fitz.Pixmap(fitz.csRGB, pix, alpha=False)
+            if pix.colorspace is None or pix.colorspace.n > 3:
+                pix = fitz.Pixmap(fitz.csRGB, pix)
+            if pix.n < 3:
+                pix = fitz.Pixmap(fitz.csRGB, pix)
+            arr = np.frombuffer(pix.samples, dtype=np.uint8)
+            arr = arr.reshape(pix.height, pix.width, pix.n)[:, :, :3].copy()
+            return arr
+        finally:
+            try:
+                del pix
+            except Exception:
+                pass
+    except Exception:
+        return None
+
+
+def _gray_band(arr) -> "object":
+    """Boolean mask of near-neutral light-gray pixels (watermark band).
+
+    The band is ADAPTIVE: it sits RASTER_BG_GAP_LO..RASTER_BG_GAP_HI below
+    the page's paper tone (median luminance), clamped to
+    RASTER_LUM_LO..RASTER_LUM_HI.  A grayish paper background is therefore
+    OUT of the band while a real stamp (20-110 levels darker) is IN it.
+    """
+    try:
+        import numpy as np
+        a = arr.astype(np.float32)
+        mx = a.max(axis=2)
+        mn = a.min(axis=2)
+        lum = a.mean(axis=2)
+        bg = float(np.median(lum))
+        lo = max(RASTER_LUM_LO, bg - RASTER_BG_GAP_HI)
+        hi = min(RASTER_LUM_HI, bg - RASTER_BG_GAP_LO)
+        band = ((mx - mn) <= RASTER_NEUTRAL_MAX) & \
+               (lum >= lo) & (lum <= hi)
+        return band
+    except Exception:
+        return None
+
+
+def _solid_blocks(mask):
+    """
+    Solid objects (gray figure, side column, footer bar) inside the mask:
+    pixels whose 13x13 neighbourhood is entirely in the mask, dilated so the
+    WHOLE block (not just its core) is covered.  Returns a bool mask.
+    """
+    try:
+        import numpy as np
+        from PIL import Image, ImageFilter
+    except ImportError:
+        return mask.copy()
+    r = RASTER_SOLID_BOX
+    m = (mask * 255).astype(np.uint8)
+    blur = np.asarray(Image.fromarray(m).filter(
+        ImageFilter.BoxBlur(r))).astype(np.float32) / 255.0
+    solid = blur >= 0.995
+    return _dilate_binary(solid, RASTER_SOLID_DILATE)
+
+
+def _dilate_binary(a, d: int):
+    """Binary dilation with wrapped-edge handling (cheap numpy shifts)."""
+    try:
+        import numpy as np
+    except ImportError:
+        return a
+    o = a.copy()
+    for dy in range(-d, d + 1):
+        for dx in range(-d, d + 1):
+            if dy == 0 and dx == 0:
+                continue
+            sh = np.roll(np.roll(a, dy, 0), dx, 1)
+            if dy > 0:
+                sh[:dy, :] = False
+            elif dy < 0:
+                sh[dy:, :] = False
+            if dx > 0:
+                sh[:, :dx] = False
+            elif dx < 0:
+                sh[:, dx:] = False
+            o |= sh
+    return o
+
+
+def _build_raster_watermark_mask(doc, an):
+    """
+    Build a normalized watermark mask for a pure-raster book.
+
+    The same physical watermark sits at (roughly) the same normalized
+    position on every page, so its pixels are neutral-gray in the band on
+    >=75% of the sampled pages, while page CONTENT differs per page.
+    Solid same-position gray objects (figures, side columns) are carved out
+    so they are never erased.  Returns a bool (H, W) canvas mask or None when
+    no consistent overlay is found (or when the candidate would be too
+    large/small - i.e. probably a frame, a gray column or a plain scan).
+    """
+    try:
+        import numpy as np
+        from PIL import Image
+    except ImportError:
+        return None
+    cw, ch = RASTER_CANVAS
+    acc = obs = dacc = None
+    used = 0
+    for pno in sorted(an.fullpage_pages)[:RASTER_SAMPLE_MAX]:
+        xrefs = an.fullpage_xrefs.get(pno)
+        if not xrefs:
+            continue
+        rgb = _decode_image_rgb(doc, xrefs[0])
+        if rgb is None:
+            continue
+        img = Image.fromarray(rgb).resize((cw, ch), Image.BILINEAR)
+        a = np.asarray(img).astype(np.float32)
+        band = _gray_band(a)
+        dark = a.mean(axis=2) < RASTER_DARK_LUM
+        if band is None:
+            continue
+        if acc is None:
+            acc = np.zeros((ch, cw), dtype=np.uint32)
+            obs = np.zeros((ch, cw), dtype=np.uint32)
+            dacc = np.zeros((ch, cw), dtype=np.uint32)
+        acc += band.astype(np.uint32)
+        dacc += dark.astype(np.uint32)
+        obs += 1
+        used += 1
+    if used < RASTER_OBS_MIN:
+        return None
+    frac = acc / np.maximum(obs, 1)
+    mask = (frac >= RASTER_FRAC_MIN) & (obs >= RASTER_OBS_MIN)
+    # exclude frame/border lines that span the page fully
+    row_full = mask.mean(axis=1) > RASTER_LINE_FULL
+    col_full = mask.mean(axis=0) > RASTER_LINE_FULL
+    mask &= ~row_full[:, None]
+    mask &= ~col_full[None, :]
+    # anti-aliased text edges hug dark content on every page (headers, body):
+    # exclude anything near consensus-dark pixels - a watermark is NOT
+    # adjacent to dark content.
+    dark_frac = dacc / np.maximum(obs, 1)
+    near_dark = _dilate_binary(dark_frac >= RASTER_DARK_FRAC_MIN,
+                               RASTER_DARK_DILATE)
+    mask &= ~near_dark
+    # carve out solid objects (gray figures/columns) - they are content
+    solid = _solid_blocks(mask)
+    if solid.any():
+        mask &= ~solid
+    # running heads / footers live in the top/bottom margin band - never
+    # erase page furniture
+    fm = int(ch * RASTER_FURN_MARGIN)
+    if mask.sum():
+        margin_frac = (mask[:fm].sum() + mask[ch - fm:].sum()) / mask.sum()
+        if margin_frac >= RASTER_FURN_FRAC:
+            return None
+    area = mask.sum() / mask.size
+    if not (RASTER_AREA_MIN <= area <= RASTER_AREA_MAX):
+        return None
+    return mask
+
+
+def _erase_raster_page(doc, pno, fullpage_xrefs, mask, stats) -> bool:
+    """Erase watermark pixels inside one page image (band-limited, then
+    re-encode as JPEG).  Returns True on success."""
+    try:
+        import numpy as np
+        from PIL import Image
+        import io
+    except ImportError:
+        return False
+    xrefs = fullpage_xrefs.get(pno)
+    if not xrefs:
+        return False
+    # erase every full-page image on the page: whatever the draw order, each
+    # gets the same small band-limited mask (content pixels stay untouched)
+    erased = False
+    for xref in xrefs:
+        if _erase_one_image(doc, xref, mask, stats):
+            erased = True
+    return erased
+
+
+def _erase_one_image(doc, xref, mask, stats) -> bool:
+    """Apply the raster mask to one image XObject (band-limited erase +
+    JPEG re-encode)."""
+    try:
+        import numpy as np
+        from PIL import Image
+        import io
+    except ImportError:
+        return False
+    rgb = _decode_image_rgb(doc, xref)
+    if rgb is None:
+        return False
+    h, w = rgb.shape[:2]
+    up = np.asarray(Image.fromarray((mask * 255).astype(np.uint8))
+                    .resize((w, h), Image.NEAREST)) > 0
+    a = rgb.astype(np.float32)
+    bg = float(np.median(a.mean(axis=2)))
+    # paper tone per channel (keeps the page's actual hue - yellowish scans
+    # stay yellowish, gray scans stay gray)
+    bg_rgb = np.array([float(np.median(a[:, :, c])) for c in range(3)])
+    mx = a.max(axis=2)
+    mn = a.min(axis=2)
+    lum = a.mean(axis=2)
+    # ERASE band is WIDER than the consensus band: the stroke halo (light
+    # anti-aliased pixels close to the paper tone) is caught too.
+    hi_erase = min(RASTER_LUM_HI, bg - RASTER_ERASE_GAP)
+    band = ((mx - mn) <= RASTER_ERASE_NEUTRAL) & \
+           (lum >= RASTER_ERASE_LUM_LO) & (lum <= hi_erase)
+    if band is None:
+        return False
+    up2 = _dilate_binary(up, RASTER_ERASE_DILATE)
+    erase = up2 & band
+    # second pass: thin strokes the consensus canvas may have dropped - any
+    # clearly-ink pixel (well below the paper tone) within a slightly wider
+    # reach of the mask is caught too
+    deep = ((mx - mn) <= RASTER_NEUTRAL_MAX) & \
+           (lum >= RASTER_ERASE_LUM_LO) & (lum <= bg - 30.0)
+    erase |= _dilate_binary(up, RASTER_ERASE_DILATE + 4) & deep
+    # fill with the page's PAPER TONE (median per channel) - invisible on
+    # grayish OR slightly-tinted scans
+    rgb[erase] = np.clip(np.round(bg_rgb), RASTER_ERASE_LUM_LO, 255) \
+        .astype(np.uint8)
+    img = Image.fromarray(rgb)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=RASTER_JPEG_QUALITY, subsampling=1)
+    data = buf.getvalue()
+    # NOTE: update_stream compresses with Flate by default - store RAW so the
+    # /DCTDecode filter matches the JPEG bytes.
+    doc.update_stream(xref, data, compress=0)
+    doc.xref_set_key(xref, "Filter", "/DCTDecode")
+    doc.xref_set_key(xref, "ColorSpace", "/DeviceRGB")
+    doc.xref_set_key(xref, "BitsPerComponent", "8")
+    try:
+        doc.xref_set_key(xref, "DecodeParms", "null")
+    except Exception:
+        pass
+    stats.raster_erased += 1
+    return True
+
+
 def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStats, list[int]]:
     print("[step1] opening", input_pdf)
     doc = fitz.open(input_pdf)
@@ -1525,28 +1835,50 @@ def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStat
         print(f"[step1] watermark INLINE image(s): "
               f"{len(an.inline_candidate_groups)} digest group(s)")
 
+    raster_mask = None
     nothing_found = not an.candidates and not an.form_candidates \
         and not an.inline_candidates and not an.text_detected \
         and not an.text_bboxes_by_page
     if nothing_found:
-        hint = ""
-        if an.scan_like:
-            hint = (" The file looks like an IMAGE-ONLY scan (full-page "
-                    "bitmaps with no vector content): a watermark there is "
-                    "burned into the raster and cannot be removed without "
-                    "re-rendering the page - this app never re-renders, so "
-                    "it refuses to damage the pages.")
-        doc.close()
-        raise RuntimeError(
-            "no candidate watermark found "
-            "(looked for: full-page image families, unique-per-page raster "
-            "overlays, same-position repeated images, full-page Form "
-            "XObjects, repeated inline images, repeated/known watermark text "
-            "and same-position text families)."
-            + hint +
-            " Inspect the report above; refusing to proceed so no figure is "
-            "damaged."
-        )
+        visible_frac = len(an.visible_content_pages) / max(1, an.total_pages)
+        union_frac = len(an.fullpage_pages) / max(1, an.total_pages)
+        if (union_frac >= RASTER_UNION_MIN
+                and visible_frac < RASTER_VISIBLE_MAX
+                and an.fullpage_xrefs):
+            # pure-raster book: watermark is baked into the bitmaps.  Try to
+            # find a consistent light-gray overlay and erase those pixels.
+            raster_mask = _build_raster_watermark_mask(doc, an)
+            if raster_mask is not None:
+                area = raster_mask.sum() / raster_mask.size
+                print(f"[step1] RASTER watermark found: consistent light-gray "
+                      f"overlay on {an.total_pages} pages "
+                      f"({area:.2%} of page area) - erasing watermark pixels "
+                      f"from the page images")
+            else:
+                doc.close()
+                raise RuntimeError(
+                    "no candidate watermark found; the file is an IMAGE-ONLY "
+                    "PDF (full-page bitmaps, no vector content) but NO "
+                    "consistent watermark pattern was found inside the page "
+                    "rasters - either the pages are clean or the watermark "
+                    "overlaps the content, so the app refuses to modify them."
+                )
+        else:
+            hint = ""
+            if an.scan_like:
+                hint = (" The file looks like an IMAGE-ONLY scan (full-page "
+                        "bitmaps with no vector content).")
+            doc.close()
+            raise RuntimeError(
+                "no candidate watermark found "
+                "(looked for: full-page image families, unique-per-page raster "
+                "overlays, same-position repeated images, full-page Form "
+                "XObjects, repeated inline images, repeated/known watermark text "
+                "and same-position text families)."
+                + hint +
+                " Inspect the report above; refusing to proceed so no figure is "
+                "damaged."
+            )
     if an.candidates:
         print(f"[step1] watermark XObject(s) detected: {an.candidates} "
               f"(content digest groups: {len(an.candidate_groups)})")
@@ -1569,40 +1901,53 @@ def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStat
     # here - PyMuPDF caches per-page image info, so it keeps answering with
     # stale rects after an in-place content swap.
     dirty: list[int] = []
-    for pno, page in enumerate(pages):
-        try:
-            ok = patch_page(doc, page, watermark_set, form_set,
-                            an.inline_candidates, an.text_needles, stats,
-                            forms_done)
-            if not ok:
-                dirty.append(pno + 1)
-        except Exception as exc:
-            dirty.append(pno + 1)
-            print(f"  [warn] page {pno + 1}: content patch failed: {exc}",
-                  file=sys.stderr)
-        # text-POSITION family: redact the exact watermark bbox (wording may
-        # differ per page, so byte-level needle removal cannot catch it)
-        pos_boxes = an.text_bboxes_by_page.get(pno, [])
-        if pos_boxes:
-            for r in pos_boxes:
-                try:
-                    page.add_redact_annot(r)
-                except Exception:
-                    pass
+
+    if raster_mask is not None:
+        # RASTER mode: erase the watermark pixels inside each page image.
+        for pno in range(len(pages)):
             try:
-                page.apply_redactions(
-                    images=fitz.PDF_REDACT_IMAGE_NONE,
-                    graphics=fitz.PDF_REDACT_LINE_ART_NONE,
-                    text=fitz.PDF_REDACT_TEXT_REMOVE,
-                )
-                stats.redacted_spans += len(pos_boxes)
-                if stats.redaction_fallbacks == 0:
-                    stats.redaction_fallbacks += 1
+                _erase_raster_page(doc, pno, an.fullpage_xrefs, raster_mask,
+                                   stats)
             except Exception as exc:
-                print(f"  [warn] page {pno + 1}: position redaction failed: "
-                      f"{exc}", file=sys.stderr)
-        if (pno + 1) % PROGRESS_EVERY == 0:
-            print(f"[step1] processed page {pno + 1}/{n}  -  {stats.summary()}")
+                print(f"  [warn] page {pno + 1}: raster erase failed: {exc}",
+                      file=sys.stderr)
+            if (pno + 1) % PROGRESS_EVERY == 0:
+                print(f"[step1] processed page {pno + 1}/{n}  -  {stats.summary()}")
+    else:
+        for pno, page in enumerate(pages):
+            try:
+                ok = patch_page(doc, page, watermark_set, form_set,
+                                an.inline_candidates, an.text_needles, stats,
+                                forms_done)
+                if not ok:
+                    dirty.append(pno + 1)
+            except Exception as exc:
+                dirty.append(pno + 1)
+                print(f"  [warn] page {pno + 1}: content patch failed: {exc}",
+                      file=sys.stderr)
+            # text-POSITION family: redact the exact watermark bbox (wording
+            # may differ per page, so byte-level needle removal cannot catch it)
+            pos_boxes = an.text_bboxes_by_page.get(pno, [])
+            if pos_boxes:
+                for r in pos_boxes:
+                    try:
+                        page.add_redact_annot(r)
+                    except Exception:
+                        pass
+                try:
+                    page.apply_redactions(
+                        images=fitz.PDF_REDACT_IMAGE_NONE,
+                        graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                        text=fitz.PDF_REDACT_TEXT_REMOVE,
+                    )
+                    stats.redacted_spans += len(pos_boxes)
+                    if stats.redaction_fallbacks == 0:
+                        stats.redaction_fallbacks += 1
+                except Exception as exc:
+                    print(f"  [warn] page {pno + 1}: position redaction failed: "
+                          f"{exc}", file=sys.stderr)
+            if (pno + 1) % PROGRESS_EVERY == 0:
+                print(f"[step1] processed page {pno + 1}/{n}  -  {stats.summary()}")
 
     # GUARANTEED visual removal: if any page's stream could not be parsed, we
     # cannot be sure the watermark draw is gone, so replace the watermark

@@ -4,6 +4,8 @@ Flask>=3.0,<4
 gunicorn>=22,<24
 pypdf>=5.0,<7
 Pillow>=10.0,<12
+# raster watermark erasure (numpy + PIL pixel processing)
+numpy>=1.24,<3
 pytesseract>=0.3,<0.4
 # fix_pdf.py: watermark removal (PyMuPDF) + forced-OCR text layer rebuild (OCRmyPDF)
 PyMuPDF>=1.24,<2

@@ -30,11 +30,17 @@ default, and one thing optionally:
      content streams and redacted visually. A same-**position** text family
      (same diagonal region on ≥90% of pages even when the wording differs,
      e.g. "… - page 123") is redacted at its exact bbox on every page.
+   - **raster-baked watermarks** — image-only books (one full-page bitmap
+     per page, no vector content) where the watermark is burned INTO the
+     pixels. The app builds a per-pixel consensus mask (same normalized
+     pixel is a light-gray overlay on ≥75% of sampled pages), carves out
+     solid gray figures/columns and anything next to dark content, then
+     fills those watermark pixels with the page's paper tone and re-encodes
+     the page image as JPEG (no geometry change, no re-render).
    Legitimate content is always protected: small corner logos, one-off
-   figures, page numbers and header/footer furniture stay untouched, and
-   **image-only scanned pages are never touched** (the app refuses with a
-   clear message instead of damaging a scan whose watermark is burned into
-   the bitmap).
+   figures, page numbers and header/footer furniture stay untouched, and an
+   image-only scan with **no provable watermark pattern** is refused with a
+   clear message instead of being damaged.
 2. **OPTIONAL — rebuilds the broken text layer with OCR**
    (`ocrmypdf --force-ocr`, English + Hindi). **Off by default**: OCR
    re-renders every page at high DPI, so the file is typically many times
