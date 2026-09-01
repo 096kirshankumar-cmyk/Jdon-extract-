@@ -99,6 +99,8 @@ DEFAULT_INPUT = "/data/input_pdfs/OPH.pdf"
 # "you purchased ..." watermarks are both caught.
 DEFAULT_WATERMARK_NEEDLES = [
     "itachibot",
+    "hackeddoctor",
+    "hacked doctor",
     "sold by",
     "you purchased",
     "you may not",
