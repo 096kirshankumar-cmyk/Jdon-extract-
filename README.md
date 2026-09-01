@@ -30,13 +30,16 @@ default, and one thing optionally:
      content streams and redacted visually. A same-**position** text family
      (same diagonal region on ≥90% of pages even when the wording differs,
      e.g. "… - page 123") is redacted at its exact bbox on every page.
-   - **raster-baked watermarks** — image-only books (one full-page bitmap
-     per page, no vector content) where the watermark is burned INTO the
-     pixels. The app builds a per-pixel consensus mask (same normalized
-     pixel is a light-gray overlay on ≥75% of sampled pages), carves out
-     solid gray figures/columns and anything next to dark content, then
-     fills those watermark pixels with the page's paper tone and re-encodes
-     the page image as JPEG (no geometry change, no re-render).
+   - **raster-baked watermarks** — when full-page bitmaps cover (almost)
+     every page and nothing else proves a removable object, the watermark is
+     likely burned INTO the pixels. The app builds a per-pixel consensus
+     mask (same normalized pixel is a light-gray overlay on ≥75% of sampled
+     pages), carves out solid gray figures/columns, dark content and margin
+     furniture, then fills those watermark pixels with the page's paper tone
+     and re-encodes the page image as JPEG (no geometry change, no
+     re-render). This also handles slide decks that keep a searchable or
+     invisible-OCR text layer mentioning the watermark ("@HACKEDDOCTOR"),
+     or pages with visible text on top of a background bitmap.
    Legitimate content is always protected: small corner logos, one-off
    figures, page numbers and header/footer furniture stay untouched, and an
    image-only scan with **no provable watermark pattern** is refused with a
