@@ -12,18 +12,25 @@ One problem is fixed by default (OCR is an optional extra):
           works for any book, not just the itachibot series):
             * full-page image XObject families (several pixel variants of the
               same watermark - e.g. 82% + 18% - are one family);
+            * unique-per-page raster overlays: tools that bake the watermark
+              into a NEW raster per page produce a 100%-coverage image per
+              page with different pixels; when they cover >=98% of pages AND
+              pages hold visible vector content AND the images are rotated or
+              light-gray, all of them are one watermark family;
             * same-position images repeated on >=90% of pages covering >=25%
               of the page area (banners);
             * full-page Form XObjects repeated on >=90% of pages (vector text
               / painted-band watermarks);
             * inline images (BI...ID...EI) repeated on pages;
             * known watermark text needles ("Sold by", "itachibot",
-              "you purchased", "not for distribution", ...) and any text span
+              "you purchased", "not for distribution", ...), any text span
               repeated on >=90% of pages that is rotated (diagonal), large or
-              known - removed from content streams and redacted visually.
+              known, and same-position text families (wording may differ per
+              page) redacted at their exact bbox.
           Legitimate content is protected: small corner logos, one-off
-          figures, page numbers and header/footer furniture stay untouched.
-          Intermediate output: step1_no_watermark.pdf
+          figures, page numbers and header/footer furniture stay untouched,
+          and image-only scanned pages are never touched (refused with a
+          clear message).  Intermediate output: step1_no_watermark.pdf
 
   STEP 2  OPTIONAL - rebuild a searchable text layer with OCRmyPDF
           (--force-ocr).  OFF by default: OCR re-renders every page at high
@@ -130,6 +137,22 @@ SAME_POS_TOL = 0.02          # normalized rect tolerance
 TEXT_MIN_PAGES = 0.90
 TEXT_MIN_AREA = 0.02
 TEXT_MARGIN = 0.08           # top/bottom 8% is "page furniture" zone
+# (d) unique-per-page raster overlay family: some tools burn the watermark
+#     into a NEW raster per page (different pixels every page), so no digest
+#     repeats.  When full-page images appear on (almost) every page, the page
+#     ALSO carries visible vector content (text/drawings - i.e. it is NOT a
+#     plain scan) and the overlay is rotated or light-gray, ALL full-page
+#     images are one watermark family.  A pure image-only (scanned) book is
+#     never touched.
+OVERLAY_UNION_MIN = 0.98    # full-page images must cover >=98% of pages
+OVERLAY_VISIBLE_MIN = 0.80  # >=80% of pages must have visible vector content
+OVERLAY_ROTATED_MIN = 0.50  # share of rotated full-page draws
+OVERLAY_GRAY_MIN = 0.60     # share of gray-light sampled images
+OVERLAY_GRAY_SAMPLES = 24   # images decoded for the gray-light check
+# (e) text-position family: ANY text span occupying the same (rotated, or
+#     large) region on >=90% of pages is a watermark even when the wording
+#     differs per page (stamps with page numbers etc.)
+TEXT_POS_ROUND = 2          # percent rounding for position grouping
 
 # --------------------------------------------------------------------------
 # PDF content-stream tokenizer (minimal, safe)
@@ -948,6 +971,7 @@ class WatermarkGroup:
         self.cover: list[float] = []       # best min(w,h) ratio per page
         self.areas: list[float] = []       # bbox area / page area
         self.rects: list[tuple] = []       # normalized bbox per page
+        self.rotated_draws = 0             # draws with a rotated CTM
         self.width = width
         self.height = height
 
@@ -1001,6 +1025,16 @@ class WatermarkAnalysis:
         self.text_needles: set[str] = set()          # strings to remove/redact
         self.text_detected: set[str] = set()         # strings actually found
         self.text_candidate_groups: list[TextGroup] = []
+        # overlay-family diagnostics + per-page redaction boxes
+        self.fullpage_draws = 0
+        self.fullpage_pages: set[int] = set()
+        self.fullpage_rotated = 0
+        self.visible_content_pages: set[int] = set()
+        self.gray_sampled = 0
+        self.gray_light = 0
+        self.overlay_family = False
+        self.text_bboxes_by_page: dict[int, list[object]] = {}
+        self.scan_like = False
 
 
 def _group_add(groups: dict, key, group, page_no: int, ratio: float,
@@ -1014,6 +1048,46 @@ def _group_add(groups: dict, key, group, page_no: int, ratio: float,
     groups[key].cover.append(ratio)
     groups[key].areas.append(area)
     groups[key].rects.append(rect)
+
+
+def _sample_gray_ratio(doc, xrefs, max_samples: int = OVERLAY_GRAY_SAMPLES
+                       ) -> tuple[int, int]:
+    """Decode up to max_samples images; return (sampled, gray_light).
+
+    A rasterized watermark stamp is light-gray on white (low colour spread,
+    high luminance).  A colour page image has a high channel spread; a B/W
+    scan stays near-black -> low luminance.  Both are excluded.
+    """
+    sampled = gray = 0
+    for xref in sorted(set(x for x in xrefs if x and x > 0)):
+        if sampled >= max_samples:
+            break
+        try:
+            pix = fitz.Pixmap(doc, xref)
+        except Exception:
+            continue
+        try:
+            if pix.n >= 3:
+                smp = bytes(pix.samples)
+                step = max(3, (len(smp) // 12000 // 3) * 3)
+                spread = lums = cnt = 0
+                for i in range(0, len(smp) - 2, step):
+                    r, g, b = smp[i], smp[i + 1], smp[i + 2]
+                    spread += max(abs(r - g), abs(g - b), abs(r - b))
+                    lums += (r + g + b) / 3.0
+                    cnt += 1
+                if cnt:
+                    spread /= cnt
+                    lums /= cnt
+                is_gray = spread < 12.0 and 120.0 < lums < 252.0
+            else:
+                is_gray = False  # grayscale bitmap: cannot tell scan vs stamp
+            sampled += 1
+            if is_gray:
+                gray += 1
+        finally:
+            del pix
+    return sampled, gray
 
 
 def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
@@ -1044,6 +1118,8 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
     inline_by_digest: dict[bytes, WatermarkGroup] = {}
     form_by_digest: dict[bytes, WatermarkGroup] = {}
     text_by_key: dict[tuple, TextGroup] = {}
+    # (pages, per-page bbox, sample text, area, rotated)
+    pos_by_key: dict[tuple, tuple] = {}
 
     for pno, page in enumerate(pages):
         prect = page.rect
@@ -1088,6 +1164,18 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
                        (rect.width * rect.height) / (pw * ph),
                        (rect.x0 / pw, rect.y0 / ph, rect.width / pw,
                         rect.height / ph))
+            # rotated placement (diagonal stamp): matrix b/c components != 0
+            tr = it.get("transform") or (1, 0, 0, 1, 0, 0)
+            try:
+                rotated_draw = abs(float(tr[1])) > 0.001 or abs(float(tr[2])) > 0.001
+            except (TypeError, ValueError, IndexError):
+                rotated_draw = False
+            if ratio >= WATERMARK_COVER_MIN:
+                an.fullpage_draws += 1
+                an.fullpage_pages.add(pno)
+                if rotated_draw:
+                    an.fullpage_rotated += 1
+                    g.rotated_draws += 1
 
         # ---- Form XObjects (digest of the form stream) ------------------
         xo_map = get_xobject_map(doc, page.xref)
@@ -1131,6 +1219,29 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
             except ContentParseError:
                 pass
 
+        # ---- visible-content probe (protects pure scans) -----------------
+        # Count visible text ops (render mode != 3, i.e. not invisible OCR
+        # text) and vector path operators.  A page with neither is a plain
+        # raster scan; its full-page image is the CONTENT, not a watermark.
+        try:
+            toks = tokenize(data)
+            ops = parse_operators(toks)
+            tr = 0
+            for operands, op in ops:
+                n = op[1]
+                if n == b"Tr" and operands and operands[-1][0] == "num":
+                    try:
+                        tr = int(operands[-1][1])
+                    except ValueError:
+                        tr = 0
+                elif n in (b"Tj", b"TJ", b"'", b'"') and tr != 3:
+                    an.visible_content_pages.add(pno)
+                elif n in (b"m", b"l", b"c", b"v", b"y", b"re", b"f", b"F",
+                           b"B", b"b", b"S", b"W", b"n"):
+                    an.visible_content_pages.add(pno)
+        except ContentParseError:
+            pass
+
         # ---- text spans --------------------------------------------------
         try:
             raw = page.get_text("rawdict")
@@ -1170,6 +1281,25 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
                         tg.pages.add(pno)
                         tg.area = max(tg.area, area)
                         tg.rotated = tg.rotated or bool(rotated)
+                    # text-POSITION family: same region on many pages even if
+                    # wording differs (stamp with page number, etc.)
+                    pq = (bool(rotated),
+                          round(bbox.x0 / pw * 100 / TEXT_POS_ROUND),
+                          round(bbox.y0 / ph * 100 / TEXT_POS_ROUND),
+                          round(bbox.width / pw * 100 / TEXT_POS_ROUND),
+                          round(bbox.height / ph * 100 / TEXT_POS_ROUND))
+                    nrect = (bbox.x0 / pw, bbox.y0 / ph,
+                             bbox.width / pw, bbox.height / ph)
+                    pk = pos_by_key.get(pq)
+                    if pk is None:
+                        pos_by_key[pq] = [{"pages": {pno}},
+                                          {pno: fitz.Rect(bbox)},
+                                          txt, area, bool(rotated), nrect]
+                    else:
+                        pk[0]["pages"].add(pno)
+                        pk[1][pno] = fitz.Rect(bbox)
+                        pk[3] = max(pk[3], area)
+                        pk[4] = pk[4] or bool(rotated)
         if (pno + 1) % PROGRESS_EVERY == 0:
             print(f"[step1] analyzed page {pno + 1}/{len(pages)} "
                   f"(images, forms, inline images, text overlays)")
@@ -1211,6 +1341,51 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
                   f"{g.digest.hex()[:10] if g.digest else 'xref ' + str(min(g.xrefs))} "
                   f"on {len(g.pages)}/{an.total_pages} pages, "
                   f"{g.area_of():.0%} page area at one fixed rect")
+
+    # ---- unique-per-page raster OVERLAY family --------------------------
+    # Tools may burn the watermark into a NEW raster per page (page number,
+    # anti-aliasing, noise -> different pixels every page, so no digest
+    # repeats).  Rule: full-page images cover >=98% of pages, the pages also
+    # carry VISIBLE vector content (so this is not a plain scan), and the
+    # overlays are rotated or light-gray (stamp-like).  Pure image-only
+    # scans never match and are protected.
+    overlay_groups = [g for g in an.groups
+                      if cover_of(g) >= WATERMARK_COVER_MIN]
+    union_all: set[int] = set()
+    for g in overlay_groups:
+        union_all |= g.pages
+    union_all_freq = len(union_all) / max(1, an.total_pages)
+    visible_pages = len(an.visible_content_pages)
+    rot_frac = an.fullpage_rotated / max(1, an.fullpage_draws)
+    gray_sampled, gray_light = _sample_gray_ratio(
+        doc, [min(g.xrefs) for g in overlay_groups if min(g.xrefs) > 0])
+    an.gray_sampled, an.gray_light = gray_sampled, gray_light
+    gray_frac = gray_light / max(1, gray_sampled)
+    visible_frac = visible_pages / max(1, an.total_pages)
+    print(f"[step1] overlay analysis: {an.fullpage_draws} full-page image "
+          f"draw(s) on {len(an.fullpage_pages)}/{an.total_pages} pages "
+          f"({union_all_freq:.0%}); rotated {rot_frac:.0%}, gray-light "
+          f"{gray_frac:.0%} (of {gray_sampled} sampled), visible vector "
+          f"content on {visible_pages}/{an.total_pages} pages "
+          f"({visible_frac:.0%})")
+    if (union_all_freq >= OVERLAY_UNION_MIN
+            and visible_frac >= OVERLAY_VISIBLE_MIN
+            and (rot_frac >= OVERLAY_ROTATED_MIN
+                 or gray_frac >= OVERLAY_GRAY_MIN)):
+        an.overlay_family = True
+        added = 0
+        for g in overlay_groups:
+            if g not in an.candidate_groups:
+                an.candidate_groups.append(g)
+                added += 1
+        print(f"[step1] watermark OVERLAY family: {len(overlay_groups)} "
+              f"distinct per-page full-page image(s) covering "
+              f"{len(union_all)}/{an.total_pages} pages "
+              f"(rotated {rot_frac:.0%}, gray-light {gray_frac:.0%}, "
+              f"visible content {visible_frac:.0%}) - treating all as one "
+              f"watermark ({added} added)")
+    if union_all_freq >= 0.90 and visible_frac < 0.10:
+        an.scan_like = True
     for g in an.candidate_groups:
         an.candidates.extend(sorted(g.xrefs))
     an.candidates = sorted(set(an.candidates))
@@ -1266,6 +1441,34 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
         print(f"[step1] watermark TEXT overlay(s): {len(an.text_candidate_groups)} "
               f"repeated span(s) on {an.total_pages}-page book, e.g. "
               f"{an.text_candidate_groups[0].needle!r}")
+
+    # ---- text-POSITION family (same region, wording may differ per page) --
+    # Stamps often vary per page ("... - page 123") so identical-span matching
+    # misses them.  ANY span occupying the same rotated (or large) region on
+    # >=90% of pages is redacted at its exact bbox on every page.
+    for (rotated, _qx, _qy, _qw, _qh), (pages_d, boxes, sample, area,
+                                        rot_sig, nrect) in pos_by_key.items():
+        frac = len(pages_d) / max(1, an.total_pages)
+        known_hit = any(n in sample for n in known)
+        if frac < TEXT_MIN_PAGES and not known_hit:
+            continue
+        nx0, ny0, nw, nh = nrect
+        margin_hit = ((ny0 + nh) <= TEXT_MARGIN or ny0 >= 1 - TEXT_MARGIN) \
+            and area < TEXT_MIN_AREA
+        if margin_hit and not (rot_sig or rotated) and not known_hit:
+            continue
+        if known_hit or rot_sig or rotated or area >= TEXT_MIN_AREA:
+            for pno, b in boxes.items():
+                an.text_bboxes_by_page.setdefault(pno, []).append(b)
+            an.text_needles.add(sample)
+            an.text_detected.add(sample)
+            an.text_candidate_groups.append(
+                TextGroup(sample, nrect, rot_sig or rotated, area,
+                          min(pages_d)))
+    if an.text_bboxes_by_page:
+        print(f"[step1] watermark text POSITION family: same region on "
+              f"{len(an.text_bboxes_by_page)}/{an.total_pages} pages "
+              f"(wording may differ) - redacting exact bboxes")
     # active needle set: detected strings + known defaults (bytes-level scan)
     an.text_needles |= {n for n in known if n and len(n) >= 3}
 
@@ -1323,15 +1526,25 @@ def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStat
               f"{len(an.inline_candidate_groups)} digest group(s)")
 
     nothing_found = not an.candidates and not an.form_candidates \
-        and not an.inline_candidates and not an.text_detected
+        and not an.inline_candidates and not an.text_detected \
+        and not an.text_bboxes_by_page
     if nothing_found:
+        hint = ""
+        if an.scan_like:
+            hint = (" The file looks like an IMAGE-ONLY scan (full-page "
+                    "bitmaps with no vector content): a watermark there is "
+                    "burned into the raster and cannot be removed without "
+                    "re-rendering the page - this app never re-renders, so "
+                    "it refuses to damage the pages.")
         doc.close()
         raise RuntimeError(
             "no candidate watermark found "
-            "(looked for: full-page image families, same-position repeated "
-            "images, full-page Form XObjects, repeated inline images and "
-            "repeated/known watermark text overlays). "
-            "Inspect the report above; refusing to proceed so no figure is "
+            "(looked for: full-page image families, unique-per-page raster "
+            "overlays, same-position repeated images, full-page Form "
+            "XObjects, repeated inline images, repeated/known watermark text "
+            "and same-position text families)."
+            + hint +
+            " Inspect the report above; refusing to proceed so no figure is "
             "damaged."
         )
     if an.candidates:
@@ -1367,6 +1580,27 @@ def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStat
             dirty.append(pno + 1)
             print(f"  [warn] page {pno + 1}: content patch failed: {exc}",
                   file=sys.stderr)
+        # text-POSITION family: redact the exact watermark bbox (wording may
+        # differ per page, so byte-level needle removal cannot catch it)
+        pos_boxes = an.text_bboxes_by_page.get(pno, [])
+        if pos_boxes:
+            for r in pos_boxes:
+                try:
+                    page.add_redact_annot(r)
+                except Exception:
+                    pass
+            try:
+                page.apply_redactions(
+                    images=fitz.PDF_REDACT_IMAGE_NONE,
+                    graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                    text=fitz.PDF_REDACT_TEXT_REMOVE,
+                )
+                stats.redacted_spans += len(pos_boxes)
+                if stats.redaction_fallbacks == 0:
+                    stats.redaction_fallbacks += 1
+            except Exception as exc:
+                print(f"  [warn] page {pno + 1}: position redaction failed: "
+                      f"{exc}", file=sys.stderr)
         if (pno + 1) % PROGRESS_EVERY == 0:
             print(f"[step1] processed page {pno + 1}/{n}  -  {stats.summary()}")
 

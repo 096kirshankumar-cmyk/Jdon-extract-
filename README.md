@@ -13,6 +13,12 @@ default, and one thing optionally:
    - **full-page image families** — the same watermark is often stored as
      several pixel variants (e.g. 82% + 18% of pages); all full-page variants
      whose union covers ≥90% of the file are one family and all are removed;
+   - **unique-per-page raster overlays** — some tools bake the watermark
+     into a NEW raster per page (different pixels each page, e.g. xrefs
+     3/5/7/9/… each covering 100% of one page). When full-page images cover
+     ≥98% of pages AND those pages also carry visible vector content AND the
+     images are rotated or light-gray (stamp-like), every full-page image is
+     removed as one watermark family;
    - **same-position images** repeated on ≥90% of pages covering ≥25% of the
      page area (diagonal grey banners);
    - **full-page Form XObjects** repeated on ≥90% of pages (vector-text /
@@ -21,9 +27,14 @@ default, and one thing optionally:
    - **watermark text** — known strings ("Sold by", "itachibot",
      "you purchased", "not for distribution", …) plus any text span repeated
      on ≥90% of pages that is rotated, large, or known: removed from the
-     content streams and redacted visually.
+     content streams and redacted visually. A same-**position** text family
+     (same diagonal region on ≥90% of pages even when the wording differs,
+     e.g. "… - page 123") is redacted at its exact bbox on every page.
    Legitimate content is always protected: small corner logos, one-off
-   figures, page numbers and header/footer furniture stay untouched.
+   figures, page numbers and header/footer furniture stay untouched, and
+   **image-only scanned pages are never touched** (the app refuses with a
+   clear message instead of damaging a scan whose watermark is burned into
+   the bitmap).
 2. **OPTIONAL — rebuilds the broken text layer with OCR**
    (`ocrmypdf --force-ocr`, English + Hindi). **Off by default**: OCR
    re-renders every page at high DPI, so the file is typically many times
