@@ -8,15 +8,21 @@ pipeline runs.
 
 One problem is fixed by default (OCR is an optional extra):
 
-  STEP 1  Remove the full-page watermark image with PyMuPDF.
-          The watermark is one or more /Image XObject variants (same physical
-          watermark rendered with different rotations/pixels across pages).
-          All full-page variants together cover >=90% of all pages at >=80%
-          page width/height.  Every invocation of those XObjects is removed
-          from the content streams (through Form XObjects too), any invocation
-          that survives is neutralized as a safety net, and the watermark's
-          text instances ("Sold by", "itachibot", "@itachibot") are removed
-          from the content streams.
+  STEP 1  Remove ANY repeated watermark from a PDF with PyMuPDF (generic -
+          works for any book, not just the itachibot series):
+            * full-page image XObject families (several pixel variants of the
+              same watermark - e.g. 82% + 18% - are one family);
+            * same-position images repeated on >=90% of pages covering >=25%
+              of the page area (banners);
+            * full-page Form XObjects repeated on >=90% of pages (vector text
+              / painted-band watermarks);
+            * inline images (BI...ID...EI) repeated on pages;
+            * known watermark text needles ("Sold by", "itachibot",
+              "you purchased", "not for distribution", ...) and any text span
+              repeated on >=90% of pages that is rotated (diagonal), large or
+              known - removed from content streams and redacted visually.
+          Legitimate content is protected: small corner logos, one-off
+          figures, page numbers and header/footer furniture stay untouched.
           Intermediate output: step1_no_watermark.pdf
 
   STEP 2  OPTIONAL - rebuild a searchable text layer with OCRmyPDF
@@ -54,6 +60,7 @@ No AI/LLM calls.  100% local processing.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import shutil
@@ -70,7 +77,26 @@ from pathlib import Path
 
 PROGRESS_EVERY = 10          # print progress every N pages
 DEFAULT_INPUT = "/data/input_pdfs/OPH.pdf"
-WATERMARK_TEXT_RE = re.compile(r"(itachibot|sold\s*by)", re.IGNORECASE)
+# Strings that are watermarks in this series (and can appear on any book).
+# Matched case-insensitively against every text payload (content streams AND
+# the extracted text layer), so old "Sold by@itachibot" and new
+# "you purchased ..." watermarks are both caught.
+DEFAULT_WATERMARK_NEEDLES = [
+    "itachibot",
+    "sold by",
+    "you purchased",
+    "you may not",
+    "purchased this",
+    "not for distribution",
+    "not for sale",
+    "do not share",
+    "do not distribute",
+    "do not copy",
+    "may not be copied",
+    "may not be shared",
+    "may not be reproduced",
+    "illegal copy",
+]
 # Characters produced by broken/missing ToUnicode CMaps (never legitimate in a
 # clean medical-MCQ text layer).
 GARBAGE_CHARS = set("•€ŒŠ‹›ŠšŽžŸ˜ˆ™‰†‡¨¯°±²³´µ·¾¿×÷«»‚„…†‡")
@@ -83,12 +109,27 @@ READABLE_RE = re.compile(
 IMAGE_SUBTYPE = "/Image"
 FORM_SUBTYPE = "/Form"
 
-# Watermark detection thresholds
-WATERMARK_COVER_MIN = 0.80  # median min(w,h) page coverage of a group
-WATERMARK_FREQ_MIN = 0.90   # union page coverage of the watermark family
-# A full-page-cover image seen on fewer pages than this is a one-off figure,
-# never part of the watermark family (protects legitimate full-page images).
+# --- generic watermark detection thresholds ------------------------------
+# (a) image family: all groups with median min(w,h) coverage >= this whose
+#     union covers >= this share of all pages are ONE watermark family
+WATERMARK_COVER_MIN = 0.80
+WATERMARK_FREQ_MIN = 0.90
+# groups seen on fewer pages than this are one-off full-page figures
+# (never part of the watermark family - protects atlas/plate pages)
 MIN_FULLPAGE_PAGES = 3
+# (b) same-position rule: an image repeated on >=90% of pages at the SAME
+#     rect is a watermark when it covers >= this share of the page area
+#     (small corner logos stay untouched)
+SAME_POS_MIN_PAGES = 0.90
+SAME_POS_MIN_AREA = 0.25
+SAME_POS_TOL = 0.02          # normalized rect tolerance
+# (c) text overlays: a text span repeated on >=90% of pages is a watermark
+#     when it is rotated (diagonal), covers >= this share of the page, or is a
+#     known watermark string.  Header/footer line-items (top/bottom margins)
+#     are excluded unless they are known watermark strings.
+TEXT_MIN_PAGES = 0.90
+TEXT_MIN_AREA = 0.02
+TEXT_MARGIN = 0.08           # top/bottom 8% is "page furniture" zone
 
 # --------------------------------------------------------------------------
 # PDF content-stream tokenizer (minimal, safe)
@@ -280,6 +321,103 @@ def tokenize(data: bytes) -> list[tuple]:
     return tokens
 
 
+def tokenize_spans(data: bytes) -> tuple[list[tuple], list[tuple]]:
+    """
+    Like tokenize() but also returns inline-image spans.
+
+    Returns (tokens, inline_spans) where each inline span is
+    (start, end, payload_hash, width, height).  The content bytes
+    data[start:end] hold 'BI ... ID <payload> EI'; end points just after
+    'EI', so splicing data[:start] + data[end:] removes the image cleanly.
+    """
+    tokens, spans = [], []
+    i, n = 0, len(data)
+    inline = False
+    while i < n:
+        c = data[i]
+        if c in _WS:
+            i += 1
+            continue
+        if c == 0x25:  # '%' comment to end of line
+            while i < n and data[i] not in b"\r\n":
+                i += 1
+            continue
+        if c == 0x28:  # '(' literal string
+            _, i = _parse_literal_string(data, i)
+            tokens.append(("str", b"", False))
+            continue
+        if c == 0x3C:  # '<'
+            if i + 1 < n and data[i + 1] == 0x3C:
+                tokens.append(("delim", b"<<"))
+                i += 2
+                continue
+            _, i = _parse_hex_string(data, i)
+            tokens.append(("str", b"", True))
+            continue
+        if c == 0x3E:  # '>'
+            if i + 1 < n and data[i + 1] == 0x3E:
+                tokens.append(("delim", b">>"))
+                i += 2
+            else:
+                tokens.append(("delim", b">"))
+                i += 1
+            continue
+        if c in b"[]{}":
+            tokens.append(("delim", bytes([c])))
+            i += 1
+            continue
+        if c == 0x2F:  # '/' name
+            j = i + 1
+            while j < n and not _is_break(data[j]):
+                j += 1
+            tokens.append(("name", data[i + 1 : j]))
+            i = j
+            continue
+        # word / number
+        j = i
+        while j < n and not _is_break(data[j]):
+            j += 1
+        word = data[i:j]
+        if word == b"BI":
+            inline = True
+            bi_start = i
+            tokens.append(("word", b"BI"))
+            i = j
+            continue
+        if word == b"ID" and inline:
+            # payload runs until whitespace-preceded 'EI'
+            m = _INLINE_EI_RE.search(data, j)
+            if m is None:
+                m = _INLINE_EI_RE2.search(data, j)
+            if m is None:
+                raise ContentParseError("inline image without closing EI")
+            dict_raw = data[bi_start:j]
+            mw = re.search(rb"/W\s+(\d+)", dict_raw)
+            mh = re.search(rb"/H\s+(\d+)", dict_raw)
+            width = int(mw.group(1)) if mw else 0
+            height = int(mh.group(1)) if mh else 0
+            payload = data[j + 2 : m.start()]
+            spans.append((bi_start, m.start() + 2, payload, width, height))
+            i = m.end()
+            inline = False
+            tokens.append(("word", b"EI"))
+            continue
+        tokens.append(("num", word) if _NUM_RE.match(word) else ("word", word))
+        i = j
+    return tokens, spans
+
+
+def scan_inline_images(data: bytes) -> list[tuple]:
+    """Return inline-image spans: (start, end, sha256, width, height)."""
+    import hashlib
+    _, spans = tokenize_spans(bytes(data))
+    out = []
+    for start, end, payload, w, h in spans:
+        out.append((start, end,
+                    hashlib.sha256(payload).hexdigest(), w, h))
+    return out
+
+
 def _escape_literal(raw: bytes) -> bytes:
     out = bytearray()
     for b in raw:
@@ -360,13 +498,20 @@ def parse_operators(tokens: list[tuple]) -> list[tuple[list[tuple], tuple]]:
     return ops
 
 
-def _string_matches_watermark(raw: bytes) -> bool:
+def _norm_text(s: str) -> str:
+    """Normalize extracted text for needle matching."""
+    return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+
+def _needles_hit(text: str, needles: set[str]) -> bool:
+    t = _norm_text(text)
+    return any(n in t for n in needles)
+
+
+def _string_matches_watermark(raw: bytes, needles: set[str]) -> bool:
     """True if a content-stream string looks like watermark text."""
     low = raw.lower()
-    if b"itachibot" in low or b"@itachibot" in low:
-        return True
-    # covers "Sold by@itachibot" / "Sold by itachibot" / "Sold by" alone
-    if b"sold" in low and b"by" in low:
+    if any(n.encode("latin-1", "ignore") in low for n in needles):
         return True
     # Unicode payloads (UTF-16BE etc.) get one extra chance
     for enc in ("utf-16-be", "utf-8", "utf-16"):
@@ -374,7 +519,7 @@ def _string_matches_watermark(raw: bytes) -> bool:
             s = raw.decode(enc)
         except (UnicodeDecodeError, ValueError):
             continue
-        if WATERMARK_TEXT_RE.search(s):
+        if _needles_hit(s, needles):
             return True
     return False
 
@@ -521,19 +666,48 @@ class PatchStats:
     def __init__(self) -> None:
         self.dropped_dos = 0
         self.dropped_text_ops = 0
+        self.dropped_forms = 0
+        self.inline_images_removed = 0
         self.forms_patched = 0
         self.neutralized_images = 0
         self.redaction_fallbacks = 0
+        self.redacted_spans = 0
         self.unparsed_streams = 0
 
     def summary(self) -> str:
         return (
             f"removed {self.dropped_dos} watermark draws, "
+            f"{self.dropped_forms} watermark form calls, "
+            f"{self.inline_images_removed} inline image(s), "
             f"{self.dropped_text_ops} watermark text ops, "
-            f"{self.forms_patched} forms patched, "
             f"neutralized {self.neutralized_images} image object(s), "
+            f"{self.redacted_spans} redacted span(s), "
             f"{self.unparsed_streams} stream(s) skipped"
         )
+
+
+def strip_inline_images(data: bytes, inline_digests: set[str],
+                        stats: PatchStats) -> bytes:
+    """Splice candidate watermark inline images (BI...ID...EI) out of a
+    content stream.  Returns the new stream."""
+    if not data or not inline_digests:
+        return data
+    try:
+        spans = scan_inline_images(data)
+    except ContentParseError:
+        stats.unparsed_streams += 1
+        return data
+    remove = [s for s in spans if s[2] in inline_digests]
+    if not remove:
+        return data
+    out = bytearray()
+    prev = 0
+    for start, end, _, _, _ in sorted(remove):
+        out += data[prev:start]
+        prev = end
+    out += data[prev:]
+    stats.inline_images_removed += len(remove)
+    return bytes(out)
 
 
 def patch_data(
@@ -541,15 +715,18 @@ def patch_data(
     data: bytes,
     xo_map: dict[bytes, int],
     watermark_xrefs: set[int],
+    watermark_forms: set[int],
+    text_needles: set[str],
     stats: PatchStats,
     forms_done: set[int],
 ) -> bytes:
     """
     Remove operations from a content stream:
       * 'Do' ops invoking a watermark image XObject;
-      * 'Do' ops invoking a Form XObject (recurse into the form's stream);
-      * text ops ('Tj', 'TJ', quote, doublequote) whose payload contains
-        watermark text.
+      * 'Do' ops invoking a watermark Form XObject; other forms are recursed
+        into (they may draw the watermark image);
+      * text ops ('Tj', 'TJ', quote, doublequote) whose payload contains a
+        watermark needle.
 
     Only operand+operator are dropped; graphics state (q/Q) is never touched,
     so the stream stays balanced.  Returns the new stream (identical bytes when
@@ -578,27 +755,30 @@ def patch_data(
                     break
             if name is not None and name in xo_map:
                 xref = xo_map[name]
-                if xref in watermark_xrefs:
+                if xref in watermark_xrefs or xref in watermark_forms:
                     remove_ops.add(idx)
                     stats.dropped_dos += 1
+                    if xref in watermark_forms:
+                        stats.dropped_forms += 1
                 elif xobject_subtype(doc, xref) == FORM_SUBTYPE:
                     forms_to_patch.add(xref)
         elif opname in (b"Tj", b"'"):
             if operands and operands[-1][0] == "str":
-                if _string_matches_watermark(operands[-1][1]):
+                if _string_matches_watermark(operands[-1][1], text_needles):
                     remove_ops.add(idx)
                     stats.dropped_text_ops += 1
         elif opname == b"TJ":
             for tok in reversed(operands):
                 if tok[0] == "group":
                     for sub in tok[1]:
-                        if sub[0] == "str" and _string_matches_watermark(sub[1]):
+                        if sub[0] == "str" and _string_matches_watermark(
+                                sub[1], text_needles):
                             remove_ops.add(idx)
                             stats.dropped_text_ops += 1
                     break
         elif opname == b'"':
             if operands and operands[-1][0] == "str":
-                if _string_matches_watermark(operands[-1][1]):
+                if _string_matches_watermark(operands[-1][1], text_needles):
                     remove_ops.add(idx)
                     stats.dropped_text_ops += 1
 
@@ -615,8 +795,8 @@ def patch_data(
             forms_ok = False
             continue
         fx_map = get_xobject_map(doc, fx)
-        new, ok = patch_data(doc, old, fx_map, watermark_xrefs, stats,
-                             forms_done)
+        new, ok = patch_data(doc, old, fx_map, watermark_xrefs,
+                             watermark_forms, text_needles, stats, forms_done)
         if not ok:
             forms_ok = False
         if new != old:
@@ -646,8 +826,9 @@ def patch_data(
     return (b"\n".join(lines) if lines else b""), forms_ok
 
 
-def patch_page(doc, page, watermark_xrefs: set[int], stats: PatchStats,
-               forms_done: set[int]) -> bool:
+def patch_page(doc, page, watermark_xrefs: set[int], watermark_forms: set[int],
+               inline_digests: set[str], text_needles: set[str],
+               stats: PatchStats, forms_done: set[int]) -> bool:
     """
     Patch one page's /Contents (and any forms it uses).
 
@@ -658,8 +839,10 @@ def patch_page(doc, page, watermark_xrefs: set[int], stats: PatchStats,
     data = page.read_contents()
     if not data:
         return True
+    data = strip_inline_images(data, inline_digests, stats)
     xo_map = get_xobject_map(doc, page.xref)
-    new, ok = patch_data(doc, data, xo_map, watermark_xrefs, stats, forms_done)
+    new, ok = patch_data(doc, data, xo_map, watermark_xrefs, watermark_forms,
+                         text_needles, stats, forms_done)
     if new != data:
         xref = doc.get_new_xref()
         doc.update_object(xref, "<< /Length 0 >>")
@@ -685,12 +868,14 @@ def neutralize_image_object(doc, page, xref: int, stats: PatchStats) -> None:
               file=sys.stderr)
 
 
-def redact_watermark_text(doc, page, stats: PatchStats) -> int:
+def redact_watermark_text(doc, page, stats: PatchStats,
+                          needles: set[str]) -> int:
     """
     Fallback for encodings the byte-level scan cannot decode (and for streams
     that MuPDF can still extract text from but rawdict cannot): find the
-    watermark strings with MuPDF's own text search and redact exactly those
-    rectangles (text only - images and line art are preserved).
+    watermark strings (known needles + spans detected on >=90% of pages) with
+    MuPDF's own text search and redact exactly those rectangles (text only -
+    images and line art are preserved).
     """
     rects: list[fitz.Rect] = []
     # 1) rawdict spans (precise per-span rects)
@@ -701,7 +886,9 @@ def redact_watermark_text(doc, page, stats: PatchStats) -> int:
                 continue
             for line in block.get("lines", []):
                 for span in line.get("spans", []):
-                    if WATERMARK_TEXT_RE.search(span.get("text", "") or ""):
+                    span_text = "".join(
+                        ch.get("c", "") for ch in span.get("chars", []))
+                    if _needles_hit(span_text, needles):
                         rects.append(fitz.Rect(span["bbox"]))
     except Exception:
         rects = []
@@ -709,18 +896,24 @@ def redact_watermark_text(doc, page, stats: PatchStats) -> int:
     # Longest needle first, so "Sold by@itachibot" wins over its substrings
     # and the "@" between them is covered (no visual leftovers).
     if not rects:
-        for needle in ("Sold by@itachibot", "itachibot", "Sold by"):
-            try:
-                for r in page.search_for(needle):
-                    if not any(fitz.Rect(r).intersects(x) for x in rects):
-                        rects.append(fitz.Rect(r))
-            except Exception:
-                continue
-    # 3) last resort: word boxes containing the pattern
+        try:
+            for needle in sorted(needles, key=len, reverse=True):
+                if len(needle) < 3:
+                    continue
+                try:
+                    for r in page.search_for(needle):
+                        r = fitz.Rect(r)
+                        if not any(r.intersects(x) for x in rects):
+                            rects.append(r)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    # 3) last resort: word boxes containing a needle
     if not rects:
         try:
             for w in page.get_text("words"):
-                if WATERMARK_TEXT_RE.search(w[4]):
+                if _needles_hit(w[4], needles):
                     rects.append(fitz.Rect(w[:4]))
         except Exception:
             pass
@@ -735,6 +928,7 @@ def redact_watermark_text(doc, page, stats: PatchStats) -> int:
                 text=fitz.PDF_REDACT_TEXT_REMOVE,
             )
             stats.redaction_fallbacks += 1
+            stats.redacted_spans += len(rects)
         except Exception as exc:
             print(f"  [warn] redaction failed on a page: {exc}", file=sys.stderr)
             return 0
@@ -752,8 +946,39 @@ class WatermarkGroup:
         self.xrefs: set[int] = {xref}
         self.pages: set[int] = set()       # page numbers where drawn
         self.cover: list[float] = []       # best min(w,h) ratio per page
+        self.areas: list[float] = []       # bbox area / page area
+        self.rects: list[tuple] = []       # normalized bbox per page
         self.width = width
         self.height = height
+
+    @property
+    def frequency(self) -> float:
+        return len(self.pages)
+
+    def area_of(self) -> float:
+        return statistics.median(self.areas) if self.areas else 0.0
+
+    def same_rect(self) -> bool:
+        """True when the image sits at the same rect on every page."""
+        if len(self.rects) < 2:
+            return True
+        base = self.rects[0]
+        return all(
+            abs(r[k] - base[k]) <= SAME_POS_TOL for r in self.rects
+            for k in range(4)
+        )
+
+
+class TextGroup:
+    """A text span repeated across pages (candidate watermark overlay)."""
+
+    def __init__(self, needle: str, rect: tuple, rotated: bool,
+                 area: float, page_no: int) -> None:
+        self.needle = needle               # normalized string
+        self.rect = rect                   # normalized (x,y,w,h)
+        self.rotated = rotated
+        self.area = area
+        self.pages: set[int] = {page_no}
 
     @property
     def frequency(self) -> float:
@@ -762,45 +987,77 @@ class WatermarkGroup:
 
 class WatermarkAnalysis:
     def __init__(self) -> None:
-        self.groups: list[WatermarkGroup] = []
+        self.groups: list[WatermarkGroup] = []       # image digest groups
+        self.inline_groups: list[WatermarkGroup] = []  # inline-image groups
+        self.form_groups: list[WatermarkGroup] = []    # Form-XObject groups
+        self.text_groups: list[TextGroup] = []
         self.total_pages = 0
-        self.candidates: list[int] = []    # watermark xrefs to remove
+        self.candidates: list[int] = []              # image xrefs to remove
         self.candidate_groups: list[WatermarkGroup] = []
+        self.inline_candidates: set[str] = set()     # inline payload digests
+        self.inline_candidate_groups: list[WatermarkGroup] = []
+        self.form_candidates: set[int] = set()       # Form xrefs to remove
+        self.form_candidate_groups: list[WatermarkGroup] = []
+        self.text_needles: set[str] = set()          # strings to remove/redact
+        self.text_detected: set[str] = set()         # strings actually found
+        self.text_candidate_groups: list[TextGroup] = []
+
+
+def _group_add(groups: dict, key, group, page_no: int, ratio: float,
+               area: float, rect: tuple) -> None:
+    g = groups.get(key)
+    if g is None:
+        groups[key] = group
+    else:
+        g.xrefs |= group.xrefs
+    groups[key].pages.add(page_no)
+    groups[key].cover.append(ratio)
+    groups[key].areas.append(area)
+    groups[key].rects.append(rect)
 
 
 def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
     """
-    Detect the watermark.
+    Generic watermark detection - works for ANY repeated watermark, not just
+    the itachibot series:
 
-    Images are grouped by pixel digest (not by xref): some PDF generators use
-    one shared XObject, others embed a copy of the image on every page, and a
-    digest group catches both.
-
-    A WATERMARK FAMILY = all image groups that cover >=80% of page width and
-    height (median of the min(w,h) ratio) and together appear on >=90% of all
-    pages.  One physical watermark is often stored as SEVERAL pixel variants
-    (different rotation, slightly different raster) - e.g. variant A on 82% of
-    pages and variant B on 18% - so neither digest alone reaches >=90%, but
-    the union covers every page.  All variants of the family are removed
-    surgically; the same rule also catches the classic single-variant case.
-
-    Groups that only appear on a couple of pages (MIN_FULLPAGE_PAGES) are
-    treated as one-off full-page figures and never removed.
+    1. IMAGE FAMILY   - XObject images are grouped by pixel digest.  All
+       groups with median min(w,h) coverage >= 80% whose UNION covers >=90%
+       of pages are one watermark family (the same watermark is often stored
+       as several pixel variants: 82% + 18% etc.).  One-off full-page figures
+       (a few pages) are protected.
+    2. SAME POSITION  - an image repeated on >=90% of pages at the SAME rect
+       covering >=25% of the page area is a watermark banner (small corner
+       logos stay untouched).
+    3. FORM OBJECTS   - Form XObjects with a full-page BBox repeated on >=90%
+       of pages are watermarks (their content stream digest groups variants).
+    4. INLINE IMAGES  - BI...ID...EI images in the content stream, grouped by
+       payload digest, follow the same full-page family rule.
+    5. TEXT OVERLAY   - a text span (or known watermark string) repeated on
+       >=90% of pages, when rotated (diagonal), large, or a known watermark
+       string, is a watermark overlay.  Page-number/header/footer furniture in
+       the top/bottom margins is excluded.
     """
     an = WatermarkAnalysis()
     an.total_pages = len(pages)
     groups_by_digest: dict[bytes, WatermarkGroup] = {}
+    inline_by_digest: dict[bytes, WatermarkGroup] = {}
+    form_by_digest: dict[bytes, WatermarkGroup] = {}
+    text_by_key: dict[tuple, TextGroup] = {}
 
     for pno, page in enumerate(pages):
         prect = page.rect
         if prect.is_empty or prect.is_infinite:
             continue
+        pw = max(prect.width, 1e-9)
+        ph = max(prect.height, 1e-9)
+
+        # ---- XObject images --------------------------------------------
         try:
             infos = page.get_image_info(xrefs=True, hashes=True)
         except Exception:
             infos = []
         if not infos:
-            # fallback for older PyMuPDF: image xrefs + drawn rects
             try:
                 images = page.get_images(full=True)
             except Exception:
@@ -821,30 +1078,108 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
             if xref is None or not bbox:
                 continue
             rect = fitz.Rect(bbox)
-            wr = min(1.0, rect.width / max(prect.width, 1e-9))
-            hr = min(1.0, rect.height / max(prect.height, 1e-9))
+            wr = min(1.0, rect.width / pw)
+            hr = min(1.0, rect.height / ph)
             ratio = min(wr, hr)
             key = digest or f"xr:{xref}".encode()
-            g = groups_by_digest.get(key)
-            if g is None:
-                g = WatermarkGroup(key, xref, it.get("width", 0) or 0,
-                                   it.get("height", 0) or 0)
-                groups_by_digest[key] = g
-            else:
-                g.xrefs.add(xref)
-            g.pages.add(pno)
-            g.cover.append(ratio)
+            g = WatermarkGroup(key, xref, it.get("width", 0) or 0,
+                               it.get("height", 0) or 0)
+            _group_add(groups_by_digest, key, g, pno, ratio,
+                       (rect.width * rect.height) / (pw * ph),
+                       (rect.x0 / pw, rect.y0 / ph, rect.width / pw,
+                        rect.height / ph))
+
+        # ---- Form XObjects (digest of the form stream) ------------------
+        xo_map = get_xobject_map(doc, page.xref)
+        for name, fx in xo_map.items():
+            try:
+                if xobject_subtype(doc, fx) != FORM_SUBTYPE:
+                    continue
+                stream = doc.xref_stream(fx)
+                fdigest = __import__("hashlib").sha256(stream).digest()
+                fkey = b"form:" + fdigest
+                bbox_v = doc.xref_get_key(fx, "BBox")[1]
+                bbox = _parse_bbox(bbox_v)
+                if bbox is None or bbox.is_empty or bbox.is_infinite:
+                    continue
+                wr = min(1.0, bbox.width / pw)
+                hr = min(1.0, bbox.height / ph)
+                ratio = min(wr, hr)
+                fg = WatermarkGroup(fkey, fx, int(bbox.width),
+                                    int(bbox.height))
+                _group_add(form_by_digest, fkey, fg, pno, ratio,
+                           (bbox.width * bbox.height) / (pw * ph),
+                           (bbox.x0 / pw, bbox.y0 / ph, bbox.width / pw,
+                            bbox.height / ph))
+            except Exception:
+                continue
+
+        # ---- inline images ----------------------------------------------
+        try:
+            data = page.read_contents()
+        except Exception:
+            data = b""
+        if data:
+            try:
+                for start, end, digest, w, h in scan_inline_images(data):
+                    key = digest.encode()
+                    ig = WatermarkGroup(key, -1, w, h)
+                    # bbox from CTM is not tracked here; use unit square
+                    # (conservative: family rule needs >=80% cover anyway)
+                    _group_add(inline_by_digest, key, ig, pno, 1.0, 1.0,
+                               (0.0, 0.0, 1.0, 1.0))
+            except ContentParseError:
+                pass
+
+        # ---- text spans --------------------------------------------------
+        try:
+            raw = page.get_text("rawdict")
+        except Exception:
+            raw = {}
+        for block in raw.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                d = line.get("dir") or (1.0, 0.0)
+                try:
+                    rotated = abs(float(d[1])) > 0.05
+                except (TypeError, ValueError, IndexError):
+                    rotated = False
+                for span in line.get("spans", []):
+                    # NOTE: rawdict spans store text as chars[]["c"], not
+                    # span["text"] (dict-mode has span["text"], rawdict does not)
+                    span_text = "".join(
+                        ch.get("c", "") for ch in span.get("chars", []))
+                    txt = _norm_text(span_text)
+                    if not txt:
+                        continue
+                    bbox = fitz.Rect(span.get("bbox", (0, 0, 0, 0)))
+                    area = (bbox.width * bbox.height) / (pw * ph)
+                    q = (round(bbox.x0 / pw * 100),
+                         round(bbox.y0 / ph * 100),
+                         round(bbox.width / pw * 100),
+                         round(bbox.height / ph * 100))
+                    key = (txt, bool(rotated), q)
+                    tg = text_by_key.get(key)
+                    if tg is None:
+                        text_by_key[key] = TextGroup(
+                            txt, (bbox.x0 / pw, bbox.y0 / ph,
+                                  bbox.width / pw, bbox.height / ph),
+                            bool(rotated), area, pno)
+                    else:
+                        tg.pages.add(pno)
+                        tg.area = max(tg.area, area)
+                        tg.rotated = tg.rotated or bool(rotated)
         if (pno + 1) % PROGRESS_EVERY == 0:
-            print(f"[step1] analyzed images on page {pno + 1}/{len(pages)}")
+            print(f"[step1] analyzed page {pno + 1}/{len(pages)} "
+                  f"(images, forms, inline images, text overlays)")
 
     def cover_of(g: WatermarkGroup) -> float:
         return statistics.median(g.cover) if g.cover else 0.0
 
+    # ---- image family (multi-variant, full-page) ------------------------
     an.groups = list(groups_by_digest.values())
     an.groups.sort(key=lambda g: -len(g.pages))
-
-    # full-page-cover groups (a legit figure never covers >=80% of a page
-    # body; the watermark does, in every variant)
     full_page = [g for g in an.groups
                  if cover_of(g) >= WATERMARK_COVER_MIN
                  and len(g.pages) >= MIN_FULLPAGE_PAGES]
@@ -852,26 +1187,113 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
     for g in full_page:
         union_pages |= g.pages
     union_freq = len(union_pages) / max(1, an.total_pages)
-
     if union_freq >= WATERMARK_FREQ_MIN:
-        # GOLDEN RULE: the full-page family covers >=90% of all pages.
         an.candidate_groups = full_page
         if len(full_page) > 1:
             print(f"[step1] watermark FAMILY: {len(full_page)} full-page image "
-                  f"variant(s) together cover {len(union_pages)}/{an.total_pages} "
-                  f"pages ({union_freq:.0%}) - treating all as one watermark")
+                  f"variant(s) together cover {len(union_pages)}/"
+                  f"{an.total_pages} pages ({union_freq:.0%}) - treating all "
+                  f"as one watermark")
     else:
-        # fallback: strict single-group rule (a single variant on >=90% of
-        # pages, even if no other full-page variant exists)
         an.candidate_groups = [
             g for g in an.groups
             if len(g.pages) / max(1, an.total_pages) >= WATERMARK_FREQ_MIN
             and cover_of(g) >= WATERMARK_COVER_MIN
         ]
+    # same-position banners (e.g. a dim grey band at the page centre)
+    for g in an.groups:
+        if g in an.candidate_groups:
+            continue
+        if (len(g.pages) / max(1, an.total_pages) >= SAME_POS_MIN_PAGES
+                and g.area_of() >= SAME_POS_MIN_AREA and g.same_rect()):
+            an.candidate_groups.append(g)
+            print(f"[step1] watermark same-position image: "
+                  f"{g.digest.hex()[:10] if g.digest else 'xref ' + str(min(g.xrefs))} "
+                  f"on {len(g.pages)}/{an.total_pages} pages, "
+                  f"{g.area_of():.0%} page area at one fixed rect")
     for g in an.candidate_groups:
         an.candidates.extend(sorted(g.xrefs))
     an.candidates = sorted(set(an.candidates))
+
+    # ---- forms -----------------------------------------------------------
+    an.form_groups = list(form_by_digest.values())
+    an.form_groups.sort(key=lambda g: -len(g.pages))
+    an.form_candidate_groups = [
+        g for g in an.form_groups
+        if cover_of(g) >= WATERMARK_COVER_MIN
+        and len(g.pages) / max(1, an.total_pages) >= WATERMARK_FREQ_MIN
+    ]
+    for g in an.form_candidate_groups:
+        an.form_candidates |= g.xrefs
+
+    # ---- inline images ---------------------------------------------------
+    an.inline_groups = list(inline_by_digest.values())
+    an.inline_groups.sort(key=lambda g: -len(g.pages))
+    an.inline_candidate_groups = [
+        g for g in an.inline_groups
+        if cover_of(g) >= WATERMARK_COVER_MIN
+        and (len(g.pages) / max(1, an.total_pages) >= WATERMARK_FREQ_MIN
+             or len(g.pages) >= MIN_FULLPAGE_PAGES)
+        and len(g.pages) >= MIN_FULLPAGE_PAGES
+    ]
+    if an.inline_candidate_groups:
+        an.inline_candidates = {g.digest.decode() for g in an.inline_candidate_groups}
+
+    # ---- text overlays ---------------------------------------------------
+    an.text_groups = list(text_by_key.values())
+    an.text_groups.sort(key=lambda g: -len(g.pages))
+    known = set(DEFAULT_WATERMARK_NEEDLES)
+    for tg in an.text_groups:
+        frac = len(tg.pages) / max(1, an.total_pages)
+        known_hit = any(n in tg.needle for n in known)
+        if known_hit:
+            # a known watermark string found anywhere (any page) is treated
+            # as a watermark overlay - most of this series' PDFs draw the
+            # same string on (nearly) every page
+            an.text_detected |= {n for n in known if n in tg.needle}
+        if frac < TEXT_MIN_PAGES and not known_hit:
+            continue
+        # 8% top/bottom margin = page furniture (page numbers, headers)
+        margin_hit = ((tg.rect[1] + tg.rect[3]) <= TEXT_MARGIN
+                      or tg.rect[1] >= 1 - TEXT_MARGIN) and tg.area < TEXT_MIN_AREA
+        if margin_hit and not known_hit:
+            continue
+        if known_hit or tg.rotated or tg.area >= TEXT_MIN_AREA:
+            an.text_candidate_groups.append(tg)
+            an.text_needles.add(tg.needle)
+            an.text_detected.add(tg.needle)
+    if an.text_candidate_groups:
+        print(f"[step1] watermark TEXT overlay(s): {len(an.text_candidate_groups)} "
+              f"repeated span(s) on {an.total_pages}-page book, e.g. "
+              f"{an.text_candidate_groups[0].needle!r}")
+    # active needle set: detected strings + known defaults (bytes-level scan)
+    an.text_needles |= {n for n in known if n and len(n) >= 3}
+
+    # union of page coverage across ALL detection channels (report only)
+    cov = set(union_pages)
+    for g in an.form_candidate_groups:
+        cov |= g.pages
+    for g in an.inline_candidate_groups:
+        cov |= g.pages
+    for tg in an.text_candidate_groups:
+        cov |= tg.pages
+    if cov:
+        print(f"[step1] watermark coverage (all channels): {len(cov)}/"
+              f"{an.total_pages} pages ({len(cov) / max(1, an.total_pages):.0%})")
     return an
+
+
+def _parse_bbox(value: str):
+    """Parse a PDF /BBox value ('[0 0 612 792]' or an indirect ref)."""
+    try:
+        import ast
+        vals = re.findall(r"-?[\d.]+", value or "")
+        if len(vals) == 4:
+            return fitz.Rect(float(vals[0]), float(vals[1]),
+                             float(vals[2]), float(vals[3]))
+    except Exception:
+        return None
+    return None
 
 
 def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStats, list[int]]:
@@ -892,21 +1314,41 @@ def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStat
         print(f"  digest {digest}: on {len(g.pages)}/{n} pages "
               f"({len(g.pages) / max(1, n):.0%}), median min(w,h) coverage "
               f"{med:.0%}, xrefs {sorted(g.xrefs)}")
+    if an.form_candidate_groups:
+        print(f"[step1] watermark FORM XObject(s): "
+              f"{sorted(an.form_candidates)} on "
+              f"{len(an.form_candidate_groups[0].pages)} pages")
+    if an.inline_candidate_groups:
+        print(f"[step1] watermark INLINE image(s): "
+              f"{len(an.inline_candidate_groups)} digest group(s)")
 
-    if not an.candidates:
+    nothing_found = not an.candidates and not an.form_candidates \
+        and not an.inline_candidates and not an.text_detected
+    if nothing_found:
         doc.close()
         raise RuntimeError(
-            "no candidate watermark XObject found "
-            f"(need a full-page image family covering >=90% of all pages at "
-            f">={WATERMARK_COVER_MIN:.0%} page coverage, or a single image on "
-            f">={WATERMARK_FREQ_MIN:.0%} of pages). "
-            "Inspect the report above; refusing to proceed so no figure is damaged."
+            "no candidate watermark found "
+            "(looked for: full-page image families, same-position repeated "
+            "images, full-page Form XObjects, repeated inline images and "
+            "repeated/known watermark text overlays). "
+            "Inspect the report above; refusing to proceed so no figure is "
+            "damaged."
         )
-    print(f"[step1] watermark XObject(s) detected: {an.candidates} "
-          f"(content digest groups: {len(an.candidate_groups)})")
+    if an.candidates:
+        print(f"[step1] watermark XObject(s) detected: {an.candidates} "
+              f"(content digest groups: {len(an.candidate_groups)})")
+    if an.form_candidates:
+        print(f"[step1] watermark Form(s) to remove: {sorted(an.form_candidates)}")
+    if an.inline_candidates:
+        print(f"[step1] watermark inline image digest(s): "
+              f"{len(an.inline_candidates)}")
+    if an.text_needles:
+        shown = sorted(an.text_needles, key=len, reverse=True)[:6]
+        print(f"[step1] watermark text needle(s): {shown}")
 
     stats = PatchStats()
     watermark_set = set(an.candidates)
+    form_set = set(an.form_candidates)
     forms_done: set[int] = set()
     t0 = time.time()
     # "dirty" = we could not prove the watermark draw is gone (parse failure
@@ -916,7 +1358,9 @@ def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStat
     dirty: list[int] = []
     for pno, page in enumerate(pages):
         try:
-            ok = patch_page(doc, page, watermark_set, stats, forms_done)
+            ok = patch_page(doc, page, watermark_set, form_set,
+                            an.inline_candidates, an.text_needles, stats,
+                            forms_done)
             if not ok:
                 dirty.append(pno + 1)
         except Exception as exc:
@@ -951,8 +1395,8 @@ def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStat
             text = page.get_text()
         except Exception:
             text = ""
-        if text and WATERMARK_TEXT_RE.search(text):
-            hits = redact_watermark_text(doc, page, stats)
+        if text and _needles_hit(text, an.text_needles):
+            hits = redact_watermark_text(doc, page, stats, an.text_needles)
             print(f"  [step1] page {pno + 1}: redacted {hits} watermark text span(s)")
 
     out_pdf = Path(output_pdf)
@@ -968,10 +1412,11 @@ def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStat
 
     elapsed = time.time() - t0
     print(f"[step1] saved {out_pdf}  -  {stats.summary()}  in {elapsed:.1f}s")
-    return stats, list(an.candidates)
+    return stats, list(an.candidates), an
 
 
-def verify_step1(doc, watermark_xrefs: list[int], label: str) -> bool:
+def verify_step1(doc, watermark_xrefs: list[int], label: str,
+                 needles: set[str]) -> bool:
     """Confirm the watermark image is no longer drawn and no watermark text
     remains in the (broken but still extractable) text layer."""
     ok = True
@@ -992,7 +1437,10 @@ def verify_step1(doc, watermark_xrefs: list[int], label: str) -> bool:
             t = page.get_text() or ""
         except Exception:
             t = ""
-        text_hits += len(WATERMARK_TEXT_RE.findall(t))
+        text_hits += len(re.findall(
+            "(" + "|".join(re.escape(x) for x in sorted(
+                needles, key=len, reverse=True)) + ")",
+            t, flags=re.IGNORECASE))
     if text_hits:
         print(f"  [{label}] watermark text still present in {text_hits} place(s) "
               f"(broken CMap may hide it from text extraction; OCR replaces the "
@@ -1317,7 +1765,8 @@ def page_quality(text: str) -> tuple[float, float, int]:
 
 
 def verify_output(pdf_path: Path, sample_pages, language: str, tag: str,
-                  check_quality: bool = True) -> dict:
+                  check_quality: bool = True,
+                  needles: set[str] | None = None) -> dict:
     """
     Verify an output PDF.
 
@@ -1326,6 +1775,9 @@ def verify_output(pdf_path: Path, sample_pages, language: str, tag: str,
       may be garbled (broken ToUnicode CMaps) - do NOT judge readability, only
       confirm the watermark strings are gone.
     """
+    needles = needles or set(DEFAULT_WATERMARK_NEEDLES)
+    pat = re.compile("(" + "|".join(re.escape(x) for x in sorted(
+        needles, key=len, reverse=True)) + ")", re.IGNORECASE)
     try:
         from pypdf import PdfReader
         total = len(PdfReader(str(pdf_path)).pages)
@@ -1343,7 +1795,7 @@ def verify_output(pdf_path: Path, sample_pages, language: str, tag: str,
         seen_any = True
         text = extract_text_page(pdf_path, pno)
         read, garb, words = page_quality(text)
-        wm = len(WATERMARK_TEXT_RE.findall(text))
+        wm = len(pat.findall(text))
         watermark_hits += wm
         bad = (check_quality and (garb > 0.05 or read < 0.55 or words < 5))
         if bad:
@@ -1375,7 +1827,7 @@ def verify_output(pdf_path: Path, sample_pages, language: str, tag: str,
     if not full:
         full = " ".join(extract_text_page(pdf_path, p) for p in sample_pages
                         if p <= total)
-    full_hits = len(WATERMARK_TEXT_RE.findall(full or ""))
+    full_hits = len(pat.findall(full or ""))
 
     ok = (seen_any and watermark_hits == 0 and full_hits == 0
           and (bad_samples == 0 or not check_quality))
@@ -1482,14 +1934,14 @@ def main(argv=None) -> int:
 
     # --------------------------------------------------------------- step 1
     try:
-        stats, wm_xrefs = remove_watermark(inp, step1, args)
+        stats, wm_xrefs, an = remove_watermark(inp, step1, args)
     except Exception as exc:
         print(f"error in step 1: {exc}", file=sys.stderr)
         return 3
 
     ok1 = True
     with fitz.open(step1) as chk:
-        ok1 = verify_step1(chk, wm_xrefs, "step1")
+        ok1 = verify_step1(chk, wm_xrefs, "step1", an.text_needles)
     if not ok1:
         print("[warn] step1 verification found residue; see log", file=sys.stderr)
 
@@ -1510,7 +1962,7 @@ def main(argv=None) -> int:
         shutil.copyfile(step1, out)
         size_after = out.stat().st_size
         res = verify_output(out, sample_pages, "none (no OCR)", "final",
-                            check_quality=False)
+                            check_quality=False, needles=an.text_needles)
         elapsed = time.time() - t_start
         print("=" * 78)
         print("SUMMARY")
@@ -1556,7 +2008,7 @@ def main(argv=None) -> int:
     # --------------------------------------------------------------- step 3
     size_after = out.stat().st_size
     res = verify_output(out, sample_pages, language, "final",
-                        check_quality=True)
+                        check_quality=True, needles=an.text_needles)
 
     if not args.keep_intermediate:
         step1.unlink(missing_ok=True)

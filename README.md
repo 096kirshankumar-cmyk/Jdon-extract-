@@ -6,14 +6,24 @@ A small Railway-hosted dashboard that cleans garbled medical MCQ PDFs
 **One job, one output: a CLEAN PDF.** The dashboard fixes one thing by
 default, and one thing optionally:
 
-1. **Removes the full-page "Sold by @itachibot" watermark** (image + text)
-   — pages are kept exactly as uploaded (no re-render, no re-encode), so the
-   output is visually identical and stays near the original file size.
-   Detection treats **all full-page image variants together**: the same
-   watermark is often stored as several pixel variants (e.g. one variant on
-   82% of pages and another on 18%), so every full-page variant whose page
-   union covers ≥90% of the file is removed as one watermark family, while
-   small figures and one-off full-page images are left untouched.
+1. **Removes the watermark** — generic, works for **any PDF / any repeated
+   watermark**, not just the itachibot series. Pages are kept exactly as
+   uploaded (no re-render, no re-encode), so the output is visually identical
+   and stays near the original file size. Detection covers:
+   - **full-page image families** — the same watermark is often stored as
+     several pixel variants (e.g. 82% + 18% of pages); all full-page variants
+     whose union covers ≥90% of the file are one family and all are removed;
+   - **same-position images** repeated on ≥90% of pages covering ≥25% of the
+     page area (diagonal grey banners);
+   - **full-page Form XObjects** repeated on ≥90% of pages (vector-text /
+     painted-band watermarks);
+   - **inline images** (`BI … EI`) repeated across pages;
+   - **watermark text** — known strings ("Sold by", "itachibot",
+     "you purchased", "not for distribution", …) plus any text span repeated
+     on ≥90% of pages that is rotated, large, or known: removed from the
+     content streams and redacted visually.
+   Legitimate content is always protected: small corner logos, one-off
+   figures, page numbers and header/footer furniture stay untouched.
 2. **OPTIONAL — rebuilds the broken text layer with OCR**
    (`ocrmypdf --force-ocr`, English + Hindi). **Off by default**: OCR
    re-renders every page at high DPI, so the file is typically many times
