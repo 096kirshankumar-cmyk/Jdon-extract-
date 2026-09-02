@@ -27,8 +27,9 @@ import uuid
 from collections import deque
 from pathlib import Path
 
-from flask import (Flask, abort, jsonify, render_template_string,
-                   request, send_file)
+from flask import (Flask, abort, jsonify, redirect, render_template_string,
+                   request, send_file, url_for)
+from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
 # --------------------------------------------------------------------------
@@ -317,9 +318,23 @@ def api_job(job_id):
     return jsonify(_job_public(job))
 
 
+@app.get("/upload")
+def upload_page():
+    # Visiting /upload directly in a browser must never 405/500 - the form
+    # lives at / (upload is POST /upload), so just go there.
+    return redirect(url_for("index"))
+
+
 @app.post("/upload")
 def upload():
-    file = request.files.get("pdf")
+    try:
+        file = request.files.get("pdf")
+    except RequestEntityTooLarge:
+        return render_template_string(
+            PAGE_TEMPLATE, job_id=None, jobs=_jobs_public(),
+            max_upload_mb=MAX_UPLOAD_MB,
+            upload_error=f"File is larger than the {MAX_UPLOAD_MB} MB limit."
+        ), 413
     if file is None or not file.filename:
         return render_template_string(
             PAGE_TEMPLATE, job_id=None, jobs=_jobs_public(),
@@ -353,8 +368,11 @@ def upload():
         options["output_type"] = "pdfa"
 
     job = _new_job(fname, options)
-    job["input_path"].write_bytes(file.read())
-    data = job["input_path"].read_bytes()[:5]
+    # STREAM to disk in chunks (never file.read() into memory - a 100 MB
+    # upload is 100 MB of RAM twice, which OOM-kills small Railway workers).
+    file.save(job["input_path"])
+    with open(job["input_path"], "rb") as fh:
+        data = fh.read(5)
     if data != b"%PDF-":
         _clean_job_dir(Path(job["job_dir"]))
         with LOCK:
@@ -440,6 +458,45 @@ def health():
         running = sum(1 for j in JOBS.values() if j["status"] == "running")
     return jsonify({"ok": True, "running_jobs": running,
                     "jobs_dir": str(JOBS_DIR)})
+
+
+@app.errorhandler(413)
+def too_large(e):
+    """Upload over the limit: friendly page instead of the raw 413."""
+    return render_template_string(
+        PAGE_TEMPLATE, job_id=None, jobs=_jobs_public(),
+        max_upload_mb=MAX_UPLOAD_MB,
+        upload_error=f"File is larger than the {MAX_UPLOAD_MB} MB limit "
+                     f"(reduce or re-save it, then upload again).",
+    ), 413
+
+
+@app.errorhandler(404)
+def not_found(e):
+    if str(request.path).startswith("/api/"):
+        return jsonify({"error": "not found"}), 404
+    return render_template_string(
+        PAGE_TEMPLATE, job_id=None, jobs=_jobs_public(),
+        max_upload_mb=MAX_UPLOAD_MB,
+        upload_error="Page not found.",
+    ), 404
+
+
+@app.errorhandler(500)
+def internal_error(e):
+    """Never leak a stack to the browser; show a friendly retry message."""
+    try:
+        exc = e.original_exception or e
+        print(f"[500] {request.method} {request.path}: {exc!r}",
+              file=sys.stderr)
+    except Exception:
+        pass
+    return render_template_string(
+        PAGE_TEMPLATE, job_id=None, jobs=_jobs_public(),
+        max_upload_mb=MAX_UPLOAD_MB,
+        upload_error="Server hit an internal error - please try again; if it "
+                     "keeps happening, re-upload the same file.",
+    ), 500
 
 
 # --------------------------------------------------------------------------
